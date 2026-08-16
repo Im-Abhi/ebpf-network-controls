@@ -106,6 +106,7 @@ Performance is compared against conventional **Linux firewall mechanisms** to st
 | **Linux**     | Target operating system and networking stack   |
 | **eBPF Maps** | Kernel–user space state and communication      |
 
+<!--
 ## Learning Outcomes
 
 Through this project, I gained exposure to:
@@ -119,7 +120,7 @@ Through this project, I gained exposure to:
 * High-performance packet filtering
 * Network performance benchmarking
 * Throughput and P99 latency analysis
-
+-->
 ## Project Status
 
 **Status:** Academic / Research Project
