@@ -85,6 +85,60 @@ The system monitors network traffic patterns to identify potential **SYN-flood a
                  Automated Remediation
 ```
 
+## Structure
+```text
+ebpf-firewall/
+│
+├── bpf/
+│   │
+│   ├── xdp/
+│   │   ├── parser.bpf.c
+│   │   ├── firewall.bpf.c
+│   │   └── redirect.bpf.c
+│   │
+│   ├── tc/
+│   │   ├── ingress.bpf.c
+│   │   └── egress.bpf.c
+│   │
+│   ├── maps/
+│   │   ├── policy_maps.bpf.h
+│   │   ├── state_maps.bpf.h
+│   │   └── event_maps.bpf.h
+│   │
+│   └── common/
+│       ├── headers.h
+│       ├── structs.h
+│       └── helpers.h
+│
+├── control/
+│   │
+│   ├── policy/
+│   │   ├── parser.go
+│   │   ├── validator.go
+│   │   └── rules.go
+│   │
+│   ├── loader/
+│   │   ├── xdp.go
+│   │   ├── tc.go
+│   │   └── lifecycle.go
+│   │
+│   ├── maps/
+│   │   ├── policy.go
+│   │   ├── state.go
+│   │   └── counters.go
+│   │
+│   └── events/
+│       ├── consumer.go
+│       ├── decoder.go
+│       └── metrics.go
+│
+├── cmd/
+│   └── firewall/
+│
+└── configs/
+    └── policy.yaml
+```
+
 ## Performance Evaluation
 
 The project evaluates the efficiency of the eBPF-based security pipeline using:
