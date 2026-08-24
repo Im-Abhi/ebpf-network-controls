@@ -13,11 +13,6 @@ struct hdr_cursor {
     void *pos;
 };
 
-/* 
- * Helper macro for safe boundary checks 
- */
-#define __always_inline inline __attribute__((always_inline))
-
 static __always_inline int parse_ethhdr(struct hdr_cursor *nh, void *data_end, struct ethhdr **ethhdr) {
     struct ethhdr *eth = nh->pos;
     int hdrsize = sizeof(*eth);

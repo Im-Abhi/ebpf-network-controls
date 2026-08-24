@@ -1,8 +1,8 @@
 # Project variables
 BINARY_NAME := firewall
 BIN_DIR := bin
-CMD_DIR := cmd/firewall
-LOADER_DIR := control/loader
+CMD_DIR := ./cmd/firewall
+LOADER_DIR := ./control/loader
 IFACE ?= lo
 
 # Go & Build tools
@@ -36,7 +36,7 @@ generate:
 build:
 	@echo "==> Building $(BINARY_NAME) binary..."
 	mkdir -p $(BIN_DIR)
-	$(GO) build -o $(BIN_DIR)/$(BINARY_NAME) $(CMD_DIR)/main.go
+	$(GO) build -o $(BIN_DIR)/$(BINARY_NAME) $(CMD_DIR)
 	@echo "==> Binary built at $(BIN_DIR)/$(BINARY_NAME)"
 
 ## clean: Remove build artifacts and generated eBPF files

@@ -1,7 +1,14 @@
-```
+```bash
+sudo apt update
 sudo apt install -y \
-    bpfcc-tools \
-    python3-bpfcc \
-    linux-headers-$(uname -r)
-sudo apt install -y linux-tools-$(uname -r)
+    clang \
+    llvm \
+    libbpf-dev \
+    gcc-multilib \
+    linux-headers-$(uname -r) \
+    linux-tools-common \
+    linux-tools-$(uname -r) \
+    bpftool \
+    make \
+    golang
 ```

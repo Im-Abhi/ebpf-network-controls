@@ -139,6 +139,18 @@ ebpf-firewall/
     └── policy.yaml
 ```
 
+## Getting Started & Installation
+
+For full environment setup, required Linux kernel headers, build tools, and dependencies, refer to:
+👉 **[INSTALLATION.md](INSTALLATION.md)**
+
+Quick build using Makefile:
+```bash
+cd ebpf-firewall
+make all
+make run IFACE=lo
+```
+
 ## Performance Evaluation
 
 The project evaluates the efficiency of the eBPF-based security pipeline using:
