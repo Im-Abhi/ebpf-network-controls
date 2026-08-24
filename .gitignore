@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Go
+vendor/
+bin/
+*.exe
+
+# eBPF / bpf2go generated files
+*_bpfel.go
+*_bpfeb.go
+*_bpfel.o
+*_bpfeb.o
+*.o
+
+# Compiled binaries
+cmd/firewall/firewall
+ebpf-firewall/cmd/firewall/firewall
+firewall
+
+# Temporary / Scratch directories
+scratch/
+build/
+
+# IDE and OS
+.DS_Store
+.idea/
+.vscode/
