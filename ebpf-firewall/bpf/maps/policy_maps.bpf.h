@@ -15,7 +15,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __type(key, struct ipv4_lpm_key);
     __type(value, __u32);
-    __uint(map_flags, BPF_F_NO_REALLOC);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
     __uint(max_entries, 65535);
 } blocked_ips SEC(".maps");
 

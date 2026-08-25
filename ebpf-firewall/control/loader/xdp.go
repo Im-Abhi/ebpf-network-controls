@@ -3,7 +3,6 @@ package loader
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf firewall ../../bpf/xdp/firewall.bpf.c -- -I../../bpf/common
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"strings"
@@ -48,7 +47,7 @@ func LoadXDP(ifaceName string) (*FirewallInstance, error) {
 
 type Ipv4LpmKey struct {
 	PrefixLen uint32
-	Data      uint32
+	Data      [4]byte
 }
 
 func (f *FirewallInstance) BlockIP(cidrStr string) error {
@@ -90,13 +89,14 @@ func ParseIPOrCIDR(cidrStr string) (Ipv4LpmKey, error) {
 
 	ipv4 := ip.To4()
 	if ipv4 == nil {
-		return Ipv4LpmKey{}, fmt.Errorf("Only IPv4 is supported: %q", cidrStr)
+		return Ipv4LpmKey{}, fmt.Errorf("only IPv4 is supported: %q", cidrStr)
 	}
 
 	ones, _ := ipNet.Mask.Size()
 
-	return Ipv4LpmKey{
-		PrefixLen: uint32(ones),
-		Data:      binary.BigEndian.Uint32(ipv4),
-	}, nil
+	var key Ipv4LpmKey
+	key.PrefixLen = uint32(ones)
+	copy(key.Data[:], ipv4) // Stores bytes [127, 0, 0, 1] directly in memory
+
+	return key, nil
 }

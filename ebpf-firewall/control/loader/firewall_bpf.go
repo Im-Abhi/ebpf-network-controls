@@ -7,14 +7,22 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
+
+type firewallIpv4LpmKey struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Data      uint32
+}
 
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	firewallMapBlockedIps    = "blocked_ips"
 	firewallProgFirewallProg = "firewall_prog"
 )
 
@@ -67,6 +75,7 @@ type firewallProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type firewallMapSpecs struct {
+	BlockedIps *ebpf.MapSpec `ebpf:"blocked_ips"`
 }
 
 // firewallVariableSpecs contains global variables before they are loaded into the kernel.
@@ -95,10 +104,13 @@ func (o *firewallObjects) Close() error {
 //
 // It can be passed to loadFirewallObjects or ebpf.CollectionSpec.LoadAndAssign.
 type firewallMaps struct {
+	BlockedIps *ebpf.Map `ebpf:"blocked_ips"`
 }
 
 func (m *firewallMaps) Close() error {
-	return _FirewallClose()
+	return _FirewallClose(
+		m.BlockedIps,
+	)
 }
 
 // firewallVariables contains all global variables after they have been loaded into the kernel.
