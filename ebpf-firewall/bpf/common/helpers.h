@@ -6,6 +6,8 @@
 #include <linux/ip.h>
 #include <linux/in.h>
 #include <linux/icmp.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -57,6 +59,32 @@ static __always_inline int parse_icmphdr(struct hdr_cursor *nh, void *data_end, 
     *icmphdr = icmp;
 
     return icmp->type;
+}
+
+static __always_inline int parse_tcphdr(struct hdr_cursor *nh, void *data_end, struct tcphdr **tcphdr) {
+    struct tcphdr *tcp = nh->pos;
+    int hdrsize = sizeof(*tcp);
+
+    if ((void*)tcp + hdrsize > data_end) 
+        return -1;
+
+    nh->pos += hdrsize;
+    *tcphdr = tcp;
+
+    return 0;
+}
+
+static __always_inline int parse_udphdr(struct hdr_cursor *nh, void *data_end, struct udphdr **udphdr) {
+    struct udphdr *udp = nh->pos;
+    int hdrsize = sizeof(*udp);
+
+    if ((void*)udp + hdrsize > data_end) 
+        return -1;
+
+    nh->pos += hdrsize;
+    *udphdr = udp;
+
+    return 0;
 }
 
 #endif

@@ -16,9 +16,9 @@ bin/
 *.o
 
 # Compiled binaries
-cmd/firewall/firewall
-ebpf-firewall/cmd/firewall/firewall
-firewall
+/firewall
+/ebpf-firewall/firewall
+/ebpf-firewall/bin/
 
 # Temporary / Scratch directories
 scratch/
