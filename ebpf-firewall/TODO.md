@@ -6,22 +6,18 @@ This document tracks upcoming architectural refactoring, feature enhancements, a
 
 ## 1. Package Decoupling & Modularity (User-Space)
 
-Currently, `control/loader/xdp.go` handles eBPF loading, IP parsing, and map writes in one place. As features grow, decouple into specialized packages:
+- [x] **Rules & Validation (`control/rules/`)**
+  - [x] Move `ParseIPOrCIDR()` and string sanitization into `control/rules/parser.go`.
+  - [ ] Add CIDR and port range validation in `control/rules/validator.go`.
+  - [ ] Define rule representations (Action: `DROP`/`PASS`, Protocol: `TCP`/`UDP`/`ICMP`, Port, IP) in `control/rules/rules.go`.
 
-- [ ] **Policy Management (`control/policy/`)**
-  - [ ] Move `ParseIPOrCIDR()` and string sanitization into `control/policy/parser.go`.
-  - [ ] Add CIDR and port range validation in `control/policy/validator.go`.
-  - [ ] Define rule representations (Action: `DROP`/`PASS`, Protocol: `TCP`/`UDP`/`ICMP`, Port, IP) in `control/policy/rules.go`.
-
-- [ ] **eBPF Map Abstractions (`control/maps/`)**
-  - [ ] Move `BlockIP()`, `UnblockIP()`, and LPM trie lookups into `control/maps/policy.go`.
-  - [ ] Implement connection tracking state map wrappers in `control/maps/state.go`.
-  - [ ] Implement packet/byte counter map readers in `control/maps/counters.go`.
-
-- [ ] **Loader & Lifecycle (`control/loader/`)**
-  - [ ] Keep `control/loader/xdp.go` focused purely on loading ELF objects and XDP link attachment.
-  - [ ] Add TC filter attachment in `control/loader/tc.go`.
-  - [ ] Add unified lifecycle management (graceful attach/detach of both XDP and TC) in `control/loader/lifecycle.go`.
+- [x] **eBPF Interactions (`control/ebpf/`)**
+  - [x] Move `BlockIP()`, `UnblockIP()`, and LPM trie lookups into `control/ebpf/maps.go`.
+  - [x] Keep `control/ebpf/xdp.go` focused purely on loading ELF objects and XDP link attachment.
+  - [ ] Implement connection tracking state map wrappers in `control/ebpf/state.go`.
+  - [ ] Implement packet/byte counter map readers in `control/ebpf/counters.go`.
+  - [ ] Add TC filter attachment in `control/ebpf/tc.go`.
+  - [ ] Add unified lifecycle management (graceful attach/detach of both XDP and TC) in `control/ebpf/lifecycle.go`.
 
 ---
 

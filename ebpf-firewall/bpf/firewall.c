@@ -2,8 +2,8 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-#include "../common/helpers.h"
-#include "../maps/policy_maps.bpf.h"
+#include "helpers.h"
+#include "maps.h"
 
 SEC("xdp") 
 int firewall_prog(struct xdp_md *ctx) {

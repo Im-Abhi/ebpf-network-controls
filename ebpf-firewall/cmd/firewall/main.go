@@ -9,7 +9,7 @@ import (
 	"strings"
 	"syscall"
 
-	"ebpf-firewall/control/loader"
+	"ebpf-firewall/control/ebpf"
 
 	"github.com/cilium/ebpf/rlimit"
 )
@@ -31,7 +31,7 @@ func main() {
 	}
 
 	// Load the compiled eBPF ELF and load it into the kernel.
-	fw, err := loader.LoadXDP(ifname)
+	fw, err := ebpf.LoadXDP(ifname)
 	if err != nil {
 		log.Fatalf("Failed to load and attach XDP: %v", err)
 	}
@@ -39,9 +39,10 @@ func main() {
 
 	// Populate the blocked IP's into the kernel map
 	if blockList != "" {
+		mapManager := ebpf.NewMapManager(fw.BlockedIps)
 		for _, ipStr := range strings.Split(blockList, ",") {
 			ipStr = strings.TrimSpace(ipStr)
-			if err := fw.BlockIP(ipStr); err != nil {
+			if err := mapManager.BlockIP(ipStr); err != nil {
 				log.Printf("Failed to block %s: %v", ipStr, err)
 			} else {
 				log.Printf("Successfully blocked IP/CIDR: %s", ipStr)

@@ -2,7 +2,7 @@
 BINARY_NAME := firewall
 BIN_DIR := bin
 CMD_DIR := ./cmd/firewall
-LOADER_DIR := ./control/loader
+EBPF_DIR := ./control/ebpf
 IFACE ?= lo
 
 # Go & Build tools
@@ -30,7 +30,7 @@ deps:
 ## generate: Compile eBPF C code and generate Go bindings via bpf2go
 generate:
 	@echo "==> Generating eBPF Go bindings..."
-	cd $(LOADER_DIR) && $(GO) generate
+	cd $(EBPF_DIR) && $(GO) generate
 
 ## build: Build the firewall user-space binary
 build:
@@ -43,8 +43,8 @@ build:
 clean:
 	@echo "==> Cleaning build artifacts..."
 	rm -rf $(BIN_DIR)
-	rm -f $(LOADER_DIR)/*_bpfel.go $(LOADER_DIR)/*_bpfeb.go
-	rm -f $(LOADER_DIR)/*_bpfel.o $(LOADER_DIR)/*_bpfeb.o
+	rm -f $(EBPF_DIR)/*_bpfel.go $(EBPF_DIR)/*_bpfeb.go
+	rm -f $(EBPF_DIR)/*_bpfel.o $(EBPF_DIR)/*_bpfeb.o
 
 ## run: Run the firewall with root privileges (default: IFACE=lo, override: make run IFACE=eth0)
 run: build
