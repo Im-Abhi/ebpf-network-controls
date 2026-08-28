@@ -14,6 +14,7 @@ bin/
 *_bpfel.o
 *_bpfeb.o
 *.o
+/ebpf-firewall/bpf/vmlinux.h
 
 # Compiled binaries
 /firewall

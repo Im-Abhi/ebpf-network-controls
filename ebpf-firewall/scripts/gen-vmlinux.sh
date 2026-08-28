@@ -1,0 +1,22 @@
+#!/usr/bin/env sh
+# Generates vmlinux.h from the running kernel's BTF information.
+#
+# This is intentionally distro-neutral: it does not reference any
+# distribution-specific header paths (e.g. /usr/include/x86_64-linux-gnu).
+# It only requires that the build host exposes kernel BTF at
+# /sys/kernel/btf/vmlinux, which is the case on all modern Linux kernels
+# (>= 5.2 with CONFIG_DEBUG_INFO_BTF=y).
+set -e
+
+OUT="${1:-vmlinux.h}"
+
+if [ ! -f /sys/kernel/btf/vmlinux ]; then
+    echo "error: /sys/kernel/btf/vmlinux not found." >&2
+    echo "       The running kernel does not expose BTF." >&2
+    echo "       Enable CONFIG_DEBUG_INFO_BTF=y, or build on a BTF-capable host." >&2
+    exit 1
+fi
+
+echo "==> Generating ${OUT} from kernel BTF..."
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > "${OUT}"
+echo "==> Generated ${OUT} ($(wc -l < "${OUT}") lines)"

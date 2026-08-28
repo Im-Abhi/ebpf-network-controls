@@ -1,8 +1,13 @@
 #ifndef __POLICY_MAPS_BPF_H
 #define __POLICY_MAPS_BPF_H
 
-#include <linux/bpf.h>
+#include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
+
+/* Map flags are UAPI macros (not BTF types), so vmlinux.h does not define them. */
+#ifndef BPF_F_NO_PREALLOC
+#define BPF_F_NO_PREALLOC (1U << 0)
+#endif
 
 // Define the key structure for the LPM Trie (Longest Prefix Match)
 // This structure is used to store IP prefixes for efficient lookups.

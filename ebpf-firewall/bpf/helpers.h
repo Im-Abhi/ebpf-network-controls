@@ -1,15 +1,35 @@
 #ifndef __HELPERS_H
 #define __HELPERS_H
 
-#include <linux/bpf.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/in.h>
-#include <linux/icmp.h>
-#include <linux/tcp.h>
-#include <linux/udp.h>
+#include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+
+/* vmlinux.h exposes kernel *types* but not UAPI *macros*. These constants are
+ * defined by the kernel UAPI headers (<linux/if_ether.h>, <linux/in.h>,
+ * <linux/icmp.h>) which are intentionally NOT included here, so that the BPF
+ * program does not depend on any distribution's installed header layout. */
+#ifndef ETH_P_IP
+#define ETH_P_IP 0x0800
+#endif
+#ifndef ETH_P_IPV6
+#define ETH_P_IPV6 0x86DD
+#endif
+#ifndef IPPROTO_ICMP
+#define IPPROTO_ICMP 1
+#endif
+#ifndef IPPROTO_TCP
+#define IPPROTO_TCP 6
+#endif
+#ifndef IPPROTO_UDP
+#define IPPROTO_UDP 17
+#endif
+#ifndef ICMP_ECHO
+#define ICMP_ECHO 8
+#endif
+#ifndef ICMP_ECHOREPLY
+#define ICMP_ECHOREPLY 0
+#endif
 
 struct hdr_cursor {
     void *pos;
