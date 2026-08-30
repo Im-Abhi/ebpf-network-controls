@@ -31,18 +31,23 @@ func main() {
 	}
 
 	// Load the compiled eBPF ELF and load it into the kernel.
-	fw, err := ebpf.LoadXDP(ifname)
+	fw, err := ebpf.NewFirewall(ifname)
 	if err != nil {
-		log.Fatalf("Failed to load and attach XDP: %v", err)
+		log.Fatalf("Failed to load firewall: %v", err)
 	}
-	defer fw.Close()
+
+	// Attach the XDP program to the interface.
+	if err := fw.Start(); err != nil {
+		fw.Stop()
+		log.Fatalf("Failed to attach XDP: %v", err)
+	}
+	defer fw.Stop()
 
 	// Populate the blocked IP's into the kernel map
 	if blockList != "" {
-		mapManager := ebpf.NewMapManager(fw.BlockedIps)
 		for _, ipStr := range strings.Split(blockList, ",") {
 			ipStr = strings.TrimSpace(ipStr)
-			if err := mapManager.BlockIP(ipStr); err != nil {
+			if err := fw.BlockIP(ipStr); err != nil {
 				log.Printf("Failed to block %s: %v", ipStr, err)
 			} else {
 				log.Printf("Successfully blocked IP/CIDR: %s", ipStr)

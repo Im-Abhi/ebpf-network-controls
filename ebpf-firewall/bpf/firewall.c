@@ -30,13 +30,20 @@ int firewall_prog(struct xdp_md *ctx) {
         __u32 src = bpf_ntohl(ip->saddr);
         __u32 dst = bpf_ntohl(ip->daddr);
 
-        // instantiate the blocklist map
+        // Block traffic to OR from a blocked address: check the source first,
+        // then the destination. Both keys use the same 8-byte LPM layout with
+        // the address in network byte order, matching the Go side (maps.go).
         struct ipv4_lpm_key key = {
             .prefixlen = 32,
             .data = ip->saddr,
         };
 
         __u32 *blocked = bpf_map_lookup_elem(&blocked_ips, &key);
+
+        if (!(blocked && *blocked)) {
+            key.data = ip->daddr;
+            blocked = bpf_map_lookup_elem(&blocked_ips, &key);
+        }
 
         if (blocked && *blocked) {
 			bpf_printk("%u.%u.%u.%u BLOCKED!",

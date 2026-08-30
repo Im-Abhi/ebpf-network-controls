@@ -10,14 +10,21 @@ import (
 	"github.com/cilium/ebpf/link"
 )
 
-type FirewallInstance struct {
-	Link       link.Link
-	BlockedIps *ebpf.Map
+// XDPProgram owns the full lifecycle (load, attach, detach, close) of the XDP
+// firewall program and its maps. It intentionally knows nothing about firewall
+// policy; policy operations live in MapManager (see maps.go).
+type XDPProgram struct {
+	ifaceName  string
+	ifaceIndex int
+	prog       *ebpf.Program
+	link       link.Link
 	objs       firewallObjects
 }
 
-// LoadXDP loads the XDP firewall program, creates the maps, and attaches to the interface.
-func LoadXDP(ifaceName string) (*FirewallInstance, error) {
+// LoadXDP loads the compiled XDP firewall ELF and its maps for the given
+// interface, but does NOT attach the program. Call Start to attach.
+func LoadXDP(ifaceName string) (*XDPProgram, error) {
+	// Attach to the interface only after Start, so validate the name upfront.
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("looking up network interface %q: %v", ifaceName, err)
@@ -28,25 +35,50 @@ func LoadXDP(ifaceName string) (*FirewallInstance, error) {
 		return nil, fmt.Errorf("loading objects: %v", err)
 	}
 
-	l, err := link.AttachXDP(link.XDPOptions{
-		Program:   objs.FirewallProg,
-		Interface: iface.Index,
-	})
-	if err != nil {
-		objs.Close() // clean up objects if attachment fails
-		return nil, fmt.Errorf("could not attach XDP program: %w", err)
-	}
-
-	return &FirewallInstance{
-		Link:       l,
-		BlockedIps: objs.BlockedIps,
+	return &XDPProgram{
+		ifaceName:  ifaceName,
+		ifaceIndex: iface.Index,
+		prog:       objs.FirewallProg,
 		objs:       objs,
 	}, nil
 }
 
-func (f *FirewallInstance) Close() {
-	if f.Link != nil {
-		f.Link.Close()
+// Start attaches the loaded XDP program to the interface. It is safe to call
+// only once; subsequent calls are a no-op.
+func (x *XDPProgram) Start() error {
+	if x.link != nil {
+		return nil
 	}
-	f.objs.Close()
+
+	l, err := link.AttachXDP(link.XDPOptions{
+		Program:   x.prog,
+		Interface: x.ifaceIndex,
+	})
+	if err != nil {
+		x.objs.Close()
+		return fmt.Errorf("could not attach XDP program to %q: %w", x.ifaceName, err)
+	}
+
+	x.link = l
+	return nil
+}
+
+// BlockedIps returns the eBPF map backing the IP blocklist.
+func (x *XDPProgram) BlockedIps() *ebpf.Map {
+	return x.objs.BlockedIps
+}
+
+// Close detaches the program (if attached) and closes all loaded objects.
+func (x *XDPProgram) Close() error {
+	var firstErr error
+	if x.link != nil {
+		if err := x.link.Close(); err != nil {
+			firstErr = err
+		}
+		x.link = nil
+	}
+	if err := x.objs.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }
