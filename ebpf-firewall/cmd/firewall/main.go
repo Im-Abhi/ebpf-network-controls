@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"ebpf-firewall/control/ebpf"
+	"ebpf-firewall/control/server"
 
 	"github.com/cilium/ebpf/rlimit"
 )
@@ -17,9 +18,13 @@ import (
 func main() {
 	var ifname string
 	var blockList string
+	var sockPath string
 	flag.StringVar(&ifname, "i", "lo", "Network interface name where the eBPF programs will be attached")
 	flag.StringVar(&blockList, "block", "", "Comma-separated list of IPs/CIDRs to block (e.g. '192.168.1.5, 10.0.0.0/8')")
+	flag.StringVar(&sockPath, "sock", "/var/run/ebpf-firewall.sock", "unix socket path for control")
 	flag.Parse()
+
+	log := log.New(os.Stdout, "[firewall] ", log.LstdFlags)
 
 	// Signal handling / context.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -41,23 +46,36 @@ func main() {
 		fw.Stop()
 		log.Fatalf("Failed to attach XDP: %v", err)
 	}
-	defer fw.Stop()
+	log.Printf("XDP attached to %s", ifname)
 
 	// Populate the blocked IP's into the kernel map
 	if blockList != "" {
 		for _, ipStr := range strings.Split(blockList, ",") {
 			ipStr = strings.TrimSpace(ipStr)
+			if ipStr == "" {
+				continue
+			}
+
 			if err := fw.BlockIP(ipStr); err != nil {
 				log.Printf("Failed to block %s: %v", ipStr, err)
 			} else {
-				log.Printf("Successfully blocked IP/CIDR: %s", ipStr)
+				log.Printf("Blocked IP/CIDR: %s", ipStr)
 			}
 		}
 	}
 
-	log.Printf("Successfully attached firewall to %s", ifname)
+	srv := server.New(sockPath, fw)
+	if err := srv.Start(ctx); err != nil {
+		log.Fatalf("failed to start control server: %v", err)
+	}
+	log.Printf("control socket listening on %s", sockPath)
+
+	defer fw.Stop()   // runs LAST (LIFO): XDP detaches after socket closes
+	defer srv.Close() // runs FIRST: socket closes before XDP detaches
+
+	log.Printf("Successfully attached XDP to %s", ifname)
 	log.Printf("Press Ctrl+C to exit and remove the program")
 
 	<-ctx.Done()
-	log.Println("Detaching firewall and Exiting...")
+	log.Println("Detaching and Exiting...")
 }
