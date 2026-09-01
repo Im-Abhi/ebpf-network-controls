@@ -42,12 +42,14 @@ generate: $(VMLINUX_H)
 	@echo "==> Generating eBPF Go bindings..."
 	cd $(EBPF_DIR) && $(GO) generate
 
-## build: Build the firewall user-space binary
+## build: Build the firewall binary and firewallctl client
 build:
 	@echo "==> Building $(BINARY_NAME) binary..."
 	mkdir -p $(BIN_DIR)
 	$(GO) build -o $(BIN_DIR)/$(BINARY_NAME) $(CMD_DIR)
-	@echo "==> Binary built at $(BIN_DIR)/$(BINARY_NAME)"
+	@echo "==> Building firewallctl client..."
+	$(GO) build -o $(BIN_DIR)/firewallctl ./cmd/firewallctl
+	@echo "==> Binaries built in $(BIN_DIR)"
 
 ## clean: Remove build artifacts and generated eBPF files
 clean:
