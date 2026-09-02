@@ -1,143 +1,96 @@
 # eBPF-Based Network Security & Automated Remediation Engine
 
-**Technologies:** C++ · Linux · eBPF · XDP · TC
+A thesis project for kernel-level network security using **eBPF, XDP, and Go**.
 
-## Overview
+This repository is evolving toward a full network-security-and-remediation engine. The
+**current implementation** is a focused, working XDP IPv4 firewall with a live Go control
+plane. Everything else described below is the roadmap the current core is built to grow
+into.
 
-This project focuses on building a **kernel-level network security and automated remediation engine** using eBPF. The system performs early packet processing and filtering inside the Linux networking stack while maintaining a lightweight kernel–user space control plane for attack detection, policy management, and automated response.
+---
 
-## Objectives
+## Current Implementation
 
-* Design a kernel-level packet processing pipeline using **eBPF, XDP, and TC**.
-* Perform early packet filtering with minimal user-space overhead.
-* Implement **IP/CIDR blocklisting** and domain-based filtering.
-* Explore **Layer 7 (L7) traffic inspection**.
-* Detect network attacks such as **SYN floods**.
-* Automatically enforce security policies and quarantine suspicious traffic.
-* Evaluate performance against conventional Linux firewall mechanisms.
+What works today (MTP1 core — XDP firewall):
 
-## Key Features
+- **XDP firewall** (`bpf/firewall.c`)
+- **IPv4 exact IP / CIDR filtering** via an **LPM trie**
+- **CO-RE** (`vmlinux.h`) – portable across kernels without compile-time headers
+- **Go control plane** (`control/`)
+- **Unix socket API** (`control/server/`) for dynamic, runtime rule updates
+- **`firewallctl`** client for live `block` / `unblock` / `list` / `status` / `clear`
+- **Unit + integration tests** (`make test`, `make integration-test`)
 
-### Early Packet Filtering
+### Default policy
 
-Uses **XDP (eXpress Data Path)** and **TC (Traffic Control)** to process packets at an early stage of the Linux networking stack, enabling efficient filtering before packets reach higher layers.
+```
+Default policy: ALLOW
 
-### Network Security Policies
-
-The engine supports security mechanisms including:
-
-* IP address blocklisting
-* CIDR-based filtering
-* Domain filtering
-* Suspicious traffic detection
-* Traffic quarantine
-* Automated rule enforcement
-
-### Kernel–User Space Control Plane
-
-A control plane connects the eBPF programs running in the kernel with user-space components responsible for:
-
-* Event collection
-* Attack detection
-* Policy updates
-* Security decisions
-* Automated remediation
-
-Communication and state management are handled using **eBPF maps and asynchronous mechanisms**.
-
-### SYN-Flood Detection
-
-The system monitors network traffic patterns to identify potential **SYN-flood attacks** and automatically applies mitigation policies when suspicious behavior is detected.
-
-## Architecture
-
-```text
-                    Network Traffic
-                          │
-                          ▼
-                    ┌───────────┐
-                    │    XDP    │
-                    │ Early     │
-                    │ Filtering │
-                    └─────┬─────┘
-                          │
-                  ┌───────▼───────┐
-                  │      TC       │
-                  │ Packet Policy │
-                  └───────┬───────┘
-                          │
-              ┌───────────▼───────────┐
-              │   eBPF Maps / Events  │
-              └───────────┬───────────┘
-                          │
-                          ▼
-                 ┌─────────────────┐
-                 │  User-Space     │
-                 │  Control Plane  │
-                 └────────┬────────┘
-                          │
-              ┌───────────▼───────────┐
-              │ Attack Detection &    │
-              │ Policy Management     │
-              └───────────┬───────────┘
-                          │
-                          ▼
-                 Automated Remediation
+Matching blocked_ips:   DROP
+No matching policy:     PASS
 ```
 
-## Structure
+The firewall is **default-allow**: packets are passed unless they match the blocklist.
+
+### Architecture (current)
+
+```text
+firewallctl
+      │
+      ▼
+Unix socket  ─────────  control plane (Go)
+      │                     │
+      ▼                     ▼
+  server.go ──▶  Firewall ──▶  MapManager
+                                   │
+                                   ▼
+                              BPF map (LPM trie)
+                                   │
+                                   ▼
+                              XDP program
+```
+
+### Structure (current)
+
 ```text
 ebpf-firewall/
 │
-├── bpf/
-│   │
-│   ├── xdp/
-│   │   ├── parser.bpf.c
-│   │   ├── firewall.bpf.c
-│   │   └── redirect.bpf.c
-│   │
-│   ├── tc/
-│   │   ├── ingress.bpf.c
-│   │   └── egress.bpf.c
-│   │
-│   ├── maps/
-│   │   ├── policy_maps.bpf.h
-│   │   ├── state_maps.bpf.h
-│   │   └── event_maps.bpf.h
-│   │
-│   └── common/
-│       ├── headers.h
-│       ├── structs.h
-│       └── helpers.h
+├── bpf/                 # eBPF C programs (dataplane)
+│   ├── firewall.c
+│   ├── helpers.h        # packet parsing helpers
+│   ├── maps.h           # BPF map definitions
+│   └── vmlinux.h        # GENERATED – do not edit
 │
 ├── control/
-│   │
-│   ├── policy/
-│   │   ├── parser.go
-│   │   ├── validator.go
-│   │   └── rules.go
-│   │
-│   ├── loader/
-│   │   ├── xdp.go
-│   │   ├── tc.go
-│   │   └── lifecycle.go
-│   │
-│   ├── maps/
-│   │   ├── policy.go
-│   │   ├── state.go
-│   │   └── counters.go
-│   │
-│   └── events/
-│       ├── consumer.go
-│       ├── decoder.go
-│       └── metrics.go
+│   ├── ebpf/            # map manager, XDP lifecycle, generated bindings
+│   │   └── firewall_bpf.go   # GENERATED – do not edit
+│   ├── rules/           # rule/IP parsing
+│   └── server/          # Unix socket control API
 │
 ├── cmd/
-│   └── firewall/
+│   ├── firewall/        # daemon entry point
+│   └── firewallctl/     # CLI client
 │
-└── configs/
-    └── policy.yaml
+├── scripts/             # build / vmlinux generation helpers
+├── INSTALLATION.md
+└── TODO.md              # milestone roadmap (MTP1 / MTP2)
 ```
+
+---
+
+## Future Extensions (roadmap)
+
+These are **planned**, not yet implemented:
+
+- **Counters / telemetry** (packet & byte stats, drop counters)
+- **Protocol / port policies** (e.g. `TCP + dst port 22 → DROP`)
+- **TC ingress / egress** (attach points beyond XDP)
+- **Flow / connection state tracking**
+- **Attack detection** (e.g. SYN floods)
+- **Quarantine & automated remediation**
+- **L7 / TLS traffic inspection**
+
+---
 
 ## Getting Started & Installation
 
@@ -147,19 +100,22 @@ For full environment setup, required Linux kernel headers, build tools, and depe
 Quick build using Makefile:
 ```bash
 cd ebpf-firewall
-make all
-make run IFACE=lo
+make generate   # compile eBPF + generate Go bindings
+make build      # build bin/firewall and bin/firewallctl
+sudo ./bin/firewall -i eth0
 ```
+
+---
 
 ## Performance Evaluation
 
-The project evaluates the efficiency of the eBPF-based security pipeline using:
+Planned work compares the eBPF pipeline against conventional Linux firewall mechanisms using:
 
-* **Throughput**
-* **Memory overhead**
-* **P99 packet-processing latency**
+- **Throughput**
+- **Memory overhead**
+- **P99 packet-processing latency**
 
-Performance is compared against conventional **Linux firewall mechanisms** to study the benefits and trade-offs of kernel-level packet processing.
+---
 
 ## Tools & Technologies
 
@@ -167,26 +123,13 @@ Performance is compared against conventional **Linux firewall mechanisms** to st
 | ------------- | ---------------------------------------------- |
 | **eBPF**      | Kernel-level programmable packet processing    |
 | **XDP**       | Early packet processing and filtering          |
-| **TC**        | Traffic control and packet policy enforcement  |
-| **C++**       | User-space control plane and system components |
+| **Go**        | Control plane, map manager, CLI/client         |
+| **C**         | eBPF dataplane programs                        |
 | **Linux**     | Target operating system and networking stack   |
 | **eBPF Maps** | Kernel–user space state and communication      |
 
-<!--
-## Learning Outcomes
+---
 
-Through this project, I gained exposure to:
-
-* Linux kernel networking
-* eBPF program development
-* XDP and TC packet processing
-* Kernel–user space communication
-* Network attack detection
-* Automated security remediation
-* High-performance packet filtering
-* Network performance benchmarking
-* Throughput and P99 latency analysis
--->
 ## Project Status
 
 **Status:** Academic / Research Project
