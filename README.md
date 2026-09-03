@@ -109,11 +109,20 @@ sudo ./bin/firewall -i eth0
 
 ## Performance Evaluation
 
-Planned work compares the eBPF pipeline against conventional Linux firewall mechanisms using:
+The benchmarking module (`MTP1-E`) compares the eBPF/XDP firewall against
+**nftables** (modern Linux baseline) using identical traffic patterns:
 
-- **Throughput**
-- **Memory overhead**
-- **P99 packet-processing latency**
+| Metric                    | eBPF/XDP Firewall | nftables |
+| ------------------------- | ----------------- | -------- |
+| Packet processing latency | ✓                 | ✓        |
+| Throughput (Gbps)         | ✓                 | ✓        |
+| Packets/sec               | ✓                 | ✓        |
+| CPU utilization           | ✓                 | ✓        |
+| Memory usage              | ✓                 | ✓        |
+| Firewall rule update time | ✓                 | ✓        |
+
+Traffic is generated with `iperf3` / `pktgen`. Results are documented in
+`benchmark/results/`.
 
 ---
 

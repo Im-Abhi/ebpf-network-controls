@@ -123,15 +123,67 @@ make generate   # generate vmlinux.h + compile BPF into Go bindings
 make build      # build the firewall binary into ./bin/
 ```
 
-## Run
+## Usage
+
+### Start the firewall
 
 ```bash
-make run                    # attach to the loopback interface (default)
-make run IFACE=eth0         # attach to a specific interface
-sudo ./bin/firewall -i lo -block "192.168.1.5, 10.0.0.0/8"
+# Attach to loopback (default)
+sudo ./bin/firewall -i lo
 
-make trace                  # stream BPF trace pipe for bpf_printk output
-make clean                  # remove build artifacts and generated files
+# Attach to a specific interface with initial block rules
+sudo ./bin/firewall -i eth0 -block "10.0.0.0/8, 192.168.1.50"
+
+# Use a custom socket path
+sudo ./bin/firewall -i eth0 -sock /tmp/fw.sock -block "10.0.0.0/8"
+```
+
+The firewall daemon loads the XDP program, attaches it to the specified
+interface, and starts a Unix socket server for runtime control. Press `Ctrl+C`
+to stop — the XDP program detaches cleanly.
+
+### Control with firewallctl
+
+All commands use the same socket path as the daemon (default:
+`/var/run/ebpf-firewall.sock`). Override with `-sock` if the daemon uses a
+custom path.
+
+```bash
+# Show interface, attached state, and blocked rule count
+firewallctl status
+
+# List all blocked IPs/CIDRs
+firewallctl list
+
+# Add or remove rules at runtime
+firewallctl block 8.8.8.8
+firewallctl block 10.0.0.0/8
+firewallctl unblock 8.8.8.8
+
+# Remove all blocked addresses
+firewallctl clear
+```
+
+### Debug mode
+
+To enable `bpf_printk` tracing (useful for learning, not for performance
+measurement):
+
+```bash
+make generate-debug   # recompile with FIREWALL_DEBUG defined
+make build
+sudo ./bin/firewall -i eth0
+make trace            # stream trace_pipe in another terminal
+```
+
+Debug mode adds protocol/port inspection output to the kernel trace pipe.
+Leave it off for benchmarks — tracing adds overhead that pollutes
+measurements.
+
+### Clean up
+
+```bash
+make clean   # remove build artifacts and generated eBPF files
 ```
 
 ## Troubleshooting
