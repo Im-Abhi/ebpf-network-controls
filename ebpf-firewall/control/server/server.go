@@ -19,6 +19,7 @@ type Policy interface {
 	ListBlockedIPs() ([]string, error)
 	Clear() error
 	Interface() string
+	Stats() (Stats, error)
 }
 
 // Server exposes a newline-delimited JSON API over a Unix socket. Each command
@@ -189,6 +190,13 @@ func (s *Server) handle(req Request) Response {
 			return Response{OK: false, Error: err.Error()}
 		}
 		return Response{OK: true}
+
+	case CmdStats:
+		stats, err := s.policy.Stats()
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+		return Response{OK: true, Stats: &stats}
 
 	default:
 		return Response{OK: false, Error: "unknown command: " + string(req.Command)}

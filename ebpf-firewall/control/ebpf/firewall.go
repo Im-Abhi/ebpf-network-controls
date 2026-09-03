@@ -2,14 +2,17 @@ package ebpf
 
 import (
 	"fmt"
+
+	"ebpf-firewall/control/server"
 )
 
 // Firewall is a thin facade coordinating the XDP program lifecycle (XDPProgram)
-// with policy map operations (MapManager). It is the single handle used by
-// cmd/firewall and, later, the runtime control plane.
+// with policy map operations (MapManager) and counter reads (CounterManager).
+// It is the single handle used by cmd/firewall and the runtime control plane.
 type Firewall struct {
-	prog *XDPProgram
-	mgr  *MapManager
+	prog       *XDPProgram
+	mgr        *MapManager
+	counterMgr *CounterManager
 }
 
 // NewFirewall loads the XDP program and its maps for the given interface but
@@ -21,8 +24,9 @@ func NewFirewall(ifaceName string) (*Firewall, error) {
 	}
 
 	return &Firewall{
-		prog: prog,
-		mgr:  NewMapManager(prog.BlockedIps()),
+		prog:       prog,
+		mgr:        NewMapManager(prog.BlockedIps()),
+		counterMgr: NewCounterManager(prog.Counters()),
 	}, nil
 }
 
@@ -70,4 +74,9 @@ func (f *Firewall) ListBlockedIPs() ([]string, error) {
 // Clear removes every blocked prefix.
 func (f *Firewall) Clear() error {
 	return f.mgr.Clear()
+}
+
+// Stats returns the global packet and byte counters from the BPF map.
+func (f *Firewall) Stats() (server.Stats, error) {
+	return f.counterMgr.GetCounters()
 }

@@ -38,6 +38,8 @@ func main() {
 		req = server.Request{Command: server.CmdStatus}
 	case "clear":
 		req = server.Request{Command: server.CmdClear}
+	case "stats":
+		req = server.Request{Command: server.CmdStats}
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -84,6 +86,8 @@ func printResponse(resp server.Response) {
 	}
 
 	switch {
+	case resp.Stats != nil:
+		printStats(resp.Stats)
 	case resp.Blocked != nil:
 		if resp.Count == 0 {
 			fmt.Println("no blocked addresses")
@@ -102,6 +106,32 @@ func printResponse(resp server.Response) {
 	}
 }
 
+func printStats(s *server.Stats) {
+	fmt.Println("Packets:")
+	fmt.Printf("  Total:   %d\n", s.TotalPackets)
+	fmt.Printf("  Passed:  %d\n", s.PassPackets)
+	fmt.Printf("  Dropped: %d\n", s.DropPackets)
+	fmt.Println()
+	fmt.Println("Bytes:")
+	fmt.Printf("  Total:   %s\n", formatBytes(s.TotalBytes))
+	fmt.Printf("  Passed:  %s\n", formatBytes(s.PassBytes))
+	fmt.Printf("  Dropped: %s\n", formatBytes(s.DropBytes))
+}
+
+// formatBytes converts a byte count to a human-readable string (B, KB, MB, GB).
+func formatBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage: firewallctl [-sock path] <command> [args]
 
@@ -111,6 +141,7 @@ Commands:
   block <ip/cidr>    block an IP or CIDR (e.g. 8.8.8.8 or 10.0.0.0/8)
   unblock <ip/cidr>  unblock an IP or CIDR
   clear              remove all blocked addresses
+  stats              show packet/byte counters
   help               show this help
 
 Options:

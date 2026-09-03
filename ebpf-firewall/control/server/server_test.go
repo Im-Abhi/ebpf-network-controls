@@ -55,6 +55,17 @@ func (f *fakePolicy) Interface() string {
 	return "test0"
 }
 
+func (f *fakePolicy) Stats() (Stats, error) {
+	return Stats{
+		TotalPackets: 100,
+		TotalBytes:   5000,
+		DropPackets:  10,
+		DropBytes:    600,
+		PassPackets:  90,
+		PassBytes:    4400,
+	}, nil
+}
+
 func TestHandle_BlockListUnblockClear(t *testing.T) {
 	policy := newFakePolicy()
 	s := New("unused.sock", policy)
@@ -93,6 +104,23 @@ func TestHandle_UnknownCommand(t *testing.T) {
 	}
 }
 
+func TestHandle_Stats(t *testing.T) {
+	s := New("unused.sock", newFakePolicy())
+	resp := s.handle(Request{Command: CmdStats})
+	if !resp.OK {
+		t.Fatalf("stats: %+v", resp)
+	}
+	if resp.Stats == nil {
+		t.Fatal("stats response has nil Stats")
+	}
+	if resp.Stats.TotalPackets != 100 {
+		t.Errorf("TotalPackets = %d, want 100", resp.Stats.TotalPackets)
+	}
+	if resp.Stats.DropBytes != 600 {
+		t.Errorf("DropBytes = %d, want 600", resp.Stats.DropBytes)
+	}
+}
+
 // errPolicy returns an error from every blocked-side operation.
 type errPolicy struct{}
 
@@ -101,11 +129,12 @@ func (p *errPolicy) UnblockIP(string) error            { return errors.New("boom
 func (p *errPolicy) ListBlockedIPs() ([]string, error) { return nil, errors.New("boom") }
 func (p *errPolicy) Clear() error                      { return errors.New("boom") }
 func (p *errPolicy) Interface() string                 { return "" }
+func (p *errPolicy) Stats() (Stats, error)             { return Stats{}, errors.New("boom") }
 
 func TestHandle_PropagatesErrors(t *testing.T) {
 	s := New("unused.sock", &errPolicy{})
 
-	for _, cmd := range []Command{CmdBlock, CmdUnblock, CmdList, CmdClear} {
+	for _, cmd := range []Command{CmdBlock, CmdUnblock, CmdList, CmdClear, CmdStats} {
 		if resp := s.handle(Request{Command: cmd, Value: "x"}); resp.OK {
 			t.Errorf("%s should not be ok with failing policy: %+v", cmd, resp)
 		}

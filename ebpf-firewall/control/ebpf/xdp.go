@@ -68,6 +68,11 @@ func (x *XDPProgram) BlockedIps() *ebpf.Map {
 	return x.objs.BlockedIps
 }
 
+// Counters returns the eBPF map holding global packet/byte counters.
+func (x *XDPProgram) Counters() *ebpf.Map {
+	return x.objs.Counters
+}
+
 // Close detaches the program (if attached) and closes all loaded objects.
 func (x *XDPProgram) Close() error {
 	var firstErr error

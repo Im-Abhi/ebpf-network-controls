@@ -89,6 +89,17 @@ static __always_inline int is_blocked(const struct packet_info *info) {
     return blocked && *blocked;
 }
 
+/* Global counter increment. Looks up the counter by index and atomically
+ * adds 1 packet and the given byte count. Must match struct counter_value
+ * and enum counter_index in maps.h. */
+static __always_inline void incr_counter(__u32 idx, __u64 bytes) {
+    struct counter_value *val = bpf_map_lookup_elem(&counters, &idx);
+    if (val) {
+        __sync_fetch_and_add(&val->packets, 1);
+        __sync_fetch_and_add(&val->bytes, bytes);
+    }
+}
+
 static __always_inline void debug_packet(const struct packet_info *info,
                                          struct hdr_cursor *nh,
                                          void *data_end) {
@@ -137,18 +148,23 @@ int firewall_prog(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
     struct hdr_cursor nh;
     nh.pos = data;
+    __u64 pkt_len = (__u64)(data_end - data);
 
     /* 1. parse */
     int ok;
     struct packet_info info = parse_packet(&nh, data_end, &ok);
     if (!ok) {
         /* Unparseable or non-IPv4: default allow. */
+        incr_counter(COUNTER_TOTAL, pkt_len);
+        incr_counter(COUNTER_PASS, pkt_len);
         return XDP_PASS;
     }
 
     /* 2. policy lookup + decision */
     if (is_blocked(&info)) {
         DEBUG_PRINTK("packet BLOCKED");
+        incr_counter(COUNTER_TOTAL, pkt_len);
+        incr_counter(COUNTER_DROP, pkt_len);
         return XDP_DROP;
     }
 
@@ -156,6 +172,8 @@ int firewall_prog(struct xdp_md *ctx) {
     debug_packet(&info, &nh, data_end);
 
     /* 4. default policy: allow */
+    incr_counter(COUNTER_TOTAL, pkt_len);
+    incr_counter(COUNTER_PASS, pkt_len);
     return XDP_PASS;
 }
 
