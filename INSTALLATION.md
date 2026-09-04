@@ -155,14 +155,26 @@ firewallctl status
 # List all blocked IPs/CIDRs
 firewallctl list
 
-# Add or remove rules at runtime
+# Add or remove IP/CIDR rules at runtime
 firewallctl block 8.8.8.8
 firewallctl block 10.0.0.0/8
 firewallctl unblock 8.8.8.8
 
-# Remove all blocked addresses
+# Add or remove protocol + destination-port rules (destination-only match)
+firewallctl block 192.168.1.100 --protocol tcp --dport 22
+firewallctl block 1.2.3.4 --protocol udp --dport 53
+firewallctl unblock 192.168.1.100 --protocol tcp --dport 22
+
+# List protocol/port rules
+firewallctl listports
+
+# Remove all blocked addresses (IP/CIDR blocks only)
 firewallctl clear
 ```
+
+Port rules match traffic **destined to** the given IP on the given protocol
+and destination port. The IP must be an exact IPv4 address (`/32`) for now;
+CIDR + port is planned.
 
 ### Debug mode
 

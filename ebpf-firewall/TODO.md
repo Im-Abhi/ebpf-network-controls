@@ -13,8 +13,8 @@ MTP2+ are the thesis-level extensions built on top of it.
 - [x] IPv4 header parsing (`bpf/helpers.h`)
 - [x] LPM policy map (`bpf/maps.h`, `blocked_ips`)
 - [x] CO-RE / `vmlinux.h`
-- [x] Go map manager (`control/ebpf/maps.go`)
-- [x] XDP lifecycle (load/attach/detach) (`control/ebpf/xdp.go`, `control/ebpf/firewall.go`)
+- [x] Go map manager (`control/ebpf/blocklist.go`)
+- [x] XDP lifecycle (load/attach/detach) (`control/ebpf/xdp.go`, `control/ebpf/facade.go`)
 - [x] Dynamic policy updates (runtime block/unblock via Unix socket)
 - [x] Unix control API (`control/server/`)
 - [x] `firewallctl` client
@@ -30,8 +30,8 @@ MTP2+ are the thesis-level extensions built on top of it.
 
 ### MTP1-C: Richer rule semantics
 
-- [ ] Protocol-based rules (`IP + protocol → DROP`)
-- [ ] Port-based filtering (`TCP + dst port 22 → DROP`)
+- [x] Protocol-based rules (`IP + protocol + destination port → DROP`)
+- [ ] Port-based filtering with CIDR networks (currently exact `/32` only)
 - [ ] Explicit rule actions (PASS / DROP)
 - [ ] Rule priority (deterministic winner when rules overlap)
 - [ ] Direction-aware rules (INGRESS / EGRESS)

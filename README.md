@@ -15,10 +15,11 @@ What works today (MTP1 core — XDP firewall):
 
 - **XDP firewall** (`bpf/firewall.c`)
 - **IPv4 exact IP / CIDR filtering** via an **LPM trie**
+- **Protocol + destination-port filtering** (e.g. `block 1.2.3.4 --protocol tcp --dport 22`)
 - **CO-RE** (`vmlinux.h`) – portable across kernels without compile-time headers
 - **Go control plane** (`control/`)
 - **Unix socket API** (`control/server/`) for dynamic, runtime rule updates
-- **`firewallctl`** client for live `block` / `unblock` / `list` / `status` / `clear`
+- **`firewallctl`** client for live `block` / `unblock` / `list` / `status` / `stats` / `listports` / `clear`
 - **Unit + integration tests** (`make test`, `make integration-test`)
 
 ### Default policy
