@@ -20,6 +20,9 @@ type Policy interface {
 	Clear() error
 	Interface() string
 	Stats() (Stats, error)
+	BlockPortRule(dst, protocol string, port uint16) error
+	UnblockPortRule(dst, protocol string, port uint16) error
+	ListPortRules() ([]PortRule, error)
 }
 
 // Server exposes a newline-delimited JSON API over a Unix socket. Each command
@@ -160,12 +163,24 @@ func (s *Server) handle(req Request) Response {
 
 	switch req.Command {
 	case CmdBlock:
+		if req.Protocol != "" || req.Port != 0 {
+			if err := s.policy.BlockPortRule(req.Value, req.Protocol, req.Port); err != nil {
+				return Response{OK: false, Error: err.Error()}
+			}
+			return Response{OK: true}
+		}
 		if err := s.policy.BlockIP(req.Value); err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
 		return Response{OK: true}
 
 	case CmdUnblock:
+		if req.Protocol != "" || req.Port != 0 {
+			if err := s.policy.UnblockPortRule(req.Value, req.Protocol, req.Port); err != nil {
+				return Response{OK: false, Error: err.Error()}
+			}
+			return Response{OK: true}
+		}
 		if err := s.policy.UnblockIP(req.Value); err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
@@ -177,6 +192,13 @@ func (s *Server) handle(req Request) Response {
 			return Response{OK: false, Error: err.Error()}
 		}
 		return Response{OK: true, Blocked: blocked, Count: len(blocked)}
+
+	case CmdListPorts:
+		rules, err := s.policy.ListPortRules()
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+		return Response{OK: true, PortRules: rules, Count: len(rules)}
 
 	case CmdStatus:
 		blocked, err := s.policy.ListBlockedIPs()

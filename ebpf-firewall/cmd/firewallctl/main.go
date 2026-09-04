@@ -12,9 +12,14 @@ import (
 
 func main() {
 	var sockPath string
+	var protocol string
+	var portUint uint
 	flag.StringVar(&sockPath, "sock", "/var/run/ebpf-firewall.sock", "unix control socket path")
+	flag.StringVar(&protocol, "protocol", "", "protocol for a port rule: tcp or udp (with a port rule)")
+	flag.UintVar(&portUint, "dport", 0, "destination port for a port rule (with --protocol)")
 	flag.Usage = usage
 	flag.Parse()
+	port := uint16(portUint)
 
 	args := flag.Args()
 	if len(args) == 0 {
@@ -31,9 +36,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "firewallctl: %s requires an IP/CIDR argument\n", cmd)
 			os.Exit(2)
 		}
-		req = server.Request{Command: server.Command(cmd), Value: args[1]}
+		req = server.Request{Command: server.Command(cmd), Value: args[1], Protocol: protocol, Port: port}
 	case "list":
 		req = server.Request{Command: server.CmdList}
+	case "listports":
+		req = server.Request{Command: server.CmdListPorts}
 	case "status":
 		req = server.Request{Command: server.CmdStatus}
 	case "clear":
@@ -88,6 +95,15 @@ func printResponse(resp server.Response) {
 	switch {
 	case resp.Stats != nil:
 		printStats(resp.Stats)
+	case resp.PortRules != nil:
+		if resp.Count == 0 {
+			fmt.Println("no port rules")
+			return
+		}
+		fmt.Println("port rules:")
+		for _, r := range resp.PortRules {
+			fmt.Printf("  %s/%d -> %s\n", r.Protocol, r.Port, r.Dst)
+		}
 	case resp.Blocked != nil:
 		if resp.Count == 0 {
 			fmt.Println("no blocked addresses")
@@ -133,18 +149,25 @@ func formatBytes(b uint64) string {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `Usage: firewallctl [-sock path] <command> [args]
+	fmt.Fprintf(os.Stderr, `Usage: firewallctl [-sock path] [-protocol p] [-dport n] <command> [args]
 
 Commands:
-  status             show firewall status
-  list               list blocked IPs/CIDRs
-  block <ip/cidr>    block an IP or CIDR (e.g. 8.8.8.8 or 10.0.0.0/8)
-  unblock <ip/cidr>  unblock an IP or CIDR
-  clear              remove all blocked addresses
-  stats              show packet/byte counters
-  help               show this help
+  status                 show firewall status
+  list                   list blocked IPs/CIDRs
+  listports              list protocol/port rules
+  block <ip/cidr>        block an IP/CIDR, or with --protocol/--dport a port rule
+  unblock <ip/cidr>      unblock an IP/CIDR or port rule
+  clear                  remove all blocked addresses
+  stats                  show packet/byte counters
+  help                   show this help
 
 Options:
-  -sock path   control socket path (default /var/run/ebpf-firewall.sock)
+  -sock path       control socket path (default /var/run/ebpf-firewall.sock)
+  -protocol p      protocol for a port rule: tcp or udp
+  -dport n         destination port for a port rule
+
+Examples:
+  firewallctl block 192.168.1.100 --protocol tcp --dport 22
+  firewallctl unblock 192.168.1.100 --protocol tcp --dport 22
 `)
 }

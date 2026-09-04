@@ -12,7 +12,7 @@ import (
 
 // XDPProgram owns the full lifecycle (load, attach, detach, close) of the XDP
 // firewall program and its maps. It intentionally knows nothing about firewall
-// policy; policy operations live in MapManager (see maps.go).
+// policy; policy operations live in MapManager (see blocklist.go).
 type XDPProgram struct {
 	ifaceName  string
 	ifaceIndex int
@@ -71,6 +71,11 @@ func (x *XDPProgram) BlockedIps() *ebpf.Map {
 // Counters returns the eBPF map holding global packet/byte counters.
 func (x *XDPProgram) Counters() *ebpf.Map {
 	return x.objs.Counters
+}
+
+// PortPolicy returns the eBPF map holding protocol/port rules.
+func (x *XDPProgram) PortPolicy() *ebpf.Map {
+	return x.objs.PortPolicy
 }
 
 // Close detaches the program (if attached) and closes all loaded objects.

@@ -31,12 +31,13 @@
 #endif
 
 /* Minimal parsed view of an IPv4 packet, sufficient for the current
- * IP/CIDR policy. Extended later with protocol/port/direction for richer
- * rules without touching the datapath control flow. */
+ * IP/CIDR policy plus protocol/destination-port rules. Extended later with
+ * direction for richer rules without touching the datapath control flow. */
 struct packet_info {
     __u32 saddr;   /* network byte order */
     __u32 daddr;   /* network byte order */
     __u8  protocol;
+    __u16 dport;   /* destination port, network byte order (0 if not TCP/UDP) */
 };
 
 static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
@@ -65,6 +66,20 @@ static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
     info.saddr = ip->saddr;
     info.daddr = ip->daddr;
     info.protocol = protocol;
+
+    /* Capture the destination port for TCP/UDP so port rules can match. */
+    if (protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp;
+        if (parse_tcphdr(nh, data_end, &tcp) == 0) {
+            info.dport = tcp->dest;
+        }
+    } else if (protocol == IPPROTO_UDP) {
+        struct udphdr *udp;
+        if (parse_udphdr(nh, data_end, &udp) == 0) {
+            info.dport = udp->dest;
+        }
+    }
+
     *ok = 1;
     return info;
 }
@@ -87,6 +102,21 @@ static __always_inline int is_blocked(const struct packet_info *info) {
     }
 
     return blocked && *blocked;
+}
+
+/* Port-policy lookup. Matches protocol + destination port against the
+ * destination address. Currently supports exact /32 destination only; the
+ * key carries the destination address in network byte order, matching the
+ * Go side (control/ebpf/portpolicy.go). */
+static __always_inline int port_rule_match(const struct packet_info *info) {
+    struct port_rule_key key = {
+        .protocol = info->protocol,
+        .dport = info->dport,
+        .dst = info->daddr,
+    };
+
+    __u32 *action = bpf_map_lookup_elem(&port_policy, &key);
+    return action && *action;
 }
 
 /* Global counter increment. Looks up the counter by index and atomically
@@ -161,7 +191,7 @@ int firewall_prog(struct xdp_md *ctx) {
     }
 
     /* 2. policy lookup + decision */
-    if (is_blocked(&info)) {
+    if (is_blocked(&info) || port_rule_match(&info)) {
         DEBUG_PRINTK("packet BLOCKED");
         incr_counter(COUNTER_TOTAL, pkt_len);
         incr_counter(COUNTER_DROP, pkt_len);

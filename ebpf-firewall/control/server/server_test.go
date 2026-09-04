@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -11,13 +12,19 @@ import (
 
 // fakePolicy is a thread-safe in-memory Policy for unit tests (no kernel).
 type fakePolicy struct {
-	mu   sync.Mutex
-	ips  map[string]struct{}
-	call bool
+	mu     sync.Mutex
+	ips    map[string]struct{}
+	rules  map[string]PortRule
+	call   bool
+	stat   Stats
+	statOK bool
 }
 
 func newFakePolicy() *fakePolicy {
-	return &fakePolicy{ips: make(map[string]struct{})}
+	return &fakePolicy{
+		ips:   make(map[string]struct{}),
+		rules: make(map[string]PortRule),
+	}
 }
 
 func (f *fakePolicy) BlockIP(cidr string) error {
@@ -56,6 +63,11 @@ func (f *fakePolicy) Interface() string {
 }
 
 func (f *fakePolicy) Stats() (Stats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.statOK {
+		return f.stat, nil
+	}
 	return Stats{
 		TotalPackets: 100,
 		TotalBytes:   5000,
@@ -64,6 +76,34 @@ func (f *fakePolicy) Stats() (Stats, error) {
 		PassPackets:  90,
 		PassBytes:    4400,
 	}, nil
+}
+
+func (f *fakePolicy) BlockPortRule(dst, protocol string, port uint16) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rules[portKey(dst, protocol, port)] = PortRule{Protocol: protocol, Port: port, Dst: dst}
+	return nil
+}
+
+func (f *fakePolicy) UnblockPortRule(dst, protocol string, port uint16) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.rules, portKey(dst, protocol, port))
+	return nil
+}
+
+func (f *fakePolicy) ListPortRules() ([]PortRule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]PortRule, 0, len(f.rules))
+	for _, r := range f.rules {
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func portKey(dst, protocol string, port uint16) string {
+	return fmt.Sprintf("%s/%s/%d", dst, protocol, port)
 }
 
 func TestHandle_BlockListUnblockClear(t *testing.T) {
@@ -97,6 +137,48 @@ func TestHandle_BlockListUnblockClear(t *testing.T) {
 	}
 }
 
+func TestHandle_BlockPortRule(t *testing.T) {
+	policy := newFakePolicy()
+	s := New("unused.sock", policy)
+
+	// block with protocol + port routes to the port-rule path
+	if resp := s.handle(Request{Command: CmdBlock, Value: "192.168.1.100", Protocol: "tcp", Port: 22}); !resp.OK {
+		t.Errorf("block port rule: %+v", resp)
+	}
+
+	resp := s.handle(Request{Command: CmdListPorts})
+	if !resp.OK || resp.Count != 1 {
+		t.Fatalf("listports: %+v", resp)
+	}
+	if resp.PortRules[0].Dst != "192.168.1.100" || resp.PortRules[0].Protocol != "tcp" || resp.PortRules[0].Port != 22 {
+		t.Errorf("unexpected rule: %+v", resp.PortRules)
+	}
+
+	// unblock with same flags removes it
+	if resp := s.handle(Request{Command: CmdUnblock, Value: "192.168.1.100", Protocol: "tcp", Port: 22}); !resp.OK {
+		t.Errorf("unblock port rule: %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdListPorts}); !resp.OK || resp.Count != 0 {
+		t.Errorf("listports after unblock: %+v", resp)
+	}
+}
+
+func TestHandle_BlockPlainIPStillWorks(t *testing.T) {
+	policy := newFakePolicy()
+	s := New("unused.sock", policy)
+
+	// block without protocol/port routes to the IP path
+	if resp := s.handle(Request{Command: CmdBlock, Value: "8.8.8.8"}); !resp.OK {
+		t.Errorf("block plain IP: %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdListPorts}); resp.Count != 0 {
+		t.Errorf("port rules should be empty, got %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdList}); resp.Count != 1 {
+		t.Errorf("IP list should have 1, got %+v", resp)
+	}
+}
+
 func TestHandle_UnknownCommand(t *testing.T) {
 	s := New("unused.sock", newFakePolicy())
 	if resp := s.handle(Request{Command: "bogus"}); resp.OK {
@@ -124,17 +206,20 @@ func TestHandle_Stats(t *testing.T) {
 // errPolicy returns an error from every blocked-side operation.
 type errPolicy struct{}
 
-func (p *errPolicy) BlockIP(string) error              { return errors.New("boom") }
-func (p *errPolicy) UnblockIP(string) error            { return errors.New("boom") }
-func (p *errPolicy) ListBlockedIPs() ([]string, error) { return nil, errors.New("boom") }
-func (p *errPolicy) Clear() error                      { return errors.New("boom") }
-func (p *errPolicy) Interface() string                 { return "" }
-func (p *errPolicy) Stats() (Stats, error)             { return Stats{}, errors.New("boom") }
+func (p *errPolicy) BlockIP(string) error                         { return errors.New("boom") }
+func (p *errPolicy) UnblockIP(string) error                       { return errors.New("boom") }
+func (p *errPolicy) ListBlockedIPs() ([]string, error)            { return nil, errors.New("boom") }
+func (p *errPolicy) Clear() error                                 { return errors.New("boom") }
+func (p *errPolicy) Interface() string                            { return "" }
+func (p *errPolicy) Stats() (Stats, error)                        { return Stats{}, errors.New("boom") }
+func (p *errPolicy) BlockPortRule(string, string, uint16) error   { return errors.New("boom") }
+func (p *errPolicy) UnblockPortRule(string, string, uint16) error { return errors.New("boom") }
+func (p *errPolicy) ListPortRules() ([]PortRule, error)           { return nil, errors.New("boom") }
 
 func TestHandle_PropagatesErrors(t *testing.T) {
 	s := New("unused.sock", &errPolicy{})
 
-	for _, cmd := range []Command{CmdBlock, CmdUnblock, CmdList, CmdClear, CmdStats} {
+	for _, cmd := range []Command{CmdBlock, CmdUnblock, CmdList, CmdClear, CmdStats, CmdListPorts} {
 		if resp := s.handle(Request{Command: cmd, Value: "x"}); resp.OK {
 			t.Errorf("%s should not be ok with failing policy: %+v", cmd, resp)
 		}

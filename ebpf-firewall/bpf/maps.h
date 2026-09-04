@@ -45,4 +45,24 @@ struct {
     __uint(max_entries, 3);
 } counters SEC(".maps");
 
+/* ── Port policy map ────────────────────────────────────────────────── */
+/* Finer-grained rules that combine a destination IP (exact /32), a
+ * protocol, and a destination port. A value of 1 means DROP. The key is
+ * an 11-byte packed struct: proto(1) + dport(2, network order) + dst(4,
+ * network order). Only the destination address is matched (classic "block
+ * SSH to X" intent). 0 in protocol means "any", 0 in port means "any". */
+
+struct port_rule_key {
+    __u8  protocol;
+    __u16 dport;   /* network byte order */
+    __u32 dst;     /* network byte order */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct port_rule_key);
+    __type(value, __u32);
+    __uint(max_entries, 65535);
+} port_policy SEC(".maps");
+
 #endif

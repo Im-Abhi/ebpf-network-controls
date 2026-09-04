@@ -7,12 +7,14 @@ import (
 )
 
 // Firewall is a thin facade coordinating the XDP program lifecycle (XDPProgram)
-// with policy map operations (MapManager) and counter reads (CounterManager).
-// It is the single handle used by cmd/firewall and the runtime control plane.
+// with policy map operations (MapManager), counter reads (CounterManager), and
+// port-policy operations (PortPolicyManager). It is the single handle used by
+// cmd/firewall and the runtime control plane.
 type Firewall struct {
-	prog       *XDPProgram
-	mgr        *MapManager
-	counterMgr *CounterManager
+	prog          *XDPProgram
+	mgr           *MapManager
+	counterMgr    *CounterManager
+	portPolicyMgr *PortPolicyManager
 }
 
 // NewFirewall loads the XDP program and its maps for the given interface but
@@ -24,9 +26,10 @@ func NewFirewall(ifaceName string) (*Firewall, error) {
 	}
 
 	return &Firewall{
-		prog:       prog,
-		mgr:        NewMapManager(prog.BlockedIps()),
-		counterMgr: NewCounterManager(prog.Counters()),
+		prog:          prog,
+		mgr:           NewMapManager(prog.BlockedIps()),
+		counterMgr:    NewCounterManager(prog.Counters()),
+		portPolicyMgr: NewPortPolicyManager(prog.PortPolicy()),
 	}, nil
 }
 
@@ -79,4 +82,31 @@ func (f *Firewall) Clear() error {
 // Stats returns the global packet and byte counters from the BPF map.
 func (f *Firewall) Stats() (server.Stats, error) {
 	return f.counterMgr.GetCounters()
+}
+
+// BlockPortRule adds a rule that DROPs traffic destined for dst on the given
+// protocol/port (protocol "tcp"/"udp"/"", port 0 for any).
+func (f *Firewall) BlockPortRule(dst, protocol string, port uint16) error {
+	if err := f.portPolicyMgr.Block(dst, protocol, port); err != nil {
+		return fmt.Errorf("blocking port rule %s/%d to %s: %w", protocol, port, dst, err)
+	}
+	return nil
+}
+
+// UnblockPortRule removes a protocol/port rule for dst.
+func (f *Firewall) UnblockPortRule(dst, protocol string, port uint16) error {
+	if err := f.portPolicyMgr.Unblock(dst, protocol, port); err != nil {
+		return fmt.Errorf("unblocking port rule %s/%d to %s: %w", protocol, port, dst, err)
+	}
+	return nil
+}
+
+// ListPortRules returns all active protocol/port rules.
+func (f *Firewall) ListPortRules() ([]PortRule, error) {
+	return f.portPolicyMgr.List()
+}
+
+// ClearPortRules removes every protocol/port rule.
+func (f *Firewall) ClearPortRules() error {
+	return f.portPolicyMgr.Clear()
 }
