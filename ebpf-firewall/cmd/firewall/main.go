@@ -19,7 +19,7 @@ func main() {
 	var ifname string
 	var blockList string
 	var sockPath string
-	flag.StringVar(&ifname, "i", "lo", "Network interface name where the eBPF programs will be attached")
+	flag.StringVar(&ifname, "i", "wlp0s20f3", "Network interface name where the eBPF programs will be attached")
 	flag.StringVar(&blockList, "block", "", "Comma-separated list of IPs/CIDRs to block (e.g. '192.168.1.5, 10.0.0.0/8')")
 	flag.StringVar(&sockPath, "sock", "/var/run/ebpf-firewall.sock", "unix socket path for control")
 	flag.Parse()
