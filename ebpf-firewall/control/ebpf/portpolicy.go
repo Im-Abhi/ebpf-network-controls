@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 
+	"ebpf-firewall/control/server"
 	"github.com/cilium/ebpf"
 )
 
@@ -19,13 +20,6 @@ const (
 	protoTCP        uint8  = 6
 	protoUDP        uint8  = 17
 )
-
-// PortRule describes a single protocol+port+destination rule.
-type PortRule struct {
-	Protocol string // "tcp", "udp", or "" (any)
-	Port     uint16 // destination port, or 0 (any)
-	Dst      string // destination IP
-}
 
 // firewallPortRuleKey mirrors struct port_rule_key in bpf/maps.h:
 //
@@ -123,10 +117,19 @@ func (pm *PortPolicyManager) Unblock(dst, protocol string, port uint16) error {
 	return pm.portPolicy.Delete(key)
 }
 
+// dportToPort converts the network-byte-order dport stored in the map key back
+// to the logical port number. The key keeps the wire bytes (e.g. port 22 ->
+// [0x00, 0x16]); on a little-endian host the stored uint16 is 0x1600, so the
+// wire bytes are rebuilt and read back big-endian to recover the port.
+func dportToPort(d uint16) uint16 {
+	b := [2]byte{byte(d), byte(d >> 8)}
+	return binary.BigEndian.Uint16(b[:])
+}
+
 // List returns all port rules currently in the map.
-func (pm *PortPolicyManager) List() ([]PortRule, error) {
+func (pm *PortPolicyManager) List() ([]server.PortRule, error) {
 	var (
-		rules []PortRule
+		rules []server.PortRule
 		key   firewallPortRuleKey
 		value uint32
 	)
@@ -134,9 +137,9 @@ func (pm *PortPolicyManager) List() ([]PortRule, error) {
 	for iter.Next(&key, &value) {
 		ipBytes := make(net.IP, 4)
 		binary.LittleEndian.PutUint32(ipBytes, key.Dst)
-		rules = append(rules, PortRule{
+		rules = append(rules, server.PortRule{
 			Protocol: codeToProto(key.Protocol),
-			Port:     key.Dport,
+			Port:     dportToPort(key.Dport),
 			Dst:      ipBytes.String(),
 		})
 	}

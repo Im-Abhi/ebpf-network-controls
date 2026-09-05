@@ -12,10 +12,24 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type firewallCounterValue struct {
+	_       structs.HostLayout
+	Packets uint64
+	Bytes   uint64
+}
+
 type firewallIpv4LpmKey struct {
 	_         structs.HostLayout
 	Prefixlen uint32
 	Data      uint32
+}
+
+type firewallPortRuleKey struct {
+	_        structs.HostLayout
+	Protocol uint8
+	_        [1]byte
+	Dport    uint16
+	Dst      uint32
 }
 
 // Names of all BPF objects in the ELF.
@@ -23,6 +37,8 @@ type firewallIpv4LpmKey struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	firewallMapBlockedIps    = "blocked_ips"
+	firewallMapCounters      = "counters"
+	firewallMapPortPolicy    = "port_policy"
 	firewallProgFirewallProg = "firewall_prog"
 )
 
@@ -76,6 +92,8 @@ type firewallProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type firewallMapSpecs struct {
 	BlockedIps *ebpf.MapSpec `ebpf:"blocked_ips"`
+	Counters   *ebpf.MapSpec `ebpf:"counters"`
+	PortPolicy *ebpf.MapSpec `ebpf:"port_policy"`
 }
 
 // firewallVariableSpecs contains global variables before they are loaded into the kernel.
@@ -105,11 +123,15 @@ func (o *firewallObjects) Close() error {
 // It can be passed to loadFirewallObjects or ebpf.CollectionSpec.LoadAndAssign.
 type firewallMaps struct {
 	BlockedIps *ebpf.Map `ebpf:"blocked_ips"`
+	Counters   *ebpf.Map `ebpf:"counters"`
+	PortPolicy *ebpf.Map `ebpf:"port_policy"`
 }
 
 func (m *firewallMaps) Close() error {
 	return _FirewallClose(
 		m.BlockedIps,
+		m.Counters,
+		m.PortPolicy,
 	)
 }
 

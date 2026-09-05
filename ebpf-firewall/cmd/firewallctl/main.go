@@ -2,30 +2,28 @@ package main
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 
 	"ebpf-firewall/control/server"
 )
 
 func main() {
-	var sockPath string
-	var protocol string
-	var portUint uint
-	flag.StringVar(&sockPath, "sock", "/var/run/ebpf-firewall.sock", "unix control socket path")
-	flag.StringVar(&protocol, "protocol", "", "protocol for a port rule: tcp or udp (with a port rule)")
-	flag.UintVar(&portUint, "dport", 0, "destination port for a port rule (with --protocol)")
-	flag.Usage = usage
-	flag.Parse()
-	port := uint16(portUint)
+	args, sockPath, protocol, portUint, err := extractOptions(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "firewallctl: %v\n", err)
+		os.Exit(2)
+	}
 
-	args := flag.Args()
 	if len(args) == 0 {
 		usage()
 		os.Exit(2)
 	}
+
+	port := uint16(portUint)
 
 	cmd := args[0]
 
@@ -63,6 +61,79 @@ func main() {
 	}
 
 	printResponse(resp)
+}
+
+// extractOptions pulls the -sock/-protocol/-dport options out of the raw
+// arguments (also accepting --x and x=value forms) so they work in any
+// position relative to the command. Go's flag package stops at the first
+// positional argument, which made the documented form
+// `block <ip> --protocol tcp --dport 22` silently ignore the options.
+// Returns the remaining positional arguments.
+func extractOptions(raw []string) (args []string, sockPath, protocol string, port uint, err error) {
+	sockPath = "/var/run/ebpf-firewall.sock"
+
+	for i := 0; i < len(raw); i++ {
+		arg := raw[i]
+		switch {
+		case arg == "-h" || arg == "--help":
+			usage()
+			os.Exit(0)
+		case arg == "-sock" || arg == "--sock":
+			if i+1 >= len(raw) {
+				return nil, "", "", 0, fmt.Errorf("%s requires a path", arg)
+			}
+			i++
+			sockPath = raw[i]
+		case strings.HasPrefix(arg, "-sock="):
+			sockPath = strings.TrimPrefix(arg, "-sock=")
+		case strings.HasPrefix(arg, "--sock="):
+			sockPath = strings.TrimPrefix(arg, "--sock=")
+		case arg == "-protocol" || arg == "--protocol":
+			if i+1 >= len(raw) {
+				return nil, "", "", 0, fmt.Errorf("%s requires a value (tcp or udp)", arg)
+			}
+			i++
+			protocol = raw[i]
+		case strings.HasPrefix(arg, "-protocol="):
+			protocol = strings.TrimPrefix(arg, "-protocol=")
+		case strings.HasPrefix(arg, "--protocol="):
+			protocol = strings.TrimPrefix(arg, "--protocol=")
+		case arg == "-dport" || arg == "--dport":
+			if i+1 >= len(raw) {
+				return nil, "", "", 0, fmt.Errorf("%s requires a numeric value (0-65535)", arg)
+			}
+			i++
+			port, err = parsePort(raw[i])
+			if err != nil {
+				return nil, "", "", 0, err
+			}
+		case strings.HasPrefix(arg, "-dport="):
+			port, err = parsePort(strings.TrimPrefix(arg, "-dport="))
+			if err != nil {
+				return nil, "", "", 0, err
+			}
+		case strings.HasPrefix(arg, "--dport="):
+			port, err = parsePort(strings.TrimPrefix(arg, "--dport="))
+			if err != nil {
+				return nil, "", "", 0, err
+			}
+		case strings.HasPrefix(arg, "-"):
+			return nil, "", "", 0, fmt.Errorf("unknown option %q", arg)
+		default:
+			args = append(args, arg)
+		}
+	}
+
+	return args, sockPath, protocol, port, nil
+}
+
+// parsePort validates a -dport value, which must fit in a uint16.
+func parsePort(s string) (uint, error) {
+	n, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
+		return 0, fmt.Errorf("invalid -dport %q (must be 0-65535)", s)
+	}
+	return uint(n), nil
 }
 
 // roundTrip dials the Unix socket, sends one request, and decodes the response.
@@ -151,13 +222,17 @@ func formatBytes(b uint64) string {
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage: firewallctl [-sock path] [-protocol p] [-dport n] <command> [args]
 
+Options may appear before or after the command, e.g.
+  firewallctl block 1.2.3.4 --protocol tcp --dport 22
+  firewallctl --dport 443 --protocol udp unblock 1.2.3.4
+
 Commands:
   status                 show firewall status
   list                   list blocked IPs/CIDRs
   listports              list protocol/port rules
   block <ip/cidr>        block an IP/CIDR, or with --protocol/--dport a port rule
   unblock <ip/cidr>      unblock an IP/CIDR or port rule
-  clear                  remove all blocked addresses
+  clear                  remove all rules (IP blocklist and port rules)
   stats                  show packet/byte counters
   help                   show this help
 
@@ -165,9 +240,5 @@ Options:
   -sock path       control socket path (default /var/run/ebpf-firewall.sock)
   -protocol p      protocol for a port rule: tcp or udp
   -dport n         destination port for a port rule
-
-Examples:
-  firewallctl block 192.168.1.100 --protocol tcp --dport 22
-  firewallctl unblock 192.168.1.100 --protocol tcp --dport 22
 `)
 }

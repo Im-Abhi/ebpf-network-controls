@@ -102,6 +102,13 @@ func (f *fakePolicy) ListPortRules() ([]PortRule, error) {
 	return out, nil
 }
 
+func (f *fakePolicy) ClearPortRules() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rules = make(map[string]PortRule)
+	return nil
+}
+
 func portKey(dst, protocol string, port uint16) string {
 	return fmt.Sprintf("%s/%s/%d", dst, protocol, port)
 }
@@ -179,6 +186,29 @@ func TestHandle_BlockPlainIPStillWorks(t *testing.T) {
 	}
 }
 
+func TestHandle_ClearRemovesPortRules(t *testing.T) {
+	policy := newFakePolicy()
+	s := New("unused.sock", policy)
+
+	if resp := s.handle(Request{Command: CmdBlock, Value: "192.168.1.100", Protocol: "tcp", Port: 22}); !resp.OK {
+		t.Fatalf("block port rule: %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdBlock, Value: "8.8.8.8"}); !resp.OK {
+		t.Fatalf("block ip: %+v", resp)
+	}
+
+	if resp := s.handle(Request{Command: CmdClear}); !resp.OK {
+		t.Fatalf("clear: %+v", resp)
+	}
+
+	if resp := s.handle(Request{Command: CmdList}); resp.OK && resp.Count != 0 {
+		t.Errorf("list after clear = %+v, want empty", resp)
+	}
+	if resp := s.handle(Request{Command: CmdListPorts}); resp.OK && resp.Count != 0 {
+		t.Errorf("listports after clear = %+v, want empty", resp)
+	}
+}
+
 func TestHandle_UnknownCommand(t *testing.T) {
 	s := New("unused.sock", newFakePolicy())
 	if resp := s.handle(Request{Command: "bogus"}); resp.OK {
@@ -215,6 +245,7 @@ func (p *errPolicy) Stats() (Stats, error)                        { return Stats
 func (p *errPolicy) BlockPortRule(string, string, uint16) error   { return errors.New("boom") }
 func (p *errPolicy) UnblockPortRule(string, string, uint16) error { return errors.New("boom") }
 func (p *errPolicy) ListPortRules() ([]PortRule, error)           { return nil, errors.New("boom") }
+func (p *errPolicy) ClearPortRules() error                        { return errors.New("boom") }
 
 func TestHandle_PropagatesErrors(t *testing.T) {
 	s := New("unused.sock", &errPolicy{})

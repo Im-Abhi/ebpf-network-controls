@@ -102,7 +102,7 @@ func (f *Firewall) UnblockPortRule(dst, protocol string, port uint16) error {
 }
 
 // ListPortRules returns all active protocol/port rules.
-func (f *Firewall) ListPortRules() ([]PortRule, error) {
+func (f *Firewall) ListPortRules() ([]server.PortRule, error) {
 	return f.portPolicyMgr.List()
 }
 

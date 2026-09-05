@@ -23,6 +23,7 @@ type Policy interface {
 	BlockPortRule(dst, protocol string, port uint16) error
 	UnblockPortRule(dst, protocol string, port uint16) error
 	ListPortRules() ([]PortRule, error)
+	ClearPortRules() error
 }
 
 // Server exposes a newline-delimited JSON API over a Unix socket. Each command
@@ -209,6 +210,9 @@ func (s *Server) handle(req Request) Response {
 
 	case CmdClear:
 		if err := s.policy.Clear(); err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+		if err := s.policy.ClearPortRules(); err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
 		return Response{OK: true}

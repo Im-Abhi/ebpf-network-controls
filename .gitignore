@@ -20,7 +20,7 @@ bin/
 /firewall
 /ebpf-firewall/firewall
 /ebpf-firewall/bin/
-firewallctl
+/ebpf-firewall/bin/firewallctl
 
 # Temporary / Scratch directories
 scratch/
