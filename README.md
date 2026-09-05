@@ -15,11 +15,12 @@ What works today (MTP1 core — XDP firewall):
 
 - **XDP firewall** (`bpf/firewall.c`)
 - **IPv4 exact IP / CIDR filtering** via an **LPM trie**
-- **Protocol + destination-port filtering** (e.g. `block 1.2.3.4 --protocol tcp --dport 22`)
+- **Protocol + destination-port rules** (e.g. `block 1.2.3.4 --protocol tcp --dport 22`), verified end-to-end
+- **Counters / telemetry** — total, drop and pass packet/byte counters (`firewallctl stats`)
 - **CO-RE** (`vmlinux.h`) – portable across kernels without compile-time headers
 - **Go control plane** (`control/`)
 - **Unix socket API** (`control/server/`) for dynamic, runtime rule updates
-- **`firewallctl`** client for live `block` / `unblock` / `list` / `status` / `stats` / `listports` / `clear`
+- **`firewallctl`** client for live `block` / `unblock` / `list` / `listports` / `status` / `stats` / `clear`; `--protocol` / `--dport` / `-sock` work in any position (before or after the command)
 - **Unit + integration tests** (`make test`, `make integration-test`)
 
 ### Default policy
@@ -32,6 +33,26 @@ No matching policy:     PASS
 ```
 
 The firewall is **default-allow**: packets are passed unless they match the blocklist.
+
+### Port rules (ingress only)
+
+XDP is a **receive-side hook**: the program sees packets *entering* the interface
+(inbound, or forwarded) and **cannot filter outbound traffic** the host itself
+sends. Port rules are therefore ingress filters that protect services **on this
+host**:
+
+```bash
+sudo ./bin/firewallctl block 10.0.0.1 --protocol tcp --dport 22
+```
+
+drops inbound TCP connections *to* `10.0.0.1` on port 22 (e.g. SSH attempts
+from other machines). A port rule is an exact match on **dst IP (host) +
+protocol + dst port**; it does not filter egress packets (for that you would
+need TC egress, not yet implemented).
+
+`clear` removes **both** the IP blocklist and all port rules in one call.
+Rule maps are anonymous kernel objects tied to the running daemon — they are
+reset when the daemon exits (no persistence across runs).
 
 ### Architecture (current)
 
@@ -83,8 +104,6 @@ ebpf-firewall/
 
 These are **planned**, not yet implemented:
 
-- **Counters / telemetry** (packet & byte stats, drop counters)
-- **Protocol / port policies** (e.g. `TCP + dst port 22 → DROP`)
 - **TC ingress / egress** (attach points beyond XDP)
 - **Flow / connection state tracking**
 - **Attack detection** (e.g. SYN floods)
