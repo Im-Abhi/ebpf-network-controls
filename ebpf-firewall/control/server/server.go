@@ -15,15 +15,19 @@ import (
 // fake without a kernel.
 type Policy interface {
 	BlockIP(cidr string) error
+	BlockIPWithAction(cidr, action string) error
 	UnblockIP(cidr string) error
 	ListBlockedIPs() ([]string, error)
 	Clear() error
 	Interface() string
 	Stats() (Stats, error)
 	BlockPortRule(dst, protocol string, port uint16) error
+	BlockPortRuleWithAction(dst, protocol string, port uint16, action string) error
 	UnblockPortRule(dst, protocol string, port uint16) error
 	ListPortRules() ([]PortRule, error)
 	ClearPortRules() error
+	SetDefaultPolicy(s string) error
+	DefaultPolicy() (string, error)
 }
 
 // Server exposes a newline-delimited JSON API over a Unix socket. Each command
@@ -165,12 +169,20 @@ func (s *Server) handle(req Request) Response {
 	switch req.Command {
 	case CmdBlock:
 		if req.Protocol != "" || req.Port != 0 {
-			if err := s.policy.BlockPortRule(req.Value, req.Protocol, req.Port); err != nil {
+			if req.Action != "" {
+				if err := s.policy.BlockPortRuleWithAction(req.Value, req.Protocol, req.Port, req.Action); err != nil {
+					return Response{OK: false, Error: err.Error()}
+				}
+			} else if err := s.policy.BlockPortRule(req.Value, req.Protocol, req.Port); err != nil {
 				return Response{OK: false, Error: err.Error()}
 			}
 			return Response{OK: true}
 		}
-		if err := s.policy.BlockIP(req.Value); err != nil {
+		if req.Action != "" {
+			if err := s.policy.BlockIPWithAction(req.Value, req.Action); err != nil {
+				return Response{OK: false, Error: err.Error()}
+			}
+		} else if err := s.policy.BlockIP(req.Value); err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
 		return Response{OK: true}
@@ -206,7 +218,17 @@ func (s *Server) handle(req Request) Response {
 		if err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
-		return Response{OK: true, Iface: s.policy.Interface(), Attached: s.live, Count: len(blocked)}
+		def, err := s.policy.DefaultPolicy()
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+		return Response{OK: true, Iface: s.policy.Interface(), Attached: s.live, Count: len(blocked), Default: def}
+
+	case CmdSetDefault, CmdDefault:
+		if err := s.policy.SetDefaultPolicy(req.Value); err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+		return Response{OK: true}
 
 	case CmdClear:
 		if err := s.policy.Clear(); err != nil {

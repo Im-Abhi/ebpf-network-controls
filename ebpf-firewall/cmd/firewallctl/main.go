@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	args, sockPath, protocol, portUint, err := extractOptions(os.Args[1:])
+	args, sockPath, protocol, action, portUint, err := extractOptions(os.Args[1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "firewallctl: %v\n", err)
 		os.Exit(2)
@@ -34,7 +34,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "firewallctl: %s requires an IP/CIDR argument\n", cmd)
 			os.Exit(2)
 		}
-		req = server.Request{Command: server.Command(cmd), Value: args[1], Protocol: protocol, Port: port}
+		req = server.Request{Command: server.Command(cmd), Value: args[1], Protocol: protocol, Port: port, Action: action}
 	case "list":
 		req = server.Request{Command: server.CmdList}
 	case "listports":
@@ -45,6 +45,12 @@ func main() {
 		req = server.Request{Command: server.CmdClear}
 	case "stats":
 		req = server.Request{Command: server.CmdStats}
+	case "default":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "firewallctl: default requires allow or deny")
+			os.Exit(2)
+		}
+		req = server.Request{Command: server.CmdDefault, Value: args[1]}
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -69,7 +75,7 @@ func main() {
 // positional argument, which made the documented form
 // `block <ip> --protocol tcp --dport 22` silently ignore the options.
 // Returns the remaining positional arguments.
-func extractOptions(raw []string) (args []string, sockPath, protocol string, port uint, err error) {
+func extractOptions(raw []string) (args []string, sockPath, protocol, action string, port uint, err error) {
 	sockPath = "/var/run/ebpf-firewall.sock"
 
 	for i := 0; i < len(raw); i++ {
@@ -80,7 +86,7 @@ func extractOptions(raw []string) (args []string, sockPath, protocol string, por
 			os.Exit(0)
 		case arg == "-sock" || arg == "--sock":
 			if i+1 >= len(raw) {
-				return nil, "", "", 0, fmt.Errorf("%s requires a path", arg)
+				return nil, "", "", "", 0, fmt.Errorf("%s requires a path", arg)
 			}
 			i++
 			sockPath = raw[i]
@@ -90,7 +96,7 @@ func extractOptions(raw []string) (args []string, sockPath, protocol string, por
 			sockPath = strings.TrimPrefix(arg, "--sock=")
 		case arg == "-protocol" || arg == "--protocol":
 			if i+1 >= len(raw) {
-				return nil, "", "", 0, fmt.Errorf("%s requires a value (tcp or udp)", arg)
+				return nil, "", "", "", 0, fmt.Errorf("%s requires a value (tcp or udp)", arg)
 			}
 			i++
 			protocol = raw[i]
@@ -98,33 +104,43 @@ func extractOptions(raw []string) (args []string, sockPath, protocol string, por
 			protocol = strings.TrimPrefix(arg, "-protocol=")
 		case strings.HasPrefix(arg, "--protocol="):
 			protocol = strings.TrimPrefix(arg, "--protocol=")
+		case arg == "-action" || arg == "--action":
+			if i+1 >= len(raw) {
+				return nil, "", "", "", 0, fmt.Errorf("%s requires a value (pass or drop)", arg)
+			}
+			i++
+			action = raw[i]
+		case strings.HasPrefix(arg, "-action="):
+			action = strings.TrimPrefix(arg, "-action=")
+		case strings.HasPrefix(arg, "--action="):
+			action = strings.TrimPrefix(arg, "--action=")
 		case arg == "-dport" || arg == "--dport":
 			if i+1 >= len(raw) {
-				return nil, "", "", 0, fmt.Errorf("%s requires a numeric value (0-65535)", arg)
+				return nil, "", "", "", 0, fmt.Errorf("%s requires a numeric value (0-65535)", arg)
 			}
 			i++
 			port, err = parsePort(raw[i])
 			if err != nil {
-				return nil, "", "", 0, err
+				return nil, "", "", "", 0, err
 			}
 		case strings.HasPrefix(arg, "-dport="):
 			port, err = parsePort(strings.TrimPrefix(arg, "-dport="))
 			if err != nil {
-				return nil, "", "", 0, err
+				return nil, "", "", "", 0, err
 			}
 		case strings.HasPrefix(arg, "--dport="):
 			port, err = parsePort(strings.TrimPrefix(arg, "--dport="))
 			if err != nil {
-				return nil, "", "", 0, err
+				return nil, "", "", "", 0, err
 			}
 		case strings.HasPrefix(arg, "-"):
-			return nil, "", "", 0, fmt.Errorf("unknown option %q", arg)
+			return nil, "", "", "", 0, fmt.Errorf("unknown option %q", arg)
 		default:
 			args = append(args, arg)
 		}
 	}
 
-	return args, sockPath, protocol, port, nil
+	return args, sockPath, protocol, action, port, nil
 }
 
 // parsePort validates a -dport value, which must fit in a uint16.
@@ -173,7 +189,7 @@ func printResponse(resp server.Response) {
 		}
 		fmt.Println("port rules:")
 		for _, r := range resp.PortRules {
-			fmt.Printf("  %s/%d -> %s\n", r.Protocol, r.Port, r.Dst)
+			fmt.Printf("  %s/%d -> %s [%s]\n", r.Protocol, r.Port, r.Dst, r.Action)
 		}
 	case resp.Blocked != nil:
 		if resp.Count == 0 {
@@ -188,6 +204,7 @@ func printResponse(resp server.Response) {
 		fmt.Printf("interface: %s\n", resp.Iface)
 		fmt.Printf("control plane: %v\n", resp.Attached)
 		fmt.Printf("blocked: %d\n", resp.Count)
+		fmt.Printf("default policy: %s\n", resp.Default)
 	default:
 		fmt.Println("ok")
 	}
@@ -220,7 +237,7 @@ func formatBytes(b uint64) string {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `Usage: firewallctl [-sock path] [-protocol p] [-dport n] <command> [args]
+	fmt.Fprintf(os.Stderr, `Usage: firewallctl [-sock path] [-protocol p] [-dport n] [-action a] <command> [args]
 
 Options may appear before or after the command, e.g.
   firewallctl block 1.2.3.4 --protocol tcp --dport 22
@@ -232,6 +249,7 @@ Commands:
   listports              list protocol/port rules
   block <ip/cidr>        block an IP/CIDR, or with --protocol/--dport a port rule
   unblock <ip/cidr>      unblock an IP/CIDR or port rule
+  default allow|deny     set the default (fallback) policy on no match
   clear                  remove all rules (IP blocklist and port rules)
   stats                  show packet/byte counters
   help                   show this help
@@ -240,5 +258,6 @@ Options:
   -sock path       control socket path (default /var/run/ebpf-firewall.sock)
   -protocol p      protocol for a port rule: tcp or udp
   -dport n         destination port for a port rule
+  -action a        rule action: pass or drop (default drop)
 `)
 }

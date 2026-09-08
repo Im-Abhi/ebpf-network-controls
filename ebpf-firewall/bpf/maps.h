@@ -9,6 +9,30 @@
 #define BPF_F_NO_PREALLOC (1U << 0)
 #endif
 
+/* ── Rule actions ───────────────────────────────────────────────────── */
+/* Values stored in rule maps encode the action to take on a match. These
+ * match the Go constants in control/ebpf/action.go. */
+enum rule_action {
+    ACTION_PASS = 0,
+    ACTION_DROP = 1,
+};
+
+/* ── Config map ─────────────────────────────────────────────────────── */
+/* Single-entry array holding the fallback (default) policy applied when no
+ * rule matches. Entry 0 of the `default_policy` sub-field is an enum
+ * (0 = ALLOW/PASS, 1 = DENY/DROP). Read once per packet by the datapath. */
+enum default_policy {
+    DEFAULT_ALLOW = 0,
+    DEFAULT_DENY  = 1,
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1);
+} config SEC(".maps");
+
 /* ── Policy map ─────────────────────────────────────────────────────── */
 
 struct ipv4_lpm_key {
@@ -47,10 +71,11 @@ struct {
 
 /* ── Port policy map ────────────────────────────────────────────────── */
 /* Finer-grained rules that combine a destination IP (exact /32), a
- * protocol, and a destination port. A value of 1 means DROP. The key is
- * an 11-byte packed struct: proto(1) + dport(2, network order) + dst(4,
- * network order). Only the destination address is matched (classic "block
- * SSH to X" intent). 0 in protocol means "any", 0 in port means "any". */
+ * protocol, and a destination port. The value is a rule_action
+ * (0 = PASS, 1 = DROP). The key is an 11-byte packed struct:
+ * proto(1) + dport(2, network order) + dst(4, network order). Only the
+ * destination address is matched (classic "block SSH to X" intent).
+ * 0 in protocol means "any", 0 in port means "any". */
 
 struct port_rule_key {
     __u8  protocol;

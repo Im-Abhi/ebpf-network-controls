@@ -4,13 +4,15 @@ package server
 type Command string
 
 const (
-	CmdBlock     Command = "block"
-	CmdUnblock   Command = "unblock"
-	CmdList      Command = "list"
-	CmdStatus    Command = "status"
-	CmdClear     Command = "clear"
-	CmdStats     Command = "stats"
-	CmdListPorts Command = "listports"
+	CmdBlock      Command = "block"
+	CmdUnblock    Command = "unblock"
+	CmdList       Command = "list"
+	CmdStatus     Command = "status"
+	CmdClear      Command = "clear"
+	CmdStats      Command = "stats"
+	CmdListPorts  Command = "listports"
+	CmdSetDefault Command = "setdefault"
+	CmdDefault    Command = "default"
 )
 
 // Request is a single JSON command received over the control socket.
@@ -19,13 +21,16 @@ type Request struct {
 	Value    string  `json:"value,omitempty"`
 	Protocol string  `json:"protocol,omitempty"`
 	Port     uint16  `json:"port,omitempty"`
+	Action   string  `json:"action,omitempty"`
 }
 
 // PortRule is a protocol+port+destination rule as returned by the server.
+// Action is the per-rule verdict ("pass" or "drop").
 type PortRule struct {
 	Protocol string `json:"protocol,omitempty"`
 	Port     uint16 `json:"port,omitempty"`
 	Dst      string `json:"dst"`
+	Action   string `json:"action"`
 }
 
 // Stats holds aggregated global packet and byte counters.
@@ -48,4 +53,5 @@ type Response struct {
 	Attached  bool       `json:"attached,omitempty"`
 	Stats     *Stats     `json:"stats,omitempty"`
 	PortRules []PortRule `json:"port_rules,omitempty"`
+	Default   string     `json:"default_policy,omitempty"`
 }
