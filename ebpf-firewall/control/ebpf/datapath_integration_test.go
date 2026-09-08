@@ -172,7 +172,7 @@ func TestDatapath_CIDR_Drops(t *testing.T) {
 
 	mustVerdict(t, fw, tcpPkt("11.0.0.1", "10.1.2.3", 1000, 80), testXDPDrop)
 	mustVerdict(t, fw, tcpPkt("10.2.3.4", "9.9.9.9", 1000, 80), testXDPDrop)
-	mustVerdict(t, fw, tcpPkt("10.255.1.1", "11.0.0.1", 1000, 80), testXDPPass)
+	mustVerdict(t, fw, tcpPkt("11.0.0.1", "172.16.0.1", 1000, 80), testXDPPass)
 }
 
 func TestDatapath_PortRule_DropsOnlyMatching(t *testing.T) {

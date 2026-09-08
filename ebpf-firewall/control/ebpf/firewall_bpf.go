@@ -36,10 +36,11 @@ type firewallPortRuleKey struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	firewallMapBlockedIps    = "blocked_ips"
-	firewallMapCounters      = "counters"
-	firewallMapPortPolicy    = "port_policy"
-	firewallProgFirewallProg = "firewall_prog"
+	firewallMapBlockedIps     = "blocked_ips"
+	firewallMapCounters       = "counters"
+	firewallMapFirewallConfig = "firewall_config"
+	firewallMapPortPolicy     = "port_policy"
+	firewallProgFirewallProg  = "firewall_prog"
 )
 
 // loadFirewall returns the embedded CollectionSpec for firewall.
@@ -91,9 +92,10 @@ type firewallProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type firewallMapSpecs struct {
-	BlockedIps *ebpf.MapSpec `ebpf:"blocked_ips"`
-	Counters   *ebpf.MapSpec `ebpf:"counters"`
-	PortPolicy *ebpf.MapSpec `ebpf:"port_policy"`
+	BlockedIps     *ebpf.MapSpec `ebpf:"blocked_ips"`
+	Counters       *ebpf.MapSpec `ebpf:"counters"`
+	FirewallConfig *ebpf.MapSpec `ebpf:"firewall_config"`
+	PortPolicy     *ebpf.MapSpec `ebpf:"port_policy"`
 }
 
 // firewallVariableSpecs contains global variables before they are loaded into the kernel.
@@ -122,15 +124,17 @@ func (o *firewallObjects) Close() error {
 //
 // It can be passed to loadFirewallObjects or ebpf.CollectionSpec.LoadAndAssign.
 type firewallMaps struct {
-	BlockedIps *ebpf.Map `ebpf:"blocked_ips"`
-	Counters   *ebpf.Map `ebpf:"counters"`
-	PortPolicy *ebpf.Map `ebpf:"port_policy"`
+	BlockedIps     *ebpf.Map `ebpf:"blocked_ips"`
+	Counters       *ebpf.Map `ebpf:"counters"`
+	FirewallConfig *ebpf.Map `ebpf:"firewall_config"`
+	PortPolicy     *ebpf.Map `ebpf:"port_policy"`
 }
 
 func (m *firewallMaps) Close() error {
 	return _FirewallClose(
 		m.BlockedIps,
 		m.Counters,
+		m.FirewallConfig,
 		m.PortPolicy,
 	)
 }

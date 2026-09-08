@@ -1,6 +1,6 @@
 //go:build integration
 
-package server
+package server_test
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"ebpf-firewall/control/ebpf"
+	. "ebpf-firewall/control/server"
 )
 
 // request sends one JSON request over a unix socket and returns the response.

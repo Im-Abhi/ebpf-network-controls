@@ -31,7 +31,7 @@ struct {
     __type(key, __u32);
     __type(value, __u32);
     __uint(max_entries, 1);
-} config SEC(".maps");
+} firewall_config SEC(".maps");
 
 /* ── Policy map ─────────────────────────────────────────────────────── */
 

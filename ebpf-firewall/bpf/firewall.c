@@ -97,41 +97,56 @@ static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
  * destination address' match. Checks source first, then destination. Both keys
  * use the same 8-byte LPM layout with the address in network byte order,
  * matching the Go side (control/ebpf/blocklist.go). */
-static __always_inline enum rule_action ip_block_action(const struct packet_info *info) {
+static __always_inline int ip_block_action(const struct packet_info *info,
+                                           enum rule_action *out_action) {
     struct ipv4_lpm_key key = {
         .prefixlen = 32,
         .data = info->saddr,
     };
 
-    __u32 *action = bpf_map_lookup_elem(&blocked_ips, &key);
-    if (!action) {
+    __u32 *elem = bpf_map_lookup_elem(&blocked_ips, &key);
+    if (!elem) {
         key.data = info->daddr;
-        action = bpf_map_lookup_elem(&blocked_ips, &key);
+        elem = bpf_map_lookup_elem(&blocked_ips, &key);
     }
 
-    return action ? (enum rule_action)*action : ACTION_PASS;
+    if (!elem) {
+        *out_action = ACTION_PASS;
+        return 0;
+    }
+
+    *out_action = (enum rule_action)*elem;
+    return 1;
 }
 
 /* Port-policy lookup. Matches protocol + destination port against the
  * destination address and returns the stored rule_action. Currently supports
  * exact /32 destination only; the key carries the destination address in
  * network byte order, matching the Go side (control/ebpf/portpolicy.go). */
-static __always_inline enum rule_action port_rule_action(const struct packet_info *info) {
+static __always_inline int port_rule_action(const struct packet_info *info,
+                                            enum rule_action *out_action) {
     struct port_rule_key key = {
         .protocol = info->protocol,
         .dport = info->dport,
         .dst = info->daddr,
     };
 
-    __u32 *action = bpf_map_lookup_elem(&port_policy, &key);
-    return action ? (enum rule_action)*action : ACTION_PASS;
+    __u32 *elem = bpf_map_lookup_elem(&port_policy, &key);
+
+    if (!elem) {
+        *out_action = ACTION_PASS;
+        return 0;
+    }
+
+    *out_action = (enum rule_action)*elem;
+    return 1;
 }
 
 /* Reads the configured default policy from the config map. Falls back to
  * DEFAULT_ALLOW if the entry is absent. */
 static __always_inline enum default_policy default_policy(void) {
     __u32 key = 0;
-    __u32 *policy = bpf_map_lookup_elem(&config, &key);
+    __u32 *policy = bpf_map_lookup_elem(&firewall_config, &key);
     if (!policy) {
         return DEFAULT_ALLOW;
     }
@@ -140,12 +155,18 @@ static __always_inline enum default_policy default_policy(void) {
 
 /* Applies the decision table. DROP from any matched rule wins; otherwise PASS
  * from any matched rule; otherwise the configured default policy. */
-static __always_inline int decide(enum rule_action ip_action,
-                                  enum rule_action port_action) {
-    if (ip_action == ACTION_DROP || port_action == ACTION_DROP) {
+static __always_inline int decide(int ip_matched, enum rule_action ip_action,
+                                  int port_matched, enum rule_action port_action) {
+    if (ip_matched && ip_action == ACTION_DROP) {
         return XDP_DROP;
     }
-    if (ip_action == ACTION_PASS || port_action == ACTION_PASS) {
+    if (port_matched && port_action == ACTION_DROP) {
+        return XDP_DROP;
+    }
+    if (ip_matched && ip_action == ACTION_PASS) {
+        return XDP_PASS;
+    }
+    if (port_matched && port_action == ACTION_PASS) {
         return XDP_PASS;
     }
     return default_policy() == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
@@ -228,11 +249,12 @@ int firewall_prog(struct xdp_md *ctx) {
     }
 
     /* 2. policy lookups, each returning an action */
-    enum rule_action ip_action = ip_block_action(&info);
-    enum rule_action port_action = port_rule_action(&info);
+    enum rule_action ip_action, port_action;
+    int ip_matched = ip_block_action(&info, &ip_action);
+    int port_matched = port_rule_action(&info, &port_action);
 
     /* 3. decision (data-driven; DROP wins, else PASS, else default) */
-    int verdict = decide(ip_action, port_action);
+    int verdict = decide(ip_matched, ip_action, port_matched, port_action);
     if (verdict == XDP_DROP) {
         DEBUG_PRINTK("packet DROPPED");
         incr_counter(COUNTER_TOTAL, pkt_len);
