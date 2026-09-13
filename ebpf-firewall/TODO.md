@@ -31,9 +31,10 @@ MTP2+ are the thesis-level extensions built on top of it.
 ### MTP1-C: Richer rule semantics
 
 - [x] Protocol-based rules (`IP + protocol + destination port → DROP`)
+- [x] Source-port matching (`--sport n`, 0 = any; most-specific-first across `(proto, dport, sport)`)
 - [x] Explicit rule actions (PASS / DROP) — configurable per rule
 - [x] Configurable default policy (ALLOW / DENY) via `firewallctl default`
-- [x] Packet-level tests (BPF_PROG_TEST_RUN: blocked → DROP, allowed → PASS, CIDR → DROP, port → DROP, PASS overrides default-deny, DROP wins)
+- [x] Packet-level tests (BPF_PROG_TEST_RUN: blocked → DROP, allowed → PASS, CIDR → DROP, port → DROP, src-port → DROP, specificity, PASS overrides default-deny, DROP wins)
 - [ ] Port-based filtering with CIDR networks (currently exact `/32` only)
 - [ ] Rule priority (deterministic winner when rules overlap)
 - [ ] Direction-aware rules (INGRESS / EGRESS)

@@ -24,6 +24,7 @@ const (
 //	struct port_rule_key {
 //	    __u8  protocol;   // IPPROTO_TCP/UDP, 0 = any
 //	    __u16 dport;      // destination port, network byte order, 0 = any
+//	    __u16 sport;      // source port, network byte order, 0 = any
 //	    __u32 dst;        // destination IP, network byte order
 //	};
 //
@@ -66,8 +67,17 @@ func codeToProto(code uint8) string {
 	}
 }
 
-// newPortKey builds the map key for a (dst, protocol, port) rule.
-func (pm *PortPolicyManager) newPortKey(dst string, proto uint8, port uint16) (firewallPortRuleKey, error) {
+// wireToPort converts a network-byte-order port stored in the map key back to
+// the logical port number. The key keeps the wire bytes (e.g. port 22 ->
+// [0x00, 0x16]); on a little-endian host the stored uint16 is 0x1600, so the
+// wire bytes are rebuilt and read back big-endian to recover the port.
+func wireToPort(w uint16) uint16 {
+	b := [2]byte{byte(w), byte(w >> 8)}
+	return binary.BigEndian.Uint16(b[:])
+}
+
+// newPortKey builds the map key for a (dst, protocol, dport, sport) rule.
+func (pm *PortPolicyManager) newPortKey(dst string, proto uint8, dport, sport uint16) (firewallPortRuleKey, error) {
 	var key firewallPortRuleKey
 
 	ip := net.ParseIP(strings.TrimSpace(dst)).To4()
@@ -78,55 +88,60 @@ func (pm *PortPolicyManager) newPortKey(dst string, proto uint8, port uint16) (f
 	key.Protocol = proto
 	key.Dst = binary.LittleEndian.Uint32(ip)
 
-	// dport must be in network byte order: the C datapath compares it against
-	// tcp->dest, whose in-memory bytes are the wire bytes (high byte first,
-	// e.g. port 22 -> [0x00, 0x16]). Store the value whose little-endian bytes
-	// reproduce that sequence, i.e. htons(port) on a little-endian host.
-	netBytes := []byte{byte(port >> 8), byte(port & 0xff)}
-	key.Dport = binary.LittleEndian.Uint16(netBytes)
+	// Ports must be in network byte order: the C datapath compares them against
+	// tcp->dest / tcp->source, whose in-memory bytes are the wire bytes (high
+	// byte first, e.g. port 22 -> [0x00, 0x16]). Store the value whose
+	// little-endian bytes reproduce that sequence, i.e. htons(port).
+	key.Dport = portToWire(dport)
+	key.Sport = portToWire(sport)
 
 	return key, nil
 }
 
-// Block adds a port rule that DROPs traffic to dst on the given protocol/port.
-// protocol may be "tcp", "udp", or "" (any). port of 0 means any port.
-func (pm *PortPolicyManager) Block(dst, protocol string, port uint16) error {
-	return pm.BlockWithAction(dst, protocol, port, ActionDrop)
+// portToWire converts a logical port to its network-byte-order wire encoding
+// as stored in the map key (see newPortKey).
+func portToWire(p uint16) uint16 {
+	netBytes := []byte{byte(p >> 8), byte(p & 0xff)}
+	return binary.LittleEndian.Uint16(netBytes)
 }
 
-// BlockWithAction adds a port rule with an explicit action (PASS or DROP).
-func (pm *PortPolicyManager) BlockWithAction(dst, protocol string, port uint16, action Action) error {
+// Block adds a port rule that DROPs traffic to dst on the given protocol/dport
+// (any source port). protocol may be "tcp", "udp", or "" (any). dport of 0
+// means any destination port.
+func (pm *PortPolicyManager) Block(dst, protocol string, dport uint16) error {
+	return pm.BlockWithAction(dst, protocol, dport, 0, ActionDrop)
+}
+
+// BlockWithAction adds a port rule with an explicit action (PASS or DROP),
+// matching dport and sport as given (0 = any for either).
+func (pm *PortPolicyManager) BlockWithAction(dst, protocol string, dport, sport uint16, action Action) error {
 	proto, err := protoToCode(protocol)
 	if err != nil {
 		return err
 	}
-	key, err := pm.newPortKey(dst, proto, port)
+	key, err := pm.newPortKey(dst, proto, dport, sport)
 	if err != nil {
 		return err
 	}
 	return pm.portPolicy.Put(key, uint32(action))
 }
 
-// Unblock removes a port rule matching dst, protocol, and port.
-func (pm *PortPolicyManager) Unblock(dst, protocol string, port uint16) error {
+// Unblock removes a port rule matching dst, protocol, and dport.
+func (pm *PortPolicyManager) Unblock(dst, protocol string, dport uint16) error {
+	return pm.UnblockWithAction(dst, protocol, dport, 0)
+}
+
+// UnblockWithAction removes the port rule for dst, protocol, dport and sport.
+func (pm *PortPolicyManager) UnblockWithAction(dst, protocol string, dport, sport uint16) error {
 	proto, err := protoToCode(protocol)
 	if err != nil {
 		return err
 	}
-	key, err := pm.newPortKey(dst, proto, port)
+	key, err := pm.newPortKey(dst, proto, dport, sport)
 	if err != nil {
 		return err
 	}
 	return pm.portPolicy.Delete(key)
-}
-
-// dportToPort converts the network-byte-order dport stored in the map key back
-// to the logical port number. The key keeps the wire bytes (e.g. port 22 ->
-// [0x00, 0x16]); on a little-endian host the stored uint16 is 0x1600, so the
-// wire bytes are rebuilt and read back big-endian to recover the port.
-func dportToPort(d uint16) uint16 {
-	b := [2]byte{byte(d), byte(d >> 8)}
-	return binary.BigEndian.Uint16(b[:])
 }
 
 // List returns all port rules currently in the map.
@@ -142,7 +157,8 @@ func (pm *PortPolicyManager) List() ([]server.PortRule, error) {
 		binary.LittleEndian.PutUint32(ipBytes, key.Dst)
 		rules = append(rules, server.PortRule{
 			Protocol: codeToProto(key.Protocol),
-			Port:     dportToPort(key.Dport),
+			Port:     wireToPort(key.Dport),
+			SPort:    wireToPort(key.Sport),
 			Dst:      ipBytes.String(),
 			Action:   Action(value).String(),
 		})

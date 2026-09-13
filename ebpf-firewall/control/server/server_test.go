@@ -87,17 +87,17 @@ func (f *fakePolicy) Stats() (Stats, error) {
 	}, nil
 }
 
-func (f *fakePolicy) BlockPortRule(dst, protocol string, port uint16) error {
+func (f *fakePolicy) BlockPortRule(dst, protocol string, dport, sport uint16) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.rules[portKey(dst, protocol, port)] = PortRule{Protocol: protocol, Port: port, Dst: dst, Action: "drop"}
+	f.rules[portKey(dst, protocol, dport, sport)] = PortRule{Protocol: protocol, Port: dport, SPort: sport, Dst: dst, Action: "drop"}
 	return nil
 }
 
-func (f *fakePolicy) BlockPortRuleWithAction(dst, protocol string, port uint16, action string) error {
+func (f *fakePolicy) BlockPortRuleWithAction(dst, protocol string, dport, sport uint16, action string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.rules[portKey(dst, protocol, port)] = PortRule{Protocol: protocol, Port: port, Dst: dst, Action: action}
+	f.rules[portKey(dst, protocol, dport, sport)] = PortRule{Protocol: protocol, Port: dport, SPort: sport, Dst: dst, Action: action}
 	return nil
 }
 
@@ -117,10 +117,10 @@ func (f *fakePolicy) DefaultPolicy() (string, error) {
 	return f.def, nil
 }
 
-func (f *fakePolicy) UnblockPortRule(dst, protocol string, port uint16) error {
+func (f *fakePolicy) UnblockPortRule(dst, protocol string, dport, sport uint16) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	delete(f.rules, portKey(dst, protocol, port))
+	delete(f.rules, portKey(dst, protocol, dport, sport))
 	return nil
 }
 
@@ -141,8 +141,8 @@ func (f *fakePolicy) ClearPortRules() error {
 	return nil
 }
 
-func portKey(dst, protocol string, port uint16) string {
-	return fmt.Sprintf("%s/%s/%d", dst, protocol, port)
+func portKey(dst, protocol string, dport, sport uint16) string {
+	return fmt.Sprintf("%s/%s/%d/%d", dst, protocol, dport, sport)
 }
 
 func TestHandle_BlockListUnblockClear(t *testing.T) {
@@ -181,7 +181,7 @@ func TestHandle_BlockPortRule(t *testing.T) {
 	s := New("unused.sock", policy)
 
 	// block with protocol + port routes to the port-rule path
-	if resp := s.handle(Request{Command: CmdBlock, Value: "192.168.1.100", Protocol: "tcp", Port: 22}); !resp.OK {
+	if resp := s.handle(Request{Command: CmdBlock, Value: "192.168.1.100", Protocol: "tcp", Port: 22, SPort: 50000}); !resp.OK {
 		t.Errorf("block port rule: %+v", resp)
 	}
 
@@ -189,12 +189,12 @@ func TestHandle_BlockPortRule(t *testing.T) {
 	if !resp.OK || resp.Count != 1 {
 		t.Fatalf("listports: %+v", resp)
 	}
-	if resp.PortRules[0].Dst != "192.168.1.100" || resp.PortRules[0].Protocol != "tcp" || resp.PortRules[0].Port != 22 {
+	if resp.PortRules[0].Dst != "192.168.1.100" || resp.PortRules[0].Protocol != "tcp" || resp.PortRules[0].Port != 22 || resp.PortRules[0].SPort != 50000 {
 		t.Errorf("unexpected rule: %+v", resp.PortRules)
 	}
 
 	// unblock with same flags removes it
-	if resp := s.handle(Request{Command: CmdUnblock, Value: "192.168.1.100", Protocol: "tcp", Port: 22}); !resp.OK {
+	if resp := s.handle(Request{Command: CmdUnblock, Value: "192.168.1.100", Protocol: "tcp", Port: 22, SPort: 50000}); !resp.OK {
 		t.Errorf("unblock port rule: %+v", resp)
 	}
 	if resp := s.handle(Request{Command: CmdListPorts}); !resp.OK || resp.Count != 0 {
@@ -320,11 +320,11 @@ func (p *errPolicy) ListBlockedIPs() ([]string, error)          { return nil, er
 func (p *errPolicy) Clear() error                               { return errors.New("boom") }
 func (p *errPolicy) Interface() string                          { return "" }
 func (p *errPolicy) Stats() (Stats, error)                      { return Stats{}, errors.New("boom") }
-func (p *errPolicy) BlockPortRule(string, string, uint16) error { return errors.New("boom") }
-func (p *errPolicy) BlockPortRuleWithAction(string, string, uint16, string) error {
+func (p *errPolicy) BlockPortRule(string, string, uint16, uint16) error { return errors.New("boom") }
+func (p *errPolicy) BlockPortRuleWithAction(string, string, uint16, uint16, string) error {
 	return errors.New("boom")
 }
-func (p *errPolicy) UnblockPortRule(string, string, uint16) error { return errors.New("boom") }
+func (p *errPolicy) UnblockPortRule(string, string, uint16, uint16) error { return errors.New("boom") }
 func (p *errPolicy) ListPortRules() ([]PortRule, error)           { return nil, errors.New("boom") }
 func (p *errPolicy) ClearPortRules() error                        { return errors.New("boom") }
 func (p *errPolicy) SetDefaultPolicy(string) error                { return errors.New("boom") }

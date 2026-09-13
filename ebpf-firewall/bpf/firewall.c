@@ -40,13 +40,14 @@
 #endif
 
 /* Minimal parsed view of an IPv4 packet, sufficient for the current
- * IP/CIDR policy plus protocol/destination-port rules. Extended later with
- * direction for richer rules without touching the datapath control flow. */
+ * IP/CIDR policy plus protocol/port rules. Extended later with direction
+ * for richer rules without touching the datapath control flow. */
 struct packet_info {
     __u32 saddr;   /* network byte order */
     __u32 daddr;   /* network byte order */
     __u8  protocol;
     __u16 dport;   /* destination port, network byte order (0 if not TCP/UDP) */
+    __u16 sport;   /* source port, network byte order (0 if not TCP/UDP) */
 };
 
 static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
@@ -76,16 +77,18 @@ static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
     info.daddr = ip->daddr;
     info.protocol = protocol;
 
-    /* Capture the destination port for TCP/UDP so port rules can match. */
+    /* Capture source/destination ports for TCP/UDP so port rules can match. */
     if (protocol == IPPROTO_TCP) {
         struct tcphdr *tcp;
         if (parse_tcphdr(nh, data_end, &tcp) == 0) {
             info.dport = tcp->dest;
+            info.sport = tcp->source;
         }
     } else if (protocol == IPPROTO_UDP) {
         struct udphdr *udp;
         if (parse_udphdr(nh, data_end, &udp) == 0) {
             info.dport = udp->dest;
+            info.sport = udp->source;
         }
     }
 
@@ -120,27 +123,51 @@ static __always_inline int ip_block_action(const struct packet_info *info,
     return 1;
 }
 
-/* Port-policy lookup. Matches protocol + destination port against the
- * destination address and returns the stored rule_action. Currently supports
- * exact /32 destination only; the key carries the destination address in
- * network byte order, matching the Go side (control/ebpf/portpolicy.go). */
+/* Port-policy lookup. Matches protocol + source/destination port against
+ * the destination address. Ports are optional: a stored rule with dport or
+ * sport == 0 means "any" for that field, so the datapath tries the rules in
+ * specificity order and returns the action of the first key that exists:
+ * (proto, dport, sport) -> (proto, dport, 0) -> (proto, 0, sport) ->
+ * (proto, 0, 0). The key carries addresses/ports in network byte order,
+ * matching the Go side (control/ebpf/portpolicy.go). Returns 1 + action on
+ * a match, 0 if no rule covers the packet. */
 static __always_inline int port_rule_action(const struct packet_info *info,
                                             enum rule_action *out_action) {
-    struct port_rule_key key = {
+    struct port_rule_key base = {
         .protocol = info->protocol,
-        .dport = info->dport,
         .dst = info->daddr,
     };
+    struct port_rule_key key;
+    __u32 *elem;
 
-    __u32 *elem = bpf_map_lookup_elem(&port_policy, &key);
+#define TRY_LOOKUP(k)                                    \
+    do {                                                 \
+        elem = bpf_map_lookup_elem(&port_policy, &(k));  \
+        if (elem) {                                      \
+            *out_action = (enum rule_action)*elem;       \
+            return 1;                                    \
+        }                                                \
+    } while (0)
 
-    if (!elem) {
-        *out_action = ACTION_PASS;
-        return 0;
-    }
+    key = base;
+    key.dport = info->dport;
+    key.sport = info->sport;
+    TRY_LOOKUP(key);            /* exact dport + exact sport */
 
-    *out_action = (enum rule_action)*elem;
-    return 1;
+    key.sport = 0;
+    TRY_LOOKUP(key);            /* exact dport + any sport */
+
+    key.dport = 0;
+    key.sport = info->sport;
+    TRY_LOOKUP(key);            /* any dport + exact sport */
+
+    key.sport = 0;
+    TRY_LOOKUP(key);            /* any dport + any sport */
+
+#undef TRY_LOOKUP
+
+    *out_action = ACTION_PASS;
+    return 0;
 }
 
 /* Reads the configured default policy from the config map. Falls back to

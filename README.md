@@ -15,12 +15,12 @@ What works today (MTP1 core — XDP firewall):
 
 - **XDP firewall** (`bpf/firewall.c`)
 - **IPv4 exact IP / CIDR filtering** via an **LPM trie**
-- **Protocol + destination-port rules** (e.g. `block 1.2.3.4 --protocol tcp --dport 22`), verified end-to-end
+- **Protocol + destination/src-port rules** (e.g. `block 1.2.3.4 --protocol tcp --dport 22`), verified end-to-end
 - **Counters / telemetry** — total, drop and pass packet/byte counters (`firewallctl stats`)
 - **CO-RE** (`vmlinux.h`) – portable across kernels without compile-time headers
 - **Go control plane** (`control/`)
 - **Unix socket API** (`control/server/`) for dynamic, runtime rule updates
-- **`firewallctl`** client for live `block` / `unblock` / `list` / `listports` / `status` / `stats` / `clear`; `--protocol` / `--dport` / `-sock` work in any position (before or after the command)
+- **`firewallctl`** client for live `block` / `unblock` / `list` / `listports` / `status` / `stats` / `clear`; `--protocol` / `--dport` / `--sport` / `-sock` work in any position (before or after the command)
 - **Unit + integration tests** (`make test`, `make integration-test`)
 
 ### Default policy & per-rule actions
@@ -52,8 +52,17 @@ sudo ./bin/firewallctl block 10.0.0.1 --protocol tcp --dport 22
 
 drops inbound TCP connections *to* `10.0.0.1` on port 22 (e.g. SSH attempts
 from other machines). A port rule is an exact match on **dst IP (host) +
-protocol + dst port**; it does not filter egress packets (for that you would
-need TC egress, not yet implemented).
+protocol + dst port + [src port]**; it does not filter egress packets (for that
+you would need TC egress, not yet implemented).
+
+A rule can also restrict the **source port** (`--sport n`), narrowing the rule
+to traffic whose sending port matches — e.g. a scan/detection tool that
+connects from a fixed local port. `0` means *any* in protocol, dst port and
+src port, and matching is **most-specific-first**: when rules overlap, the
+datapath tries an exact `(protocol, dport, sport)` match before falling back
+to partial matches (`dport` only, `sport` only, then neither) and finally to
+the default policy. `listports` prints the source port when a rule has one,
+e.g. `tcp/22 (sport 50000) -> 1.2.3.4 [drop]`.
 
 `clear` removes **both** the IP blocklist and all port rules in one call.
 Rule maps are anonymous kernel objects tied to the running daemon — they are

@@ -177,7 +177,7 @@ func TestDatapath_CIDR_Drops(t *testing.T) {
 
 func TestDatapath_PortRule_DropsOnlyMatching(t *testing.T) {
 	fw := loadTestFirewall(t)
-	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22); err != nil {
+	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22, 0); err != nil {
 		t.Fatalf("BlockPortRule: %v", err)
 	}
 
@@ -187,6 +187,42 @@ func TestDatapath_PortRule_DropsOnlyMatching(t *testing.T) {
 	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 80), testXDPPass)
 	// Same port, UDP: passes.
 	mustVerdict(t, fw, udpPkt("192.168.0.1", "1.2.3.4", 12345, 22), testXDPPass)
+}
+
+func TestDatapath_PortRule_SourcePort(t *testing.T) {
+	fw := loadTestFirewall(t)
+
+	// Block only when the source port is 50000.
+	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22, 50000); err != nil {
+		t.Fatalf("BlockPortRule: %v", err)
+	}
+
+	// Exact (proto, dport, sport) matches -> drop.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 50000, 22), testXDPDrop)
+	// Same dport but different source port -> no candidate matches -> pass.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 22), testXDPPass)
+	// Same sport but different dport -> pass.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 50000, 80), testXDPPass)
+	// UDP on same dport/sport -> protocol differs -> pass.
+	mustVerdict(t, fw, udpPkt("192.168.0.1", "1.2.3.4", 50000, 22), testXDPPass)
+}
+
+func TestDatapath_PortRule_Specifity(t *testing.T) {
+	fw := loadTestFirewall(t)
+
+	// Most-specific rule drops exactly src-port 50000 -> dst:22.
+	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22, 50000); err != nil {
+		t.Fatalf("BlockPortRule: %v", err)
+	}
+	// Less-specific rule PASSes any other tcp traffic to dst:22.
+	if err := fw.BlockPortRuleWithAction("1.2.3.4", "tcp", 22, 0, "pass"); err != nil {
+		t.Fatalf("BlockPortRuleWithAction: %v", err)
+	}
+
+	// Exact match wins (DROP) even though the wildcard PASS rule exists.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 50000, 22), testXDPDrop)
+	// Other source ports fall through to the PASS rule.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 22), testXDPPass)
 }
 
 func TestDatapath_PassRule_OverridesDefaultDeny(t *testing.T) {
@@ -213,7 +249,7 @@ func TestDatapath_DropWinsOverPass(t *testing.T) {
 	if err := fw.BlockIPWithAction("1.2.3.4", "pass"); err != nil {
 		t.Fatalf("BlockIPWithAction: %v", err)
 	}
-	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22); err != nil {
+	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22, 0); err != nil {
 		t.Fatalf("BlockPortRule: %v", err)
 	}
 

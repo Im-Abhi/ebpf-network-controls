@@ -21,9 +21,9 @@ type Policy interface {
 	Clear() error
 	Interface() string
 	Stats() (Stats, error)
-	BlockPortRule(dst, protocol string, port uint16) error
-	BlockPortRuleWithAction(dst, protocol string, port uint16, action string) error
-	UnblockPortRule(dst, protocol string, port uint16) error
+	BlockPortRule(dst, protocol string, dport, sport uint16) error
+	BlockPortRuleWithAction(dst, protocol string, dport, sport uint16, action string) error
+	UnblockPortRule(dst, protocol string, dport, sport uint16) error
 	ListPortRules() ([]PortRule, error)
 	ClearPortRules() error
 	SetDefaultPolicy(s string) error
@@ -168,12 +168,12 @@ func (s *Server) handle(req Request) Response {
 
 	switch req.Command {
 	case CmdBlock:
-		if req.Protocol != "" || req.Port != 0 {
+		if req.Protocol != "" || req.Port != 0 || req.SPort != 0 {
 			if req.Action != "" {
-				if err := s.policy.BlockPortRuleWithAction(req.Value, req.Protocol, req.Port, req.Action); err != nil {
+				if err := s.policy.BlockPortRuleWithAction(req.Value, req.Protocol, req.Port, req.SPort, req.Action); err != nil {
 					return Response{OK: false, Error: err.Error()}
 				}
-			} else if err := s.policy.BlockPortRule(req.Value, req.Protocol, req.Port); err != nil {
+			} else if err := s.policy.BlockPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
 				return Response{OK: false, Error: err.Error()}
 			}
 			return Response{OK: true}
@@ -188,8 +188,8 @@ func (s *Server) handle(req Request) Response {
 		return Response{OK: true}
 
 	case CmdUnblock:
-		if req.Protocol != "" || req.Port != 0 {
-			if err := s.policy.UnblockPortRule(req.Value, req.Protocol, req.Port); err != nil {
+		if req.Protocol != "" || req.Port != 0 || req.SPort != 0 {
+			if err := s.policy.UnblockPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
 				return Response{OK: false, Error: err.Error()}
 			}
 			return Response{OK: true}

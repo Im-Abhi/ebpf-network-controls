@@ -10,14 +10,14 @@ import (
 )
 
 // newTestPortPolicyMap creates a standalone hash map matching the port_policy
-// map layout (8-byte key, 4-byte value) without attaching any XDP program.
+// map layout (12-byte key, 4-byte value) without attaching any XDP program.
 func newTestPortPolicyMap(t *testing.T) *ebpf.Map {
 	t.Helper()
 
 	tm, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Hash,
-		KeySize:    8, // firewallPortRuleKey
-		ValueSize:  4, // portRuleDrop
+		KeySize:    12, // firewallPortRuleKey
+		ValueSize:  4,  // portRuleDrop
 		MaxEntries: 65535,
 	})
 	if err != nil {

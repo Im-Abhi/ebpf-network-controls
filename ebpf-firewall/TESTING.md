@@ -44,7 +44,7 @@ These use in-memory fakes and never touch the kernel:
 | `control/rules` | CIDR/IP parsing and validation |
 | `control/ebpf` | map managers with stubbed maps: blocklist (exact + LPM + overlap + clear), port rules, action/config parsing |
 | `control/server` | socket protocol + command dispatch against a fake `Policy`: `block`/`unblock`/`list`/`clear`/`stats`/`default`/`--action`, error propagation, socket lifecycle |
-| `cmd/firewallctl` | option parsing anywhere in the argument list (`-sock`, `--protocol`, `--dport`, `--action`, `key=value` forms) and port validation |
+| `cmd/firewallctl` | option parsing anywhere in the argument list (`-sock`, `--protocol`, `--dport`, `--sport`, `--action`, `key=value` forms) and port validation |
 
 ---
 
@@ -68,7 +68,7 @@ datapath** — not just Go map writes. Groups:
 Builds **raw Ethernet/IPv4/TCP/UDP frames** and injects them through
 `BPF_PROG_TEST_RUN` (`prog.Run`), asserting the returned XDP verdict and counter
 deltas. The program is loaded on `lo` but **not attached** — no real traffic,
-fully deterministic. The 10 scenarios:
+fully deterministic. The 12 scenarios:
 
 | Test | Asserts |
 | --- | --- |
@@ -77,6 +77,8 @@ fully deterministic. The 10 scenarios:
 | `TestDatapath_BlockedIP_Drops` | blocked IP matched as source **or** destination → DROP |
 | `TestDatapath_CIDR_Drops` | `10.0.0.0/8` block drops in-range src or dst |
 | `TestDatapath_PortRule_DropsOnlyMatching` | only exact dst+proto+port matches → DROP |
+| `TestDatapath_PortRule_SourcePort` | a `(dport, sport)` rule drops only exact src-port traffic; other src ports, dst ports, and UDP pass |
+| `TestDatapath_PortRule_Specifity` | when a `(dport, sport)` DROP rule and a `(dport)` PASS rule overlap, the exact src-port match wins |
 | `TestDatapath_PassRule_OverridesDefaultDeny` | a matched `--action pass` rule allows traffic even under default-deny |
 | `TestDatapath_DropWinsOverPass` | a DROP port rule beats a PASS IP rule on the same packet |
 | `TestDatapath_NonIPv4_UsesDefault` | ARP follows the default policy |
@@ -112,6 +114,8 @@ sudo ./bin/firewallctl status                  # interface + live default policy
 sudo ./bin/firewallctl listports               # port rules with [pass]/[drop]
 sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 22
 sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 22 --action pass
+sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 22 --sport 50000   # src-port-scoped rule
+sudo ./bin/firewallctl listports               # shows tcp/22 (sport 50000) -> 1.2.3.4
 sudo ./bin/firewallctl default deny            # fallback policy on no match
 sudo ./bin/firewallctl clear                   # wipes IP blocklist + port rules
 sudo ./bin/firewallctl stats                   # total / drop / pass counters

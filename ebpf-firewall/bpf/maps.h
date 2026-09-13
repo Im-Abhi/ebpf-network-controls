@@ -71,15 +71,24 @@ struct {
 
 /* ── Port policy map ────────────────────────────────────────────────── */
 /* Finer-grained rules that combine a destination IP (exact /32), a
- * protocol, and a destination port. The value is a rule_action
- * (0 = PASS, 1 = DROP). The key is an 11-byte packed struct:
- * proto(1) + dport(2, network order) + dst(4, network order). Only the
- * destination address is matched (classic "block SSH to X" intent).
- * 0 in protocol means "any", 0 in port means "any". */
+ * protocol, a destination port and a source port. The value is a
+ * rule_action (0 = PASS, 1 = DROP). The key is the natural-alignment
+ * struct below (12 bytes: proto(1) + pad(1) + dport(2) + sport(2) +
+ * dst(4)), ports kept in network byte order. 0 in protocol, dport or
+ * sport means "any". The datapath performs up to four lookups per packet,
+ * most-specific first:
+ *   (proto, dport, sport)  -> exact both
+ *   (proto, dport, 0)      -> dport exact, sport any
+ *   (proto, 0, sport)      -> dport any,  sport exact
+ *   (proto, 0, 0)          -> neither restricted
+ * The first key that exists in the map decides the rule action (see
+ * port_rule_action in firewall.c). This makes the "0 = any" semantics
+ * actually work with an exact-key hash map. */
 
 struct port_rule_key {
     __u8  protocol;
-    __u16 dport;   /* network byte order */
+    __u16 dport;   /* network byte order; 0 = any */
+    __u16 sport;   /* network byte order; 0 = any */
     __u32 dst;     /* network byte order */
 };
 

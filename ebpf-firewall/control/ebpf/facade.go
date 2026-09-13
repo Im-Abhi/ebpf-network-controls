@@ -98,31 +98,31 @@ func (f *Firewall) Stats() (server.Stats, error) {
 	return f.counterMgr.GetCounters()
 }
 
-// BlockPortRule adds a rule that DROPs traffic destined for dst on the given
-// protocol/port (protocol "tcp"/"udp"/"", port 0 for any).
-func (f *Firewall) BlockPortRule(dst, protocol string, port uint16) error {
-	if err := f.portPolicyMgr.Block(dst, protocol, port); err != nil {
-		return fmt.Errorf("blocking port rule %s/%d to %s: %w", protocol, port, dst, err)
+// BlockPortRule adds a rule that DROPs traffic destined to dst on the given
+// protocol/dport (sport 0 = any source port). dport 0 means any port.
+func (f *Firewall) BlockPortRule(dst, protocol string, dport, sport uint16) error {
+	if err := f.portPolicyMgr.BlockWithAction(dst, protocol, dport, sport, ActionDrop); err != nil {
+		return fmt.Errorf("blocking port rule %s/%d (sport %d) to %s: %w", protocol, dport, sport, dst, err)
 	}
 	return nil
 }
 
 // BlockPortRuleWithAction adds a port rule with an explicit action.
-func (f *Firewall) BlockPortRuleWithAction(dst, protocol string, port uint16, actionStr string) error {
+func (f *Firewall) BlockPortRuleWithAction(dst, protocol string, dport, sport uint16, actionStr string) error {
 	action, err := ParseAction(actionStr)
 	if err != nil {
 		return err
 	}
-	if err := f.portPolicyMgr.BlockWithAction(dst, protocol, port, action); err != nil {
-		return fmt.Errorf("adding port rule %s/%d to %s with action %s: %w", protocol, port, dst, action, err)
+	if err := f.portPolicyMgr.BlockWithAction(dst, protocol, dport, sport, action); err != nil {
+		return fmt.Errorf("adding port rule %s/%d (sport %d) to %s with action %s: %w", protocol, dport, sport, dst, action, err)
 	}
 	return nil
 }
 
-// UnblockPortRule removes a protocol/port rule for dst.
-func (f *Firewall) UnblockPortRule(dst, protocol string, port uint16) error {
-	if err := f.portPolicyMgr.Unblock(dst, protocol, port); err != nil {
-		return fmt.Errorf("unblocking port rule %s/%d to %s: %w", protocol, port, dst, err)
+// UnblockPortRule removes a protocol/dport rule for dst (sport 0 = any).
+func (f *Firewall) UnblockPortRule(dst, protocol string, dport, sport uint16) error {
+	if err := f.portPolicyMgr.UnblockWithAction(dst, protocol, dport, sport); err != nil {
+		return fmt.Errorf("unblocking port rule %s/%d (sport %d) to %s: %w", protocol, dport, sport, dst, err)
 	}
 	return nil
 }

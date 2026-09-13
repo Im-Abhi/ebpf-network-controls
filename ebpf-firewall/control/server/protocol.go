@@ -21,6 +21,7 @@ type Request struct {
 	Value    string  `json:"value,omitempty"`
 	Protocol string  `json:"protocol,omitempty"`
 	Port     uint16  `json:"port,omitempty"`
+	SPort    uint16  `json:"sport,omitempty"`
 	Action   string  `json:"action,omitempty"`
 }
 
@@ -29,6 +30,7 @@ type Request struct {
 type PortRule struct {
 	Protocol string `json:"protocol,omitempty"`
 	Port     uint16 `json:"port,omitempty"`
+	SPort    uint16 `json:"sport,omitempty"`
 	Dst      string `json:"dst"`
 	Action   string `json:"action"`
 }
