@@ -17,7 +17,7 @@ BPFTOOL ?= bpftool
 # datapath under trace. Leave unset for performance-sensitive measurements.
 DEBUG ?= 0
 
-.PHONY: all deps vmlinux generate generate-debug build test integration-test clean run trace bench help
+.PHONY: all deps vmlinux generate generate-debug build test integration-test clean run trace bench bench-plot help
 
 ## all: Resolve deps, generate eBPF bindings, and build binaries
 all: deps generate build
@@ -93,3 +93,8 @@ trace:
 bench: build
 	@echo "==> Running benchmark harness (needs root + iperf3 + nft)..."
 	sudo ./benchmark/run-bench.sh $(BENCH_ARGS)
+
+## bench-plot: Render charts for the latest benchmark run (or BENCH_RUN=<dir>). Needs python3 (+ matplotlib for PNGs)
+bench-plot:
+	@echo "==> Rendering benchmark results..."
+	python3 ./benchmark/plot.py $(BENCH_RUN)

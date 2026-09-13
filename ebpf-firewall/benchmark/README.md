@@ -16,7 +16,9 @@ destroyed after each run — safe to run against a development machine.
 - Linux root: `sudo ./benchmark/run-bench.sh`
 - `iperf3`, `nft`, `ip` (iproute2)
 - Go toolchain (`make bench` builds `bin/firewall` + `bin/firewallctl` first)
-- Optional but recommended: `jq` (precision throughput parsing), `sysstat`
+- `jq` **or** `python3` for iperf3 JSON metric extraction (the harness uses
+  whichever is present; `python3` is also used by `make bench-plot`)
+- Optional: `sysstat`, `matplotlib` (renders PNG charts in `bench-plot`)
 
 ## Usage
 
@@ -72,8 +74,31 @@ Each run creates `benchmark/results/<YYYYmmdd-HHMMSS>/`, with one directory per
 run  backend  scenario  iter  udp_bps  udp_pps  udp_lost  udp_jitter_ms  tcp_bps  rtt_avg_ms  cpu_jif  rss_kb  add_ms  del_ms
 ```
 
-`benchmark/results/` is gitignored; `git add -f` only the runs you want to keep
-(an empty `.gitkeep` preserves the directory).
+`benchmark/results/` is gitignored; `git add -f` only the runs you want to keep.
+
+Each run also writes a `meta.txt` capturing the environment (kernel, iperf3/nft/
+go/python3/jq versions, UTC start time) so results are self-documenting.
+
+## Visualizing results
+
+`make bench-plot` (or `python3 benchmark/plot.py [RUN_DIR]`) renders the latest
+run — or the run you name:
+
+- a **terminal table** of every metric as mean ± stdev across iterations
+  (stdlib only, always printed);
+- **bar charts** (`<run>/charts/<metric>.png`) comparing XDP vs nftables per
+  scenario, with ±stdev error bars — throughput (UDP/TCP Mbit/s, pps), packet
+  loss, jitter, RTT, CPU jiffies, RSS, and rule add/del time;
+- **`timeseries.png`** — per-second UDP/TCP throughput curves read from the
+  `iperf-*.json` intervals for one scenario (default `single`).
+
+Charts need `python3` + `matplotlib`; without matplotlib only the table is
+printed. Example:
+
+```bash
+make bench-plot                  # latest run
+python3 benchmark/plot.py results/20260913-171508 --scenario many
+```
 
 ## Reproducibility notes
 

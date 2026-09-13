@@ -62,6 +62,10 @@ done
 
 [ "$(id -u)" -eq 0 ] || { echo "bench: run as root" >&2; exit 1; }
 require_cmds ip nft iperf3 ping date || exit 1
+if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+    echo "bench: iperf3 JSON parsing needs jq or python3 (neither found)" >&2
+    exit 1
+fi
 
 if pgrep -f "/bin/firewall " >/dev/null 2>&1; then
     echo "bench: a firewall daemon is already running; stop it first (the benchmark starts its own on the sandbox veth)" >&2
@@ -74,6 +78,19 @@ log "building firewall + firewallctl from current source"
 
 log "results -> ${RUN_DIR}"
 mkdir -p "${RUN_DIR}"
+
+# Environment capture: each run is self-documenting for the thesis.
+{
+    echo "run: ${RUN_TS}"
+    date -u '+started_utc: %Y-%m-%d %H:%M:%S'
+    echo "kernel:   $(uname -srm 2>/dev/null || true)"
+    echo "uname_r:  $(uname -r 2>/dev/null || true)"
+    echo "iperf3:   $(iperf3 --version 2>/dev/null | head -1 || true)"
+    echo "nft:      $(nft --version 2>/dev/null || true)"
+    echo "go:       $(go version 2>/dev/null || true)"
+    echo "jq:       $(jq --version 2>/dev/null || echo n/a)"
+    echo "python3:  $(python3 --version 2>/dev/null || echo n/a)"
+} > "${RUN_DIR}/meta.txt"
 
 # kv <file> <key> : prints the value of `key=value` lines written by helpers.
 kv() { awk -F= -v k="$2" '$1==k {print $2; exit}' "$1"; }
@@ -198,6 +215,10 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     rtt="$(kv "${rundir}/rtt.kv" rtt_avg_ms)";        [ -z "${rtt}" ]    && rtt="n/a"
     mem="$(backend_mem_kb "${backend}")"
     read -r addr del <<< "$(update_timing "${backend}")"
+
+    if [ "${bps}" -eq 0 ]; then
+        log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: udp_bps=0 (iperf or metric-parser problem)"
+    fi
 
     printf '%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n' \
         "${RUN_TS}" "${backend}" "${scenario}" "${iter}" \

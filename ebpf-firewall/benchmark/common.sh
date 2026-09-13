@@ -142,15 +142,43 @@ run_iperf() {
         echo "bench: iperf3 ${mode} run failed" >&2
         return 1
     fi
-    # Print derived key/value lines for the summary.
+    # Print derived key/value lines for the summary (same format either way, so
+    # the kv() reader downstream never changes). jq is preferred; when it is
+    # missing the stdlib json module (part of every python3) does the same job,
+    # so no metric extraction tool is actually required. A JSON that cannot be
+    # read yields `parse_failed=1`, which the orchestrator surfaces as a WARN.
     if command -v jq >/dev/null 2>&1; then
         if [ "${mode}" = udp ]; then
             jq -r '"udp_bits_per_sec=\(.end.sum.bits_per_second)\nudp_bytes=\(.end.sum.bytes)\nudp_lost_packets=\(.end.sum.lost_packets)\nudp_sent_packets=\(.end.sum.packets)\nudp_jitter_ms=\(.end.sum.jitter_ms)"' "${out}"
         else
             jq -r '"tcp_bits_per_sec=\(.end.sum_received.bits_per_second)\ntcp_bytes_retrans=\(.end.sum_received.retransmits)"' "${out}"
         fi
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "${out}" "${mode}" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception:
+    print("parse_failed=1")
+    sys.exit(0)
+
+if sys.argv[2] == "udp":
+    s = d["end"]["sum"]
+    print("udp_bits_per_sec=%d" % s["bits_per_second"])
+    print("udp_bytes=%d" % s["bytes"])
+    print("udp_lost_packets=%d" % s["lost_packets"])
+    print("udp_sent_packets=%d" % s["packets"])
+    print("udp_jitter_ms=%s" % s["jitter_ms"])
+else:
+    s = d["end"]["sum_received"]
+    print("tcp_bits_per_sec=%d" % s["bits_per_second"])
+    print("tcp_bytes_retrans=%d" % s["retransmits"])
+PY
     else
-        echo "jq_missing=1"
+        echo "parser_missing=1 (install jq or python3)"
     fi
 }
 
@@ -181,15 +209,30 @@ time_ms() {  # time_ms <outvar> <cmd...>
 # Backend rule application
 # ---------------------------------------------------------------------------
 
+# valid_cidr <token> : accepts "A.B.C.D/len" with octets 0-255 and len 0-32.
+# Guards rule installation so a buggy scenario generator fails fast with the
+# offending token instead of failing silently part-way through the matrix.
+valid_cidr() {
+    [[ "$1" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)/([0-9]+)$ ]] || return 1
+    local o
+    for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \
+             "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+        [ "${o}" -le 255 ] || return 1
+    done
+    [ "${BASH_REMATCH[5]}" -le 32 ] || return 1
+}
+
 # apply_xdp_rules <scenario> : adds drop rules via firewallctl (daemon must be
 # attached to ${VETH0}). Mirrors saddr+daddr semantics of the C datapath:
 # blocked_ips matches source first, then destination.
 apply_xdp_rules() {
-    local ip
+    local ip targets
+    targets="$(scenario_targets "$1")" || return 1
     while read -r ip; do
         [ -n "${ip}" ] || continue
+        valid_cidr "${ip}" || { echo "bench: invalid CIDR target '${ip}' (scenario '$1')" >&2; return 1; }
         "${CTL}" block "${ip}" || return 1
-    done < <(scenario_targets "$1")
+    done <<< "${targets}"
 }
 
 clear_xdp_rules() { "${CTL}" clear >/dev/null 2>&1 || true; }
@@ -209,10 +252,12 @@ nft_rules_flush() { nft flush table inet "${NFT_TABLE}" 2>/dev/null || true; }
 nft_rules_down() { nft delete table inet "${NFT_TABLE}" 2>/dev/null || true; }
 
 apply_nft_rules() {
-    local ip
+    local ip targets
+    targets="$(scenario_targets "$1")" || return 1
     while read -r ip; do
         [ -n "${ip}" ] || continue
+        valid_cidr "${ip}" || { echo "bench: invalid CIDR target '${ip}' (scenario '$1')" >&2; return 1; }
         nft add rule inet "${NFT_TABLE}" input ip saddr "${ip}" drop
         nft add rule inet "${NFT_TABLE}" input ip daddr "${ip}" drop
-    done < <(scenario_targets "$1")
+    done <<< "${targets}"
 }
