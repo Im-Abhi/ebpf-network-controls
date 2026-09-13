@@ -23,16 +23,21 @@ What works today (MTP1 core — XDP firewall):
 - **`firewallctl`** client for live `block` / `unblock` / `list` / `listports` / `status` / `stats` / `clear`; `--protocol` / `--dport` / `-sock` work in any position (before or after the command)
 - **Unit + integration tests** (`make test`, `make integration-test`)
 
-### Default policy
+### Default policy & per-rule actions
 
 ```
-Default policy: ALLOW
+Default policy: ALLOW  (runtime-configurable)
 
-Matching blocked_ips:   DROP
-No matching policy:     PASS
+Matching rule:          DROP (or PASS for --action pass)
+No matching rule:       default policy (allow => PASS, deny => DROP)
+Rule vs rule:           DROP wins over PASS
 ```
 
-The firewall is **default-allow**: packets are passed unless they match the blocklist.
+The firewall is **default-allow** by default and can be flipped live with
+`firewallctl default allow|deny`. Every block rule (IP/CIDR or port) can carry a
+`-action pass|drop` qualifier — a PASS rule acts as an allowlist override under
+default-deny, while a DROP rule always wins over PASS. Non-IPv4 / unparseable
+packets (e.g. ARP) follow the default policy.
 
 ### Port rules (ingress only)
 
@@ -124,6 +129,9 @@ make generate   # compile eBPF + generate Go bindings
 make build      # build bin/firewall and bin/firewallctl
 sudo ./bin/firewall -i eth0
 ```
+
+For the full testing toolbox — unit tests, `BPF_PROG_TEST_RUN` datapath tests, the
+veth/netns sandbox, and gotchas — see 👉 **[TESTING.md](ebpf-firewall/TESTING.md)**.
 
 ---
 

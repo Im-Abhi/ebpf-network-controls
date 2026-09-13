@@ -8,13 +8,14 @@ import (
 
 // Firewall is a thin facade coordinating the XDP program lifecycle (XDPProgram)
 // with policy map operations (MapManager), counter reads (CounterManager), and
-// port-policy operations (PortPolicyManager). It is the single handle used by
-// cmd/firewall and the runtime control plane.
+// the config/default-policy state (ConfigManager). It is the single handle
+// used by cmd/firewall and the runtime control plane.
 type Firewall struct {
 	prog          *XDPProgram
 	mgr           *MapManager
 	counterMgr    *CounterManager
 	portPolicyMgr *PortPolicyManager
+	configMgr     *ConfigManager
 }
 
 // NewFirewall loads the XDP program and its maps for the given interface but
@@ -30,6 +31,7 @@ func NewFirewall(ifaceName string) (*Firewall, error) {
 		mgr:           NewMapManager(prog.BlockedIps()),
 		counterMgr:    NewCounterManager(prog.Counters()),
 		portPolicyMgr: NewPortPolicyManager(prog.PortPolicy()),
+		configMgr:     NewConfigManager(prog.Config()),
 	}, nil
 }
 
@@ -48,10 +50,22 @@ func (f *Firewall) Interface() string {
 	return f.prog.ifaceName
 }
 
-// BlockIP adds an IP or CIDR to the blocklist.
+// BlockIP adds an IP or CIDR to the blocklist with a DROP action.
 func (f *Firewall) BlockIP(cidr string) error {
 	if err := f.mgr.BlockIP(cidr); err != nil {
 		return fmt.Errorf("blocking %q: %w", cidr, err)
+	}
+	return nil
+}
+
+// BlockIPWithAction adds an IP or CIDR rule with an explicit action.
+func (f *Firewall) BlockIPWithAction(cidr, actionStr string) error {
+	action, err := ParseAction(actionStr)
+	if err != nil {
+		return err
+	}
+	if err := f.mgr.BlockIPWithAction(cidr, action); err != nil {
+		return fmt.Errorf("adding %q with action %s: %w", cidr, action, err)
 	}
 	return nil
 }
@@ -93,6 +107,18 @@ func (f *Firewall) BlockPortRule(dst, protocol string, port uint16) error {
 	return nil
 }
 
+// BlockPortRuleWithAction adds a port rule with an explicit action.
+func (f *Firewall) BlockPortRuleWithAction(dst, protocol string, port uint16, actionStr string) error {
+	action, err := ParseAction(actionStr)
+	if err != nil {
+		return err
+	}
+	if err := f.portPolicyMgr.BlockWithAction(dst, protocol, port, action); err != nil {
+		return fmt.Errorf("adding port rule %s/%d to %s with action %s: %w", protocol, port, dst, action, err)
+	}
+	return nil
+}
+
 // UnblockPortRule removes a protocol/port rule for dst.
 func (f *Firewall) UnblockPortRule(dst, protocol string, port uint16) error {
 	if err := f.portPolicyMgr.Unblock(dst, protocol, port); err != nil {
@@ -109,4 +135,26 @@ func (f *Firewall) ListPortRules() ([]server.PortRule, error) {
 // ClearPortRules removes every protocol/port rule.
 func (f *Firewall) ClearPortRules() error {
 	return f.portPolicyMgr.Clear()
+}
+
+// SetDefaultPolicy sets the fallback policy ("allow" or "deny") applied when
+// no rule matches.
+func (f *Firewall) SetDefaultPolicy(s string) error {
+	policy, err := ParseDefaultPolicy(s)
+	if err != nil {
+		return err
+	}
+	if err := f.configMgr.SetDefaultPolicy(policy); err != nil {
+		return fmt.Errorf("setting default policy to %s: %w", policy, err)
+	}
+	return nil
+}
+
+// DefaultPolicy returns the current fallback policy ("allow" or "deny").
+func (f *Firewall) DefaultPolicy() (string, error) {
+	p, err := f.configMgr.DefaultPolicy()
+	if err != nil {
+		return "", err
+	}
+	return p.String(), nil
 }

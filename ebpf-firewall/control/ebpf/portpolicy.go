@@ -11,10 +11,8 @@ import (
 )
 
 // portRuleValue is the value stored for every entry in the port_policy map.
-// It must match the C `value, __u32` definition in bpf/maps.h. 1 = DROP,
-// 0 is reserved (PASS) for future use.
+// It must match enum rule_action in bpf/maps.h. ActionDrop = 1, ActionPass = 0.
 const (
-	portRuleDrop    uint32 = 1
 	portAnyProtocol uint8  = 0
 	portAnyPort     uint16 = 0
 	protoTCP        uint8  = 6
@@ -93,6 +91,11 @@ func (pm *PortPolicyManager) newPortKey(dst string, proto uint8, port uint16) (f
 // Block adds a port rule that DROPs traffic to dst on the given protocol/port.
 // protocol may be "tcp", "udp", or "" (any). port of 0 means any port.
 func (pm *PortPolicyManager) Block(dst, protocol string, port uint16) error {
+	return pm.BlockWithAction(dst, protocol, port, ActionDrop)
+}
+
+// BlockWithAction adds a port rule with an explicit action (PASS or DROP).
+func (pm *PortPolicyManager) BlockWithAction(dst, protocol string, port uint16, action Action) error {
 	proto, err := protoToCode(protocol)
 	if err != nil {
 		return err
@@ -101,7 +104,7 @@ func (pm *PortPolicyManager) Block(dst, protocol string, port uint16) error {
 	if err != nil {
 		return err
 	}
-	return pm.portPolicy.Put(key, portRuleDrop)
+	return pm.portPolicy.Put(key, uint32(action))
 }
 
 // Unblock removes a port rule matching dst, protocol, and port.
@@ -141,6 +144,7 @@ func (pm *PortPolicyManager) List() ([]server.PortRule, error) {
 			Protocol: codeToProto(key.Protocol),
 			Port:     dportToPort(key.Dport),
 			Dst:      ipBytes.String(),
+			Action:   Action(value).String(),
 		})
 	}
 	if err := iter.Err(); err != nil {

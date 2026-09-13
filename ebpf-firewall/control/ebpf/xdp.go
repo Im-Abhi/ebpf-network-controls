@@ -78,6 +78,11 @@ func (x *XDPProgram) PortPolicy() *ebpf.Map {
 	return x.objs.PortPolicy
 }
 
+// Config returns the eBPF map holding the default policy configuration.
+func (x *XDPProgram) Config() *ebpf.Map {
+	return x.objs.FirewallConfig
+}
+
 // Close detaches the program (if attached) and closes all loaded objects.
 func (x *XDPProgram) Close() error {
 	var firstErr error

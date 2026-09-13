@@ -11,9 +11,8 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// blockedIPValue is the value stored for every entry in the blocked_ips map.
-// It must match the C `value, __u32` definition in bpf/maps.h.
-const blockedIPValue uint32 = 1
+// Rule action value defaults to DROP for the convenience Block methods.
+const defaultBlockAction Action = ActionDrop
 
 // newLpmKey builds an LPM trie lookup/insertion key for a parsed IPv4 network.
 //
@@ -50,8 +49,15 @@ func NewMapManager(blockedIpsMap *ebpf.Map) *MapManager {
 	}
 }
 
-// BlockIP adds an IP or CIDR to the blocked IPs eBPF map.
+// BlockIP adds an IP or CIDR to the blocked IPs eBPF map with a DROP action.
 func (pm *MapManager) BlockIP(cidrStr string) error {
+	return pm.BlockIPWithAction(cidrStr, defaultBlockAction)
+}
+
+// BlockIPWithAction adds an IP or CIDR to the IP policy map with the given
+// action (PASS or DROP). The action value is stored in the map and read by the
+// datapath at lookup time.
+func (pm *MapManager) BlockIPWithAction(cidrStr string, action Action) error {
 	ipNet, err := rules.ParseIPOrCIDR(cidrStr)
 	if err != nil {
 		return err
@@ -60,7 +66,7 @@ func (pm *MapManager) BlockIP(cidrStr string) error {
 	ones, _ := ipNet.Mask.Size()
 	key := newLpmKey(ipNet.IP, ones)
 
-	return pm.blockedIps.Put(key, blockedIPValue)
+	return pm.blockedIps.Put(key, uint32(action))
 }
 
 // UnblockIP removes an IP or CIDR from the blocked IPs eBPF map.

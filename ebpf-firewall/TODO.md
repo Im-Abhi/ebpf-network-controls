@@ -21,21 +21,22 @@ MTP2+ are the thesis-level extensions built on top of it.
 - [x] Unit + integration tests
 - [x] Clean datapath (parse → packet_info → policy lookup → decision)
 
-### MTP1-B: Observable firewall — counters
+### MTP1-B: Observable firewall — counters ✅
 
-- [ ] Global counters map (total / dropped / passed packets + bytes)
-- [ ] `firewallctl stats` command with human-readable output
-- [ ] Counter integration tests
+- [x] Global counters map (total / dropped / passed packets + bytes)
+- [x] `firewallctl stats` command with human-readable output
+- [x] Counter integration tests
 - [ ] Verify `make test` / `make integration-test` on a clean Linux checkout
 
 ### MTP1-C: Richer rule semantics
 
 - [x] Protocol-based rules (`IP + protocol + destination port → DROP`)
+- [x] Explicit rule actions (PASS / DROP) — configurable per rule
+- [x] Configurable default policy (ALLOW / DENY) via `firewallctl default`
+- [x] Packet-level tests (BPF_PROG_TEST_RUN: blocked → DROP, allowed → PASS, CIDR → DROP, port → DROP, PASS overrides default-deny, DROP wins)
 - [ ] Port-based filtering with CIDR networks (currently exact `/32` only)
-- [ ] Explicit rule actions (PASS / DROP)
 - [ ] Rule priority (deterministic winner when rules overlap)
 - [ ] Direction-aware rules (INGRESS / EGRESS)
-- [ ] Packet-level tests (blocked → DROP, allowed → PASS, CIDR → DROP, rule removed → PASS)
 
 ### MTP1-D: Stateful firewall
 

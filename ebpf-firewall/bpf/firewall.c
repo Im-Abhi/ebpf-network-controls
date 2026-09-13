@@ -11,17 +11,26 @@
  * Datapath (fixed, always runs):
  *     1. parse packet headers
  *     2. build packet_info (src/dst address, protocol)
- *     3. policy lookup (blocked_ips LPM trie)
- *     4. decision: DROP if the packet matched the blocklist, else PASS
+ *     3. policy lookups: blocked_ips LPM trie + port_policy hash,
+ *        each returning a rule_action (PASS or DROP)
+ *     4. decision (data-driven, see decision_table below)
+ *
+ * Decision table (deterministic, DROP takes precedence):
+ *   any matched rule action == DROP      -> DROP
+ *   else any matched rule action == PASS -> PASS
+ *   else (no rule matched by any lookup) -> default policy
+ *   unparseable / non-IPv4               -> default policy
+ *
+ * The default policy is read from the `firewall_config` map (entry 0 =
+ * DEFAULT_ALLOW or DEFAULT_DENY). A matched DROP always wins, so adding an
+ * explicit block stays effective even under a default-allow policy. An
+ * explicit PASS rule takes effect only for traffic it matches, permitting
+ * exactly that traffic under a default-deny policy.
  *
  * Debugging (optional, compile-time): protocol/port inspection and
  * bpf_printk logging are compiled out unless FIREWALL_DEBUG is defined.
  * Keep debugging off for performance-sensitive measurements so tracing
  * does not pollute the datapath.
- *
- * Default policy: ALLOW
- *   matching blocked_ips: DROP
- *   no matching policy:   PASS
  */
 
 #ifdef FIREWALL_DEBUG
@@ -84,39 +93,84 @@ static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
     return info;
 }
 
-/* Policy lookup + decision. Currently: block traffic to OR from a blocked
- * address. Checks source first, then destination. Both keys use the same
- * 8-byte LPM layout with the address in network byte order, matching the
- * Go side (control/ebpf/maps.go). */
-static __always_inline int is_blocked(const struct packet_info *info) {
+/* Policy lookup for the IP blocklist. Returns the rule_action stored for the
+ * longest-prefix LPM match on the source address, falling back to the
+ * destination address' match. Checks source first, then destination. Both keys
+ * use the same 8-byte LPM layout with the address in network byte order,
+ * matching the Go side (control/ebpf/blocklist.go). */
+static __always_inline int ip_block_action(const struct packet_info *info,
+                                           enum rule_action *out_action) {
     struct ipv4_lpm_key key = {
         .prefixlen = 32,
         .data = info->saddr,
     };
 
-    __u32 *blocked = bpf_map_lookup_elem(&blocked_ips, &key);
-
-    if (!(blocked && *blocked)) {
+    __u32 *elem = bpf_map_lookup_elem(&blocked_ips, &key);
+    if (!elem) {
         key.data = info->daddr;
-        blocked = bpf_map_lookup_elem(&blocked_ips, &key);
+        elem = bpf_map_lookup_elem(&blocked_ips, &key);
     }
 
-    return blocked && *blocked;
+    if (!elem) {
+        *out_action = ACTION_PASS;
+        return 0;
+    }
+
+    *out_action = (enum rule_action)*elem;
+    return 1;
 }
 
 /* Port-policy lookup. Matches protocol + destination port against the
- * destination address. Currently supports exact /32 destination only; the
- * key carries the destination address in network byte order, matching the
- * Go side (control/ebpf/portpolicy.go). */
-static __always_inline int port_rule_match(const struct packet_info *info) {
+ * destination address and returns the stored rule_action. Currently supports
+ * exact /32 destination only; the key carries the destination address in
+ * network byte order, matching the Go side (control/ebpf/portpolicy.go). */
+static __always_inline int port_rule_action(const struct packet_info *info,
+                                            enum rule_action *out_action) {
     struct port_rule_key key = {
         .protocol = info->protocol,
         .dport = info->dport,
         .dst = info->daddr,
     };
 
-    __u32 *action = bpf_map_lookup_elem(&port_policy, &key);
-    return action && *action;
+    __u32 *elem = bpf_map_lookup_elem(&port_policy, &key);
+
+    if (!elem) {
+        *out_action = ACTION_PASS;
+        return 0;
+    }
+
+    *out_action = (enum rule_action)*elem;
+    return 1;
+}
+
+/* Reads the configured default policy from the config map. Falls back to
+ * DEFAULT_ALLOW if the entry is absent. */
+static __always_inline enum default_policy default_policy(void) {
+    __u32 key = 0;
+    __u32 *policy = bpf_map_lookup_elem(&firewall_config, &key);
+    if (!policy) {
+        return DEFAULT_ALLOW;
+    }
+    return (enum default_policy)*policy;
+}
+
+/* Applies the decision table. DROP from any matched rule wins; otherwise PASS
+ * from any matched rule; otherwise the configured default policy. */
+static __always_inline int decide(int ip_matched, enum rule_action ip_action,
+                                  int port_matched, enum rule_action port_action) {
+    if (ip_matched && ip_action == ACTION_DROP) {
+        return XDP_DROP;
+    }
+    if (port_matched && port_action == ACTION_DROP) {
+        return XDP_DROP;
+    }
+    if (ip_matched && ip_action == ACTION_PASS) {
+        return XDP_PASS;
+    }
+    if (port_matched && port_action == ACTION_PASS) {
+        return XDP_PASS;
+    }
+    return default_policy() == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
 }
 
 /* Global counter increment. Looks up the counter by index and atomically
@@ -184,24 +238,35 @@ int firewall_prog(struct xdp_md *ctx) {
     int ok;
     struct packet_info info = parse_packet(&nh, data_end, &ok);
     if (!ok) {
-        /* Unparseable or non-IPv4: default allow. */
+        /* Unparseable or non-IPv4: apply the default policy. */
+        int verdict = default_policy() == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
         incr_counter(COUNTER_TOTAL, pkt_len);
-        incr_counter(COUNTER_PASS, pkt_len);
-        return XDP_PASS;
+        if (verdict == XDP_DROP) {
+            incr_counter(COUNTER_DROP, pkt_len);
+        } else {
+            incr_counter(COUNTER_PASS, pkt_len);
+        }
+        return verdict;
     }
 
-    /* 2. policy lookup + decision */
-    if (is_blocked(&info) || port_rule_match(&info)) {
-        DEBUG_PRINTK("packet BLOCKED");
+    /* 2. policy lookups, each returning an action */
+    enum rule_action ip_action, port_action;
+    int ip_matched = ip_block_action(&info, &ip_action);
+    int port_matched = port_rule_action(&info, &port_action);
+
+    /* 3. decision (data-driven; DROP wins, else PASS, else default) */
+    int verdict = decide(ip_matched, ip_action, port_matched, port_action);
+    if (verdict == XDP_DROP) {
+        DEBUG_PRINTK("packet DROPPED");
         incr_counter(COUNTER_TOTAL, pkt_len);
         incr_counter(COUNTER_DROP, pkt_len);
         return XDP_DROP;
     }
 
-    /* 3. optional debugging (compiled out with FIREWALL_DEBUG undefined) */
+    /* 4. optional debugging (compiled out with FIREWALL_DEBUG undefined) */
     debug_packet(&info, &nh, data_end);
 
-    /* 4. default policy: allow */
+    /* 5. passed: matching PASS rule or default allow */
     incr_counter(COUNTER_TOTAL, pkt_len);
     incr_counter(COUNTER_PASS, pkt_len);
     return XDP_PASS;

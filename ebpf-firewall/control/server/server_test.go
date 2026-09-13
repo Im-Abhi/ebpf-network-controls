@@ -18,16 +18,25 @@ type fakePolicy struct {
 	call   bool
 	stat   Stats
 	statOK bool
+	def    string
 }
 
 func newFakePolicy() *fakePolicy {
 	return &fakePolicy{
 		ips:   make(map[string]struct{}),
 		rules: make(map[string]PortRule),
+		def:   "allow",
 	}
 }
 
 func (f *fakePolicy) BlockIP(cidr string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ips[cidr] = struct{}{}
+	return nil
+}
+
+func (f *fakePolicy) BlockIPWithAction(cidr, action string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ips[cidr] = struct{}{}
@@ -81,8 +90,31 @@ func (f *fakePolicy) Stats() (Stats, error) {
 func (f *fakePolicy) BlockPortRule(dst, protocol string, port uint16) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.rules[portKey(dst, protocol, port)] = PortRule{Protocol: protocol, Port: port, Dst: dst}
+	f.rules[portKey(dst, protocol, port)] = PortRule{Protocol: protocol, Port: port, Dst: dst, Action: "drop"}
 	return nil
+}
+
+func (f *fakePolicy) BlockPortRuleWithAction(dst, protocol string, port uint16, action string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rules[portKey(dst, protocol, port)] = PortRule{Protocol: protocol, Port: port, Dst: dst, Action: action}
+	return nil
+}
+
+func (f *fakePolicy) SetDefaultPolicy(s string) error {
+	if s != "allow" && s != "deny" {
+		return fmt.Errorf("invalid default policy %q", s)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.def = s
+	return nil
+}
+
+func (f *fakePolicy) DefaultPolicy() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.def, nil
 }
 
 func (f *fakePolicy) UnblockPortRule(dst, protocol string, port uint16) error {
@@ -186,6 +218,51 @@ func TestHandle_BlockPlainIPStillWorks(t *testing.T) {
 	}
 }
 
+func TestHandle_DefaultPolicy(t *testing.T) {
+	policy := newFakePolicy()
+	s := New("unused.sock", policy)
+
+	// default command reads/writes the default policy
+	if resp := s.handle(Request{Command: CmdDefault, Value: "deny"}); !resp.OK {
+		t.Errorf("set default deny: %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdStatus}); !resp.OK {
+		t.Fatalf("status: %+v", resp)
+	} else if resp.Default != "deny" {
+		t.Errorf("status default = %q, want deny", resp.Default)
+	}
+
+	// invalid value propagates the error
+	if resp := s.handle(Request{Command: CmdDefault, Value: "bogus"}); resp.OK {
+		t.Errorf("invalid default should not be ok: %+v", resp)
+	}
+}
+
+func TestHandle_BlockWithAction(t *testing.T) {
+	policy := newFakePolicy()
+	s := New("unused.sock", policy)
+
+	// port rule with explicit action routes to the WithAction path
+	if resp := s.handle(Request{Command: CmdBlock, Value: "192.168.1.100", Protocol: "tcp", Port: 22, Action: "pass"}); !resp.OK {
+		t.Errorf("block port with action: %+v", resp)
+	}
+	resp := s.handle(Request{Command: CmdListPorts})
+	if !resp.OK || resp.Count != 1 {
+		t.Fatalf("listports: %+v", resp)
+	}
+	if resp.PortRules[0].Action != "pass" {
+		t.Errorf("port rule action = %q, want pass", resp.PortRules[0].Action)
+	}
+
+	// IP rule with explicit action
+	if resp := s.handle(Request{Command: CmdBlock, Value: "10.0.0.0/8", Action: "pass"}); !resp.OK {
+		t.Errorf("block IP with action: %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdList}); resp.Count != 1 {
+		t.Errorf("IP list should have 1, got %+v", resp)
+	}
+}
+
 func TestHandle_ClearRemovesPortRules(t *testing.T) {
 	policy := newFakePolicy()
 	s := New("unused.sock", policy)
@@ -236,21 +313,27 @@ func TestHandle_Stats(t *testing.T) {
 // errPolicy returns an error from every blocked-side operation.
 type errPolicy struct{}
 
-func (p *errPolicy) BlockIP(string) error                         { return errors.New("boom") }
-func (p *errPolicy) UnblockIP(string) error                       { return errors.New("boom") }
-func (p *errPolicy) ListBlockedIPs() ([]string, error)            { return nil, errors.New("boom") }
-func (p *errPolicy) Clear() error                                 { return errors.New("boom") }
-func (p *errPolicy) Interface() string                            { return "" }
-func (p *errPolicy) Stats() (Stats, error)                        { return Stats{}, errors.New("boom") }
-func (p *errPolicy) BlockPortRule(string, string, uint16) error   { return errors.New("boom") }
+func (p *errPolicy) BlockIP(string) error                       { return errors.New("boom") }
+func (p *errPolicy) BlockIPWithAction(string, string) error     { return errors.New("boom") }
+func (p *errPolicy) UnblockIP(string) error                     { return errors.New("boom") }
+func (p *errPolicy) ListBlockedIPs() ([]string, error)          { return nil, errors.New("boom") }
+func (p *errPolicy) Clear() error                               { return errors.New("boom") }
+func (p *errPolicy) Interface() string                          { return "" }
+func (p *errPolicy) Stats() (Stats, error)                      { return Stats{}, errors.New("boom") }
+func (p *errPolicy) BlockPortRule(string, string, uint16) error { return errors.New("boom") }
+func (p *errPolicy) BlockPortRuleWithAction(string, string, uint16, string) error {
+	return errors.New("boom")
+}
 func (p *errPolicy) UnblockPortRule(string, string, uint16) error { return errors.New("boom") }
 func (p *errPolicy) ListPortRules() ([]PortRule, error)           { return nil, errors.New("boom") }
 func (p *errPolicy) ClearPortRules() error                        { return errors.New("boom") }
+func (p *errPolicy) SetDefaultPolicy(string) error                { return errors.New("boom") }
+func (p *errPolicy) DefaultPolicy() (string, error)               { return "", errors.New("boom") }
 
 func TestHandle_PropagatesErrors(t *testing.T) {
 	s := New("unused.sock", &errPolicy{})
 
-	for _, cmd := range []Command{CmdBlock, CmdUnblock, CmdList, CmdClear, CmdStats, CmdListPorts} {
+	for _, cmd := range []Command{CmdBlock, CmdUnblock, CmdList, CmdClear, CmdStats, CmdListPorts, CmdDefault} {
 		if resp := s.handle(Request{Command: cmd, Value: "x"}); resp.OK {
 			t.Errorf("%s should not be ok with failing policy: %+v", cmd, resp)
 		}
