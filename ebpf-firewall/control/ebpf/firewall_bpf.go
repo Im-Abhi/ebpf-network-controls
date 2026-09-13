@@ -29,6 +29,8 @@ type firewallPortRuleKey struct {
 	Protocol uint8
 	_        [1]byte
 	Dport    uint16
+	Sport    uint16
+	_        [2]byte
 	Dst      uint32
 }
 

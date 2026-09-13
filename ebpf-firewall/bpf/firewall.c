@@ -133,36 +133,34 @@ static __always_inline int ip_block_action(const struct packet_info *info,
  * a match, 0 if no rule covers the packet. */
 static __always_inline int port_rule_action(const struct packet_info *info,
                                             enum rule_action *out_action) {
-    struct port_rule_key base = {
-        .protocol = info->protocol,
-        .dst = info->daddr,
-    };
     struct port_rule_key key;
     __u32 *elem;
 
-#define TRY_LOOKUP(k)                                    \
-    do {                                                 \
-        elem = bpf_map_lookup_elem(&port_policy, &(k));  \
-        if (elem) {                                      \
-            *out_action = (enum rule_action)*elem;       \
-            return 1;                                    \
-        }                                                \
-    } while (0)
-
-    key = base;
+    /* Zero the whole key, including padding. The hash comparison covers all
+     * 12 bytes of the struct and the Go side stores zero padding, so any
+     * stale stack bytes here (e.g. leftover from the LPM key that shares the
+     * same stack slots) would make every lookup miss. */
+    __builtin_memset(&key, 0, sizeof(key));
+    key.protocol = info->protocol;
     key.dport = info->dport;
     key.sport = info->sport;
-    TRY_LOOKUP(key);            /* exact dport + exact sport */
+    key.dst = info->daddr;
 
-    key.sport = 0;
-    TRY_LOOKUP(key);            /* exact dport + any sport */
+#define TRY_LOOKUP(d, s)                                        \
+    do {                                                        \
+        key.dport = (d);                                        \
+        key.sport = (s);                                        \
+        elem = bpf_map_lookup_elem(&port_policy, &key);         \
+        if (elem) {                                             \
+            *out_action = (enum rule_action)*elem;              \
+            return 1;                                           \
+        }                                                       \
+    } while (0)
 
-    key.dport = 0;
-    key.sport = info->sport;
-    TRY_LOOKUP(key);            /* any dport + exact sport */
-
-    key.sport = 0;
-    TRY_LOOKUP(key);            /* any dport + any sport */
+    TRY_LOOKUP(info->dport, info->sport);   /* exact dport + exact sport */
+    TRY_LOOKUP(info->dport, 0);             /* exact dport + any sport */
+    TRY_LOOKUP(0,         info->sport);     /* any dport + exact sport */
+    TRY_LOOKUP(0,         0);               /* any dport + any sport */
 
 #undef TRY_LOOKUP
 
