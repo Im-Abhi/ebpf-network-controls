@@ -24,7 +24,7 @@ destroyed after each run — safe to run against a development machine.
 
 ```bash
 cd ebpf-firewall
-make bench                                # build + full default matrix
+make bench                                # regenerate bindings + build + full default matrix
 # or, with the same backend/scenario controls as run-bench.sh:
 sudo ./benchmark/run-bench.sh --backend xdp --scenario single --iterations 3 --duration 10
 ```
@@ -64,6 +64,14 @@ per network — the same number of effective lookups.
 | Memory | `VmRSS` of the firewall daemon (XDP); `0` for nft (kernel-internal state) |
 | Rule update time | ms for `firewallctl block/unblock` (XDP) vs `nft add/delete rule` (nft) |
 
+Both UDP and TCP passes run against the same per-iteration `iperf3 -s` server
+(bound to `HOST_IP:5201`). Before each pass the harness reaps any stale
+`iperf3 -s` process left behind by an interrupted run — an old listener would
+otherwise starve the TCP pass of a binding port and zero out the whole
+`tcp_bps` column — then waits until its own server is listening. A failed
+listener is logged as a `WARN` and its stderr kept in the run directory instead
+of being discarded, so measurement problems stay visible in the results.
+
 ## Output
 
 Each run creates `benchmark/results/<YYYYmmdd-HHMMSS>/`, with one directory per
@@ -78,6 +86,9 @@ run  backend  scenario  iter  udp_bps  udp_pps  udp_lost  udp_jitter_ms  tcp_bps
 
 Each run also writes a `meta.txt` capturing the environment (kernel, iperf3/nft/
 go/python3/jq versions, UTC start time) so results are self-documenting.
+
+A per-iteration `iperf-server.err` holds the iperf3 server's stderr; a non-empty
+file (e.g. a port conflict) explains any `tcp_bps=0` WARN in the run log.
 
 ## Visualizing results
 

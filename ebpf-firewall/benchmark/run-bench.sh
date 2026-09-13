@@ -182,8 +182,23 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     mkdir -p "${rundir}"
     log "measuring backend=${backend} scenario=${scenario} iteration=${iter} duration=${DURATION}s"
 
-    iperf3 -s -B "${HOST_IP}" -p 5201 > /dev/null 2>&1 &
+    # Reap any stale iperf3 server (e.g. from an interrupted run) that would
+    # otherwise keep holding :5201 and silently starve the TCP pass of a
+    # listener -- the observable symptom is an all-zero tcp_bps column.
+    pkill -f 'iperf3 -s' 2>/dev/null || true
+    sleep 0.3
+    iperf3 -s -B "${HOST_IP}" -p 5201 > "${rundir}/iperf-server.err" 2>&1 &
     IPERF_PID=$!
+
+    # Wait until the server is actually LISTENing (port 5201 == hex 0x1451 in
+    # /proc/net/tcp) and surface a bind failure instead of zeroed TCP rows.
+    for _ in $(seq 1 20); do
+        awk 'NR>1{print $2}' /proc/net/tcp 2>/dev/null | grep -q ':1451' && break
+        sleep 0.1
+    done
+    if ! awk 'NR>1{print $2}' /proc/net/tcp 2>/dev/null | grep -q ':1451'; then
+        log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: iperf3 server not listening on :5201 (see ${rundir}/iperf-server.err)"
+    fi
 
     local cpu0 cpu1
     sample_cpu cpu0
@@ -218,6 +233,9 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
 
     if [ "${bps}" -eq 0 ]; then
         log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: udp_bps=0 (iperf or metric-parser problem)"
+    fi
+    if [ "${tcp_bps}" -eq 0 ]; then
+        log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: tcp_bps=0 (iperf server, run, or metric-parser problem; see ${rundir}/iperf-server.err)"
     fi
 
     printf '%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n' \

@@ -125,12 +125,6 @@ sample_rss_kb() {
 # Traffic measurement (iperf3 + ping); requires `iperf3`
 # ---------------------------------------------------------------------------
 
-# start_iperf_server : host-side server bound to the sandbox veth IP.
-start_iperf_server() {
-    iperf3 -s -B "${HOST_IP}" -p 5201 --one-off -D --logfile /dev/null
-    sleep 0.2
-}
-
 # run_iperf <udp|tcp> <duration> <json_out> : client inside the ns.
 run_iperf() {
     local mode="$1" dur="$2" out="$3" extra=()

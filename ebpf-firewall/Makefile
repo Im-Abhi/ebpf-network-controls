@@ -75,8 +75,8 @@ integration-test: generate
 clean:
 	@echo "==> Cleaning build artifacts..."
 	rm -rf $(BIN_DIR)
-	rm -f $(EBPF_DIR)/*_bpfel.go $(EBPF_DIR)/*_bpfeb.go
-	rm -f $(EBPF_DIR)/*_bpfel.o $(EBPF_DIR)/*_bpfeb.o
+	rm -f $(EBPF_DIR)/*_bpf.go $(EBPF_DIR)/*_bpfel.go $(EBPF_DIR)/*_bpfeb.go
+	rm -f $(EBPF_DIR)/*_bpf.o $(EBPF_DIR)/*_bpfel.o $(EBPF_DIR)/*_bpfeb.o
 	rm -f $(VMLINUX_H)
 
 ## run: Run the firewall with root privileges (default: IFACE=lo, override: make run IFACE=eth0)
@@ -90,7 +90,7 @@ trace:
 	sudo cat /sys/kernel/debug/tracing/trace_pipe
 
 ## bench: Run the MTP1-E benchmark (XDP firewall vs nftables). Args via BENCH_ARGS, e.g. `make bench BENCH_ARGS="--backend nft --scenario single --iterations 2"`
-bench: build
+bench: generate build
 	@echo "==> Running benchmark harness (needs root + iperf3 + nft)..."
 	sudo ./benchmark/run-bench.sh $(BENCH_ARGS)
 
