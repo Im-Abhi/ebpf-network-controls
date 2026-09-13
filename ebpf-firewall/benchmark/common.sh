@@ -47,7 +47,7 @@ scenario_targets() {
     many)
         # 1000 distinct /30 prefixes in a 10.10.0.0/19 block. Deterministic,
         # generated once and reused for every backend so counts match exactly.
-        seq 0 999 | awk '{ printf "10.10.%d.%d/30\n", ($1 / 256), ($1 % 256 * 4) }'
+        seq 0 999 | awk '{ f = $1 * 4; printf "10.10.%d.%d/30\n", int(f / 256), f % 256 }'
         ;;
     *)
         echo "bench: unknown scenario '$1'" >&2
