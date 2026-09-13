@@ -46,9 +46,10 @@ MTP2+ are the thesis-level extensions built on top of it.
 
 ### MTP1-E: Benchmarking module (separate from firewall)
 
-- [ ] Benchmark harness (iperf3 / pktgen scripts)
-- [ ] eBPF/XDP vs nftables comparison
+- [x] Benchmark harness (`benchmark/` — veth+netns sandbox, `run-bench.sh`, `make bench`)
+- [ ] Run baseline (XDP vs nftables) and save results
 - [ ] Metrics: throughput, latency, CPU, memory, rule-update time
+- [ ] Rerun unchanged after stateful firewall; document feature cost
 - [ ] Results documentation
 
 ---

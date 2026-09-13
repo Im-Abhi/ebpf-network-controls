@@ -17,7 +17,7 @@ BPFTOOL ?= bpftool
 # datapath under trace. Leave unset for performance-sensitive measurements.
 DEBUG ?= 0
 
-.PHONY: all deps vmlinux generate generate-debug build test integration-test clean run trace help
+.PHONY: all deps vmlinux generate generate-debug build test integration-test clean run trace bench help
 
 ## all: Resolve deps, generate eBPF bindings, and build binaries
 all: deps generate build
@@ -88,3 +88,8 @@ run: build
 trace:
 	@echo "==> Streaming BPF trace pipe (Ctrl+C to stop)..."
 	sudo cat /sys/kernel/debug/tracing/trace_pipe
+
+## bench: Run the MTP1-E benchmark (XDP firewall vs nftables). Args via BENCH_ARGS, e.g. `make bench BENCH_ARGS="--backend nft --scenario single --iterations 2"`
+bench: build
+	@echo "==> Running benchmark harness (needs root + iperf3 + nft)..."
+	sudo ./benchmark/run-bench.sh $(BENCH_ARGS)
