@@ -26,15 +26,21 @@ destroyed after each run — safe to run against a development machine.
 cd ebpf-firewall
 make bench                                # regenerate bindings + build + full default matrix
 # or, with the same backend/scenario controls as run-bench.sh:
-sudo ./benchmark/run-bench.sh --backend xdp --scenario single --iterations 3 --duration 10
+sudo ./benchmark/run-bench.sh --backend xdp --scenario single --iterations 5 --duration 10
 ```
 
 | Option | Values | Default |
 | --- | --- | --- |
 | `--backend` | `all`, `xdp`, `nft` | `all` |
 | `--scenario` | `all`, `none`, `single`, `forward`, `many` | `all` |
-| `--iterations` | positive int | 3 |
+| `--iterations` | positive int | 5 |
 | `--duration` | seconds per iperf3 pass | 10 |
+
+Environment knobs (no flag equivalent): `ITERS` iterations, `DURATION`
+seconds per pass, `UDP_BW` iperf3 UDP rate (`0` default = unthrottled, e.g.
+`UDP_BW=500M` for a fixed-rate pass). Iterations default to 5 so the median
+table has enough samples to damp burst noise (e.g. the one-off softirq dips
+seen at n=3); the plotter reports median ± stdev.
 
 ## Scenarios
 
@@ -72,6 +78,14 @@ populates on the sending client too (`sum_received` carries the send statistics
 while `sender=true`), giving the true forwarding datapath — not the ACK-echo
 path that a `server → client` (`-R`) test would measure.
 
+**UDP is unthrottled by default** (`-b 0`), so the UDP column now discriminates
+at line rate: throughput, pps, loss and jitter all reflect the firewall's
+datapath capacity instead of a fixed 1 Gbps ceiling. `udp_lost` is therefore a
+saturation metric (the host RX path drops when the sender out-runs the
+datapath), not a defect; interpret `udp_bps` *together with* `udp_lost`/`udp_pps`
+for a given cell. Set `UDP_BW` to a fixed rate for loss-free, rate-controlled
+measurements.
+
 Both UDP and TCP passes run against the same per-iteration `iperf3 -s` server
 (bound to `HOST_IP:5201`). Before each pass the harness reaps any stale
 `iperf3 -s` process left behind by an interrupted run — an old listener would
@@ -101,6 +115,17 @@ Summing the per-iteration pass-bytes against the reported `tcp_bps`/`udp_bps`
 confirms the throughput column really is the firewall's datapath (and catches a
 mis-scoped measurement if a future change flips the traffic direction).
 
+### XDP attach mode
+
+The daemon attaches natively first and falls back to generic (SKB) XDP:
+`link.XDPDriverMode`, and on failure `link.XDPGenericMode` with a logged
+warning. The effective mode is recorded in every run's `meta.txt` as
+`xdp_attach: xdpDriver` / `xdp_attach: xdpGeneric` and is also visible in
+`fwctl status`. Read it before citing per-packet numbers: **generic mode rides
+the skb path and inflates the XDP overhead**, while native mode measures the
+real driver datapath. The locked baseline below was captured in native mode on
+veth.
+
 ## Output
 
 Each run creates `benchmark/results/<YYYYmmdd-HHMMSS>/`, with one directory per
@@ -113,8 +138,9 @@ run  backend  scenario  iter  udp_bps  udp_pps  udp_lost  udp_jitter_ms  tcp_bps
 
 `benchmark/results/` is gitignored; `git add -f` only the runs you want to keep.
 
-Each run also writes a `meta.txt` capturing the environment (kernel, iperf3/nft/
-go/python3/jq versions, UTC start time) so results are self-documenting.
+Each run also writes a `meta.txt` capturing the environment (kernel + `uname -r`,
+`bpf_jit` sysctl, XDP attach mode, iperf3/nft/go/python3/jq versions, UTC start
+time) so results are self-documenting.
 
 A per-iteration `iperf-server.err` holds the iperf3 server's stderr; a non-empty
 file (e.g. a port conflict) explains any `tcp_bps=0` WARN in the run log.
@@ -134,7 +160,7 @@ nothing and are untouched.
 `make bench-plot` (or `python3 benchmark/plot.py [RUN_DIR]`) renders the latest
 run — or the run you name:
 
-- a **terminal table** of every metric as mean ± stdev across iterations
+- a **terminal table** of every metric as median ± stdev across iterations
   (stdlib only, always printed);
 - **bar charts** (`<run>/charts/<metric>.png`) comparing XDP vs nftables per
   scenario, with ±stdev error bars — throughput (UDP/TCP Mbit/s, pps), packet
@@ -147,8 +173,29 @@ printed. Example:
 
 ```bash
 make bench-plot                  # latest run
-python3 benchmark/plot.py results/20260913-171508 --scenario many
+python3 benchmark/plot.py results/20260914-151138 --scenario many
 ```
+
+## Baselines and superseded runs
+
+The **locked pre-conntrack baseline** is
+`benchmark/results/20260914-151138/` (native XDP on veth, UDP unthrottled,
+fast path + host-firewall handling, 5 iterations). It is the reference to quote
+for Phase 4 onwards.
+
+Superseded and **do not cite**:
+
+- `results/20260913-191705` (and other `2026-09-13`/early runs): captured
+  before the host-firewall fix — the sandbox's SYNs were silently dropped, so
+  their TCP rows are artifacts (all-zero or ACK-only).
+- `results/20260914-133552`: `-R` (download) direction experiment, `tcp_bps`
+  null — not the datapath direction, kept only as a diagnostic.
+- `results/20260914-134906`: correct direction and fast path, but UDP was still
+  capped at `-b 1000M` and iterations were 3; superseded by the locked baseline
+  above.
+
+Older runs (`…-002931`, `…-004040`, etc.) are informal exploration and must not
+be quoted either.
 
 ## Reproducibility notes
 

@@ -71,6 +71,10 @@ func (f *fakePolicy) Interface() string {
 	return "test0"
 }
 
+func (f *fakePolicy) AttachMode() string {
+	return "xdpGeneric"
+}
+
 func (f *fakePolicy) Stats() (Stats, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -319,6 +323,7 @@ func (p *errPolicy) UnblockIP(string) error                     { return errors.
 func (p *errPolicy) ListBlockedIPs() ([]string, error)          { return nil, errors.New("boom") }
 func (p *errPolicy) Clear() error                               { return errors.New("boom") }
 func (p *errPolicy) Interface() string                          { return "" }
+func (p *errPolicy) AttachMode() string                         { return "" }
 func (p *errPolicy) Stats() (Stats, error)                      { return Stats{}, errors.New("boom") }
 func (p *errPolicy) BlockPortRule(string, string, uint16, uint16) error { return errors.New("boom") }
 func (p *errPolicy) BlockPortRuleWithAction(string, string, uint16, uint16, string) error {

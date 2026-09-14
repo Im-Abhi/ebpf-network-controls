@@ -20,6 +20,7 @@ type Policy interface {
 	ListBlockedIPs() ([]string, error)
 	Clear() error
 	Interface() string
+	AttachMode() string
 	Stats() (Stats, error)
 	BlockPortRule(dst, protocol string, dport, sport uint16) error
 	BlockPortRuleWithAction(dst, protocol string, dport, sport uint16, action string) error
@@ -222,7 +223,7 @@ func (s *Server) handle(req Request) Response {
 		if err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
-		return Response{OK: true, Iface: s.policy.Interface(), Attached: s.live, Count: len(blocked), Default: def}
+		return Response{OK: true, Iface: s.policy.Interface(), Attached: s.live, Count: len(blocked), Default: def, AttachMode: s.policy.AttachMode()}
 
 	case CmdSetDefault, CmdDefault:
 		if err := s.policy.SetDefaultPolicy(req.Value); err != nil {

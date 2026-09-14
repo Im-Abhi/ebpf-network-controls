@@ -34,6 +34,9 @@ func TestFirewall_LoadAttachDynamicPolicy(t *testing.T) {
 	if err := fw.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	if am := fw.AttachMode(); am != AttachModeDriver && am != AttachModeGeneric {
+		t.Errorf("AttachMode() = %q; want xdpDriver or xdpGeneric", am)
+	}
 
 	// Dynamic rule change while attached: the program must not be reloaded.
 	if err := fw.BlockIP("1.2.3.4"); err != nil {

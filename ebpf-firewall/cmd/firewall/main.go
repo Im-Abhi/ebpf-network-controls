@@ -46,7 +46,7 @@ func main() {
 		fw.Stop()
 		log.Fatalf("Failed to attach XDP: %v", err)
 	}
-	log.Printf("XDP attached to %s", ifname)
+	log.Printf("XDP (%s) attached to %s", fw.AttachMode(), ifname)
 
 	// Populate the blocked IP's into the kernel map
 	if blockList != "" {
@@ -73,7 +73,7 @@ func main() {
 	defer fw.Stop()   // runs LAST (LIFO): XDP detaches after socket closes
 	defer srv.Close() // runs FIRST: socket closes before XDP detaches
 
-	log.Printf("Successfully attached XDP to %s", ifname)
+	log.Printf("Successfully attached XDP (%s) to %s", fw.AttachMode(), ifname)
 	log.Printf("Press Ctrl+C to exit and remove the program")
 
 	<-ctx.Done()

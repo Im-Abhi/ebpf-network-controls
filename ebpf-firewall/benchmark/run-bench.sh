@@ -16,7 +16,9 @@
 #                                [--scenario all|none|single|forward|many]
 #                                [--iterations N] [--duration S]
 #                                [--help]
-# Defaults: backend=all scenario=all iterations=3 duration=10.
+# Defaults: backend=all scenario=all iterations=5 duration=10.
+# Environment knobs: ITERS (iterations), DURATION (seconds per iperf3 pass),
+# UDP_BW (iperf3 -b for the UDP pass; 0 = unthrottled).
 #
 # Directions: iperf3's client (run in the sandbox netns) is the sender by
 # default, so bulk DATA always flows client -> server through the host-side XDP
@@ -31,7 +33,7 @@ source "${BENCH_DIR}/common.sh"
 
 BACKENDS=(xdp nft)
 SCENARIOS=("${all_scenarios[@]}")
-ITERATIONS=3
+ITERATIONS="${ITERS:-5}"
 DURATION=10
 RUN_TS="$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="${RESULTS_ROOT}/${RUN_TS}"
@@ -91,6 +93,7 @@ mkdir -p "${RUN_DIR}"
     date -u '+started_utc: %Y-%m-%d %H:%M:%S'
     echo "kernel:   $(uname -srm 2>/dev/null || true)"
     echo "uname_r:  $(uname -r 2>/dev/null || true)"
+    echo "bpf_jit:  $(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || echo n/a)"
     echo "iperf3:   $(iperf3 --version 2>/dev/null | head -1 || true)"
     echo "nft:      $(nft --version 2>/dev/null || true)"
     echo "go:       $(go version 2>/dev/null || true)"
@@ -120,6 +123,14 @@ trap cleanup EXIT
 
 # --- per-backend lifecycle -------------------------------------------------
 
+# Records the XDP attach mode actually used (xdpDriver/xdpGeneric) into
+# meta.txt. Only meaningful while the daemon runs, so it lives in fw_start.
+record_attach_mode() {
+    local am
+    am="$("${CTL}" status 2>/dev/null | sed -n 's/^attach mode: //p' | head -1)"
+    [ -n "${am:-}" ] && echo "xdp_attach: ${am}" >> "${RUN_DIR}/meta.txt" || true
+}
+
 fw_start() {  # start daemon attached to ${VETH0}, default allow
     "${FIREWALLD}" -i "${VETH0}" > /dev/null 2>&1 &
     FW_PID=$!
@@ -130,6 +141,7 @@ fw_start() {  # start daemon attached to ${VETH0}, default allow
     done
     sleep 0.2
     "${CTL}" default allow
+    record_attach_mode
 }
 
 fw_stop() { clear_xdp_rules; kill "${FW_PID}" 2>/dev/null || true; wait "${FW_PID}" 2>/dev/null || true; FW_PID=""; }

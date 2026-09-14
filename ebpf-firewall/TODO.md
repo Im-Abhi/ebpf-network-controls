@@ -46,7 +46,7 @@ MTP2+ are the thesis-level extensions built on top of it.
       identical by construction; 8 → 4 map accesses per packet)
 - [x] Presence bits maintained by Go managers (set before first insert, cleared
       after last delete) and wired through the facade
-- [ ] Verify `make test` / `make integration-test` with the fast path enabled
+- [x] Verify `make test` / `make integration-test` with the fast path enabled
 
 ### MTP1-D: Stateful firewall
 

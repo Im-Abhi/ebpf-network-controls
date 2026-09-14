@@ -226,6 +226,9 @@ func printResponse(resp server.Response) {
 		}
 	case resp.Iface != "":
 		fmt.Printf("interface: %s\n", resp.Iface)
+		if resp.AttachMode != "" {
+			fmt.Printf("attach mode: %s\n", resp.AttachMode)
+		}
 		fmt.Printf("control plane: %v\n", resp.Attached)
 		fmt.Printf("blocked: %d\n", resp.Count)
 		fmt.Printf("default policy: %s\n", resp.Default)

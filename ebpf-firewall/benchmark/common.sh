@@ -136,11 +136,13 @@ sample_rss_kb() {
 # run_iperf <udp|tcp> <duration> <json_out> : iperf3 client inside the sandbox
 # netns. The iperf3 client is the sender by default, so the bulk DATA crosses
 # the host-side XDP hook / nft INPUT chain; `.end.sum_received` (populated on
-# send) carries the true datapath throughput.
+# send) carries the true datapath throughput. The UDP pass is unthrottled by
+# default (`UDP_BW=0`) so loss/jitter/pps at saturation discriminate the
+# backends; override with UDP_BW, e.g. `UDP_BW=500M`.
 run_iperf() {
     local mode="$1" dur="$2" out="$3" extra=()
     if [ "${mode}" = udp ]; then
-        extra=(-u -b 1000M)
+        extra=(-u -b "${UDP_BW:-0}")
     fi
     if ! ns_exec iperf3 -c "${HOST_IP}" -p 5201 -t "${dur}" "${extra[@]}" \
          -J > "${out}" 2>/dev/null; then

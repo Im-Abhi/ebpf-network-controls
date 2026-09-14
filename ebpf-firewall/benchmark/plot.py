@@ -2,7 +2,7 @@
 """Render MTP1-E benchmark results.
 
 Reads a run directory produced by benchmark/run-bench.sh, prints a compact
-mean +/- stdev table of every metric (stdlib only), and - when matplotlib is
+median +/- stdev table of every metric (stdlib only), and - when matplotlib is
 installed - renders comparison bar charts and iperf3 per-second time-series
 PNGs into <run>/charts/.
 
@@ -107,7 +107,7 @@ def aggregate(rows):
                 nums = [v for v in vals if v is not None]
                 agg[m][b][s] = {
                     "vals": nums,
-                    "mean": statistics.mean(nums) if nums else None,
+                    "median": statistics.median(nums) if nums else None,
                     "stdev": statistics.stdev(nums) if len(nums) > 1 else 0.0,
                     "n": len(nums),
                 }
@@ -115,17 +115,17 @@ def aggregate(rows):
 
 
 def print_table(agg, scenarios):
-    print(f"{'metric':<24}{'backend':<8}{'scenario':<10}{'mean':>16}{'stdev':>12}{'n':>4}")
+    print(f"{'metric':<24}{'backend':<8}{'scenario':<10}{'median':>16}{'stdev':>12}{'n':>4}")
     for m, label, _, fmt in METRICS:
         print(f"{label}")
         for b in BACKENDS:
             for s in scenarios:
                 cell = agg[m][b].get(s)
-                if not cell or cell["mean"] is None:
+                if not cell or cell["median"] is None:
                     print(f"{'':<24}{b:<8}{s:<10}{'-':>16}{'-':>12}{0:>4}")
                     continue
                 print(f"{'':<24}{b:<8}{s:<10}"
-                      f"{fmt.format(cell['mean']):>16}"
+                      f"{fmt.format(cell['median']):>16}"
                       f"{fmt.format(cell['stdev']):>12}"
                       f"{cell['n']:>4}")
 
@@ -148,9 +148,9 @@ def render_bars(agg, scenarios, out_dir):
     for metric, ylabel, scale in BAR_METRICS:
         fig, ax = plt.subplots(figsize=(9, 4.5))
         for b in BACKENDS:
-            means = [agg[metric][b].get(s, {}).get("mean") for s in scenarios]
+            medians = [agg[metric][b].get(s, {}).get("median") for s in scenarios]
             stdevs = [agg[metric][b].get(s, {}).get("stdev") for s in scenarios]
-            heights = [((v or 0.0) / scale) for v in means]
+            heights = [((v or 0.0) / scale) for v in medians]
             errs = [(e or 0.0) / scale for e in stdevs]
             off = ((width / 2) if b == "xdp" else -(width / 2))
             ax.bar([pos + off for pos in x], heights, width, yerr=errs,

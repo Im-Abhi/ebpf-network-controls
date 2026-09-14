@@ -56,6 +56,12 @@ func (f *Firewall) Interface() string {
 	return f.prog.ifaceName
 }
 
+// AttachMode reports the effective XDP attach mode ("xdpDriver"/"xdpGeneric"),
+// empty until the program is attached.
+func (f *Firewall) AttachMode() string {
+	return f.prog.AttachMode()
+}
+
 // BlockIP adds an IP or CIDR to the blocklist with a DROP action.
 func (f *Firewall) BlockIP(cidr string) error {
 	if err := f.mgr.BlockIP(cidr); err != nil {

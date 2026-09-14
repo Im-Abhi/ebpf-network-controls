@@ -56,4 +56,5 @@ type Response struct {
 	Stats     *Stats     `json:"stats,omitempty"`
 	PortRules []PortRule `json:"port_rules,omitempty"`
 	Default   string     `json:"default_policy,omitempty"`
+	AttachMode string    `json:"attach_mode,omitempty"`
 }
