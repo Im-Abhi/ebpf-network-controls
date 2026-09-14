@@ -14,8 +14,14 @@
 # Usage:
 #   sudo ./benchmark/run-bench.sh [--backend all|xdp|nft]
 #                                [--scenario all|none|single|forward|many]
-#                                [--iterations N] [--duration S] [--help]
+#                                [--iterations N] [--duration S]
+#                                [--help]
 # Defaults: backend=all scenario=all iterations=3 duration=10.
+#
+# Directions: iperf3's client (run in the sandbox netns) is the sender by
+# default, so bulk DATA always flows client -> server through the host-side XDP
+# hook and the nft INPUT chain. tcp_bps and udp_bps measure the firewalls'
+# real forwarding datapath (not the ACK echo path).
 
 set -euo pipefail
 
@@ -33,7 +39,7 @@ SUMMARY="${RUN_DIR}/summary.tsv"
 IPERF_PID=""
 
 usage() {
-    sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# //'
+    sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# //'
     exit 0
 }
 
@@ -95,12 +101,20 @@ mkdir -p "${RUN_DIR}"
 # kv <file> <key> : prints the value of `key=value` lines written by helpers.
 kv() { awk -F= -v k="$2" '$1==k {print $2; exit}' "$1"; }
 
+# Hand the run dir back to the user that invoked us via sudo, so the non-root
+# `make bench-plot` can write charts into it. No-op when not run via sudo.
+reset_results_owner() {
+    { [ -n "${SUDO_USER:-}" ] && [ -d "${RUN_DIR:-}" ]; } && chown -R "${SUDO_USER}" "${RUN_DIR}" 2>/dev/null || true
+}
+
 cleanup() {
     [ -n "${IPERF_PID}" ] && kill "${IPERF_PID}" 2>/dev/null || true
     clear_xdp_rules 2>/dev/null || true
     [ -n "${FW_PID:-}" ] && kill "${FW_PID}" 2>/dev/null || true
+    host_firewall_close
     nft_rules_down
     sandbox_down
+    reset_results_owner
 }
 trap cleanup EXIT
 
@@ -203,6 +217,8 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     local cpu0 cpu1
     sample_cpu cpu0
 
+    [ "${backend}" = xdp ] && snap_xdp_stats "${rundir}/stats-before.json"
+
     local udp_kv tcp_kv
     if run_iperf udp "${DURATION}" "${rundir}/iperf-udp.json" > "${rundir}/udp.kv" 2>/dev/null; then
         udp_kv="${rundir}/udp.kv"
@@ -216,6 +232,8 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     fi
     run_ping 20 "${rundir}/ping.txt" > "${rundir}/rtt.kv" 2>/dev/null || true
     sample_cpu cpu1
+
+    [ "${backend}" = xdp ] && snap_xdp_stats "${rundir}/stats-after.json"
 
     kill "${IPERF_PID}" 2>/dev/null || true
     IPERF_PID=""
@@ -231,12 +249,14 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     mem="$(backend_mem_kb "${backend}")"
     read -r addr del <<< "$(update_timing "${backend}")"
 
-    if [ "${bps}" -eq 0 ]; then
+    if is_zero "${bps}"; then
         log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: udp_bps=0 (iperf or metric-parser problem)"
     fi
-    if [ "${tcp_bps}" -eq 0 ]; then
+    if is_zero "${tcp_bps}"; then
         log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: tcp_bps=0 (iperf server, run, or metric-parser problem; see ${rundir}/iperf-server.err)"
     fi
+
+    [ "${backend}" = xdp ] && log_xdp_delta "${rundir}"
 
     printf '%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n' \
         "${RUN_TS}" "${backend}" "${scenario}" "${iter}" \
@@ -249,6 +269,7 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
 # --- main ------------------------------------------------------------------
 
 sandbox_up
+host_firewall_open
 
 printf 'run\tbackend\tscenario\titer\tudp_bps\tudp_pps\tudp_lost\tudp_jitter_ms\ttcp_bps\trtt_avg_ms\tcpu_jif\trss_kb\tadd_ms\tdel_ms\n' \
     > "${SUMMARY}"
@@ -265,7 +286,9 @@ for backend in "${BACKENDS[@]}"; do
 done
 
 sandbox_down
+host_firewall_close
 nft_rules_down
+reset_results_owner
 trap - EXIT
 log "done. Summary:"
 cat "${SUMMARY}" | sed 's/^/  /'

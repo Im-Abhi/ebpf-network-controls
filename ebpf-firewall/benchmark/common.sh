@@ -99,6 +99,14 @@ ns_exec() { ip netns exec "${NS_NAME}" "$@"; }
 # CPU / memory sampling (no external tooling required)
 # ---------------------------------------------------------------------------
 
+# is_zero <number-or-empty> : true when the value (possibly float, possibly
+# empty) numerically equals 0 — the WARN guards in the orchestrator cannot use
+# `[ -eq ]` as jq may report fractional bits-per-second. Uses a BEGIN block so
+# it never depends on awk receiving input (mawk runs no pattern action at EOF).
+is_zero() {
+    awk -v v="${1}" 'BEGIN { exit ((v + 0) == 0 ? 0 : 1) }'
+}
+
 # sample_cpu <outvar> : stores aggregate (user+system+softirq) jiffies.
 sample_cpu() {
     local line cpu name
@@ -125,7 +133,10 @@ sample_rss_kb() {
 # Traffic measurement (iperf3 + ping); requires `iperf3`
 # ---------------------------------------------------------------------------
 
-# run_iperf <udp|tcp> <duration> <json_out> : client inside the ns.
+# run_iperf <udp|tcp> <duration> <json_out> : iperf3 client inside the sandbox
+# netns. The iperf3 client is the sender by default, so the bulk DATA crosses
+# the host-side XDP hook / nft INPUT chain; `.end.sum_received` (populated on
+# send) carries the true datapath throughput.
 run_iperf() {
     local mode="$1" dur="$2" out="$3" extra=()
     if [ "${mode}" = udp ]; then
@@ -182,6 +193,60 @@ run_ping() {
     ns_exec ping -c "${rounds}" -i 0.05 -q "${HOST_IP}" > "${out}" 2>&1 || true
     awk '/rtt/{split($4, a, "/"); print "rtt_min_ms=" a[1]; print "rtt_avg_ms=" a[2]; print "rtt_max_ms=" a[3]}' \
         "${out}" 2>/dev/null || true
+}
+
+# snap_xdp_stats <json-file> : dumps the firewall's raw packet/byte counters
+# (via the one-shot JSON control socket) so the orchestrator can log how much
+# traffic actually crossed the XDP hook. Best-effort; writes nothing on failure.
+snap_xdp_stats() {
+    python3 - "$1" <<'PY'
+import json
+import socket
+import sys
+
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    s.connect("/var/run/ebpf-firewall.sock")
+    s.sendall(b'{"command":"stats"}\n')
+    buf = b""
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    d = json.loads(buf)
+    with open(sys.argv[1], "w") as f:
+        json.dump(d.get("stats", {}), f)
+except Exception:
+    pass
+PY
+}
+
+# log_xdp_delta <rundir> : prints how many packets/bytes crossed the XDP hook
+# between the rundir/stats-before and stats-after snapshots (xdp rows only).
+log_xdp_delta() {
+    python3 - "$1" <<'PY'
+import json
+import os
+import sys
+
+def load(p):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+b = load(os.path.join(sys.argv[1], "stats-before.json"))
+a = load(os.path.join(sys.argv[1], "stats-after.json"))
+if not b or not a:
+    sys.exit(0)
+def d(k):
+    return a.get(k, 0) - b.get(k, 0)
+print("  fw-crossing: +pass-pkts=%d +pass-bytes=%d +drop-pkts=%d (datapath saw the traffic)" % (d("pass_packets"), d("pass_bytes"), d("drop_packets")))
+PY
 }
 
 # ---------------------------------------------------------------------------
@@ -244,6 +309,81 @@ nft_rules_up() {
 nft_rules_flush() { nft flush table inet "${NFT_TABLE}" 2>/dev/null || true; }
 
 nft_rules_down() { nft delete table inet "${NFT_TABLE}" 2>/dev/null || true; }
+
+# ---------------------------------------------------------------------------
+# Host firewall exception for the sandbox link
+# ---------------------------------------------------------------------------
+
+# Host firewalls (notably ufw) default-deny INPUT: they would silently drop the
+# new SYNs the iperf3 server needs, zeroing every throughput row while ping
+# (ICMP) still works. The harness runs as root, so it inserts one accept rule
+# for the bench veth at the top of the discovered base chain that handles
+# INPUT on family inet (falling back to ip), and deletes it on teardown.
+# Hosts with no such chain (no nftables firewall) get a no-op.
+HOST_FW_FAM=""
+HOST_FW_TAB=""
+HOST_FW_CHAIN=""
+HOST_FW_HANDLE=""
+
+host_firewall_open() {
+    command -v nft >/dev/null 2>&1 || return 0
+    [ -z "${HOST_FW_HANDLE}" ] || return 0   # already open
+
+    local def
+    def="$(nft list ruleset 2>/dev/null | awk '
+        /^table / && $2=="inet" { t=$3; fam="inet" }
+        /^table / && $2=="ip"   { t=$3; fam="ip" }
+        /^[[:space:]]+chain /   { c=$2 }
+        /type filter hook input priority/ {
+            if (fam=="inet") { print "inet", t, c; exit }
+            if (!f && fam=="ip") f="ip " t " " c
+        }
+        END { if (f) print f }
+    ' | head -1)"
+    [ -n "${def}" ] || {
+        log "WARN: no inet/ip INPUT base chain to open — host firewall (if any) not opened for ${VETH0}"
+        return 0
+    }
+
+    read -r HOST_FW_FAM HOST_FW_TAB HOST_FW_CHAIN <<< "${def}"
+    if HOST_FW_HANDLE="$(
+        nft insert rule "${HOST_FW_FAM}" "${HOST_FW_TAB}" "${HOST_FW_CHAIN}" iifname "${VETH0}" accept 2>/dev/null \
+            && nft -a list chain "${HOST_FW_FAM}" "${HOST_FW_TAB}" "${HOST_FW_CHAIN}" 2>/dev/null \
+            | awk -v v="${VETH0}" '$0 ~ v {print $NF; exit}'
+    )"; then
+        if [ -n "${HOST_FW_HANDLE}" ]; then
+            log "opened host firewall for ${VETH0} (nft ${HOST_FW_FAM} ${HOST_FW_TAB}/${HOST_FW_CHAIN}, handle ${HOST_FW_HANDLE})"
+        else
+            local __fam="${HOST_FW_FAM}" __tab="${HOST_FW_TAB}" __chn="${HOST_FW_CHAIN}"
+            HOST_FW_FAM=""
+            HOST_FW_TAB=""
+            HOST_FW_CHAIN=""
+            HOST_FW_HANDLE=""
+            log "WARN: host firewall rule for ${VETH0} inserted but handle not confirmed — cannot guarantee cleanup"
+            log "       discovered chain: nft ${__fam} ${__tab}/${__chn}"
+        fi
+    else
+        local __fam="${HOST_FW_FAM}" __tab="${HOST_FW_TAB}" __chn="${HOST_FW_CHAIN}"
+        HOST_FW_FAM=""
+        HOST_FW_TAB=""
+        HOST_FW_CHAIN=""
+        HOST_FW_HANDLE=""
+        log "WARN: could not insert host-firewall accept rule for ${VETH0}"
+        log "       discovered chain: nft ${__fam} ${__tab}/${__chn}"
+        log "       a host firewall may still block the iperf port (zeroed rows)"
+    fi
+}
+
+host_firewall_close() {
+    if [ -n "${HOST_FW_HANDLE}" ]; then
+        nft delete rule "${HOST_FW_FAM}" "${HOST_FW_TAB}" "${HOST_FW_CHAIN}" handle "${HOST_FW_HANDLE}" 2>/dev/null || true
+        log "closed host firewall (deleted handle ${HOST_FW_HANDLE} from ${HOST_FW_FAM} ${HOST_FW_TAB}/${HOST_FW_CHAIN})"
+    fi
+    HOST_FW_FAM=""
+    HOST_FW_TAB=""
+    HOST_FW_CHAIN=""
+    HOST_FW_HANDLE=""
+}
 
 apply_nft_rules() {
     local ip targets

@@ -39,6 +39,15 @@ MTP2+ are the thesis-level extensions built on top of it.
 - [ ] Rule priority (deterministic winner when rules overlap)
 - [ ] Direction-aware rules (INGRESS / EGRESS)
 
+### MTP1-F: Fast-path optimization
+
+- [x] `rule_presence` maps (IP / port) gating lookups in the XDP datapath
+- [x] Empty-table: lookups skipped entirely (empty map can only miss → verdict
+      identical by construction; 8 → 4 map accesses per packet)
+- [x] Presence bits maintained by Go managers (set before first insert, cleared
+      after last delete) and wired through the facade
+- [ ] Verify `make test` / `make integration-test` with the fast path enabled
+
 ### MTP1-D: Stateful firewall
 
 - [ ] Flow / connection state tracking
@@ -48,8 +57,11 @@ MTP2+ are the thesis-level extensions built on top of it.
 ### MTP1-E: Benchmarking module (separate from firewall)
 
 - [x] Benchmark harness (`benchmark/` — veth+netns sandbox, `run-bench.sh`, `make bench`)
-- [ ] Run baseline (XDP vs nftables) and save results
-- [ ] Metrics: throughput, latency, CPU, memory, rule-update time
+- [x] Baseline run: XDP vs nftables full matrix (24 cells) saved + charts
+- [x] Metrics: throughput, latency, CPU, memory, rule-update time
+- [x] Verify measurement is the true forwarding datapath (uplink direction; XDP
+      `fc_stats` counter deltas confirm data crossed the hook)
+- [ ] IS_UPLOAD ⇄ future `-R` / download comparisons documented in `benchmark/README.md`
 - [ ] Rerun unchanged after stateful firewall; document feature cost
 - [ ] Results documentation
 

@@ -64,6 +64,14 @@ per network — the same number of effective lookups.
 | Memory | `VmRSS` of the firewall daemon (XDP); `0` for nft (kernel-internal state) |
 | Rule update time | ms for `firewallctl block/unblock` (XDP) vs `nft add/delete rule` (nft) |
 
+**Traffic direction is upload (data crosses the firewalls).** The iperf3 client
+(inside `benchns`) is the sender by default, so UDP and TCP bulk data flows
+client → host and is filtered by the XDP program / nft INPUT chain on
+`bench-v0`. The harness reads `tcp_bps` from `.end.sum_received`, which iperf3
+populates on the sending client too (`sum_received` carries the send statistics
+while `sender=true`), giving the true forwarding datapath — not the ACK-echo
+path that a `server → client` (`-R`) test would measure.
+
 Both UDP and TCP passes run against the same per-iteration `iperf3 -s` server
 (bound to `HOST_IP:5201`). Before each pass the harness reaps any stale
 `iperf3 -s` process left behind by an interrupted run — an old listener would
@@ -71,6 +79,27 @@ otherwise starve the TCP pass of a binding port and zero out the whole
 `tcp_bps` column — then waits until its own server is listening. A failed
 listener is logged as a `WARN` and its stderr kept in the run directory instead
 of being discarded, so measurement problems stay visible in the results.
+
+### Firewall fast path (XDP counter ground truth)
+
+The XDP datapath maintains a `rule_presence` array map (bit flags for
+"any IP rule", "any port rule"). Both Go managers set the bits before their
+first insert and clear them after the last delete, so the program can skip the
+LPM + hash lookups entirely while the tables are empty; with no rules the
+verdict is identical by construction (an empty map can only miss, so the
+default policy is returned either way). This turns the common off state from
+8 map lookups + 2 atomics per packet to 4.
+
+For each XDP iteration the harness snapshots the XDP `fc_stats` counters before
+and after (`stats-before.json` / `stats-after.json`) and logs the delta:
+
+```
+fw-crossing: +pass-pkts=3975731 +pass-bytes=5983526465 +drop-pkts=0 (datapath saw the traffic)
+```
+
+Summing the per-iteration pass-bytes against the reported `tcp_bps`/`udp_bps`
+confirms the throughput column really is the firewall's datapath (and catches a
+mis-scoped measurement if a future change flips the traffic direction).
 
 ## Output
 
@@ -89,6 +118,16 @@ go/python3/jq versions, UTC start time) so results are self-documenting.
 
 A per-iteration `iperf-server.err` holds the iperf3 server's stderr; a non-empty
 file (e.g. a port conflict) explains any `tcp_bps=0` WARN in the run log.
+
+### Host firewall
+
+ufw (and similar INPUT default-deny firewalls) will otherwise silently drop the
+iperf server's new SYNs, producing all-zero throughput rows while ping still
+works and `iperf-server.err` stays empty. As root, the harness discovers the
+base chain handling INPUT (`inet` family, falling back to `ip`), inserts one
+`accept` rule for the bench veth at the top of that chain, and deletes it by
+handle on teardown — including on Ctrl+C. Hosts with no nftables firewall get
+nothing and are untouched.
 
 ## Visualizing results
 
