@@ -115,7 +115,7 @@ mkdir -p "${RUN_DIR}"
 } > "${RUN_DIR}/meta.txt"
 
 # kv <file> <key> : prints the value of `key=value` lines written by helpers.
-kv() { awk -F= -v k="$2" '$1==k {print $2; exit}' "$1"; }
+kv() { [ -r "$1" ] || return 0; awk -F= -v k="$2" '$1==k {print $2; exit}' "$1"; }
 
 # Hand the run dir back to the user that invoked us via sudo, so the non-root
 # `make bench-plot` can write charts into it. No-op when not run via sudo.
@@ -248,7 +248,7 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
         snap_nft_counters "${rundir}/nft-before.json"
     fi
 
-    local udp_kv udp2_kv tcp_kv flood_kv="/dev/null"
+    local udp_kv="/dev/null" udp2_kv="/dev/null" tcp_kv="/dev/null" flood_kv="/dev/null"
     if [ "${scenario}" = drop ]; then
         # iperf3 cannot drive `drop`: its TCP control channel is dropped with
         # the workload, so no DATA would ever flow. Use a raw-UDP flood for the
