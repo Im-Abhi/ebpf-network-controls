@@ -13,12 +13,13 @@
 #
 # Usage:
 #   sudo ./benchmark/run-bench.sh [--backend all|xdp|nft]
-#                                [--scenario all|none|single|forward|many]
+#                                [--scenario all|none|single|forward|many|drop]
 #                                [--iterations N] [--duration S]
 #                                [--help]
 # Defaults: backend=all scenario=all iterations=5 duration=10.
 # Environment knobs: ITERS (iterations), DURATION (seconds per iperf3 pass),
-# UDP_BW (iperf3 -b for the UDP pass; 0 = unthrottled).
+# UDP_BW (iperf3 -b for the saturated UDP pass; 0 = unthrottled),
+# UDP_CTL_BW (controlled UDP pass rate; 1500M default, 0 disables that pass).
 #
 # Directions: iperf3's client (run in the sandbox netns) is the sender by
 # default, so bulk DATA always flows client -> server through the host-side XDP
@@ -41,7 +42,7 @@ SUMMARY="${RUN_DIR}/summary.tsv"
 IPERF_PID=""
 
 usage() {
-    sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# //'
+    sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# //'
     exit 0
 }
 
@@ -57,7 +58,7 @@ while [ "$#" -gt 0 ]; do
     --scenario)
         case "$2" in
         all) SCENARIOS=("${all_scenarios[@]}") ;;
-        none|single|forward|many) SCENARIOS=("$2") ;;
+        none|single|forward|many|drop) SCENARIOS=("$2") ;;
         *) echo "bench: bad scenario '$2'" >&2; usage ;;
         esac
         shift 2 ;;
@@ -229,13 +230,23 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     local cpu0 cpu1
     sample_cpu cpu0
 
-    [ "${backend}" = xdp ] && snap_xdp_stats "${rundir}/stats-before.json"
+    if [ "${backend}" = xdp ]; then
+        snap_xdp_stats "${rundir}/stats-before.json"
+    else
+        snap_nft_counters "${rundir}/nft-before.json"
+    fi
 
-    local udp_kv tcp_kv
+    local udp_kv udp2_kv tcp_kv
     if run_iperf udp "${DURATION}" "${rundir}/iperf-udp.json" > "${rundir}/udp.kv" 2>/dev/null; then
         udp_kv="${rundir}/udp.kv"
     else
         udp_kv="/dev/null"
+    fi
+    if [ "${UDP_CTL_BW:-1500M}" != 0 ] \
+        && run_iperf udp "${DURATION}" "${rundir}/iperf-udp-ctl.json" "${UDP_CTL_BW:-1500M}" > "${rundir}/udp2.kv" 2>/dev/null; then
+        udp2_kv="${rundir}/udp2.kv"
+    else
+        udp2_kv="/dev/null"
     fi
     if run_iperf tcp "${DURATION}" "${rundir}/iperf-tcp.json" > "${rundir}/tcp.kv" 2>/dev/null; then
         tcp_kv="${rundir}/tcp.kv"
@@ -245,12 +256,16 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     run_ping 20 "${rundir}/ping.txt" > "${rundir}/rtt.kv" 2>/dev/null || true
     sample_cpu cpu1
 
-    [ "${backend}" = xdp ] && snap_xdp_stats "${rundir}/stats-after.json"
+    if [ "${backend}" = xdp ]; then
+        snap_xdp_stats "${rundir}/stats-after.json"
+    else
+        snap_nft_counters "${rundir}/nft-after.json"
+    fi
 
     kill "${IPERF_PID}" 2>/dev/null || true
     IPERF_PID=""
 
-    local bps pps loss jitter tcp_bps rtt mem addr del
+    local bps pps loss jitter tcp_bps rtt mem addr del drop_pps udp2_bps udp2_pps udp2_loss udp2_jitter
     bps="$(kv "${udp_kv}" udp_bits_per_sec)";        [ -z "${bps}" ]    && bps=0
     pps="$(kv "${udp_kv}" udp_sent_packets)";         [ -z "${pps}" ]    && pps=0
     pps=$(( pps / DURATION ))
@@ -261,21 +276,42 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     mem="$(backend_mem_kb "${backend}")"
     read -r addr del <<< "$(update_timing "${backend}")"
 
-    if is_zero "${bps}"; then
+    # Hook-side DROP rate: XDP from fc_stats deltas, nft from rule counters.
+    if [ "${backend}" = xdp ]; then
+        drop_pps="$(xdp_drop_delta "${rundir}")"
+    else
+        drop_pps="$(nft_drop_delta "${rundir}")"
+    fi
+    [ -z "${drop_pps}" ] && drop_pps=0
+    drop_pps=$(( drop_pps / DURATION ))
+
+    udp2_bps="$(kv "${udp2_kv}" udp_bits_per_sec)";      [ -z "${udp2_bps}" ]    && udp2_bps=0
+    udp2_pps="$(kv "${udp2_kv}" udp_sent_packets)";      [ -z "${udp2_pps}" ]    && udp2_pps=0
+    udp2_pps=$(( udp2_pps / DURATION ))
+    udp2_loss="$(kv "${udp2_kv}" udp_lost_packets)";     [ -z "${udp2_loss}" ]   && udp2_loss=0
+    udp2_jitter="$(kv "${udp2_kv}" udp_jitter_ms)";      [ -z "${udp2_jitter}" ] && udp2_jitter=0
+
+    # In `drop` zero throughput is the expected success (every workload packet
+    # is dropped before delivery), so those rows must not WARN.
+    if [ "${scenario}" != drop ] && is_zero "${bps}"; then
         log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: udp_bps=0 (iperf or metric-parser problem)"
     fi
-    if is_zero "${tcp_bps}"; then
+    if [ "${scenario}" != drop ] && is_zero "${tcp_bps}"; then
         log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: tcp_bps=0 (iperf server, run, or metric-parser problem; see ${rundir}/iperf-server.err)"
+    fi
+    if [ "${UDP_CTL_BW:-1500M}" != 0 ] && [ "${scenario}" != drop ] && is_zero "${udp2_bps}"; then
+        log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: udp2_bps=0 (controlled UDP pass failed)"
     fi
 
     [ "${backend}" = xdp ] && log_xdp_delta "${rundir}"
 
-    printf '%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n' \
         "${RUN_TS}" "${backend}" "${scenario}" "${iter}" \
         "${bps}" "${pps}" "${loss}" "${jitter}" "${tcp_bps}" "${rtt}" \
         "$(cpu_delta "${cpu0}" "${cpu1}")" "${mem}" "${addr}" "${del}" \
+        "${drop_pps}" "${udp2_bps}" "${udp2_pps}" "${udp2_loss}" "${udp2_jitter}" \
         >> "${SUMMARY}"
-    log "  udp_bps=${bps} pps=${pps} loss=${loss} tcp_bps=${tcp_bps} rtt=${rtt} mem=${mem} add=${addr}ms del=${del}ms"
+    log "  udp_bps=${bps} pps=${pps} loss=${loss} tcp_bps=${tcp_bps} rtt=${rtt} mem=${mem} add=${addr}ms del=${del}ms udp2_bps=${udp2_bps} drop_pps=${drop_pps}"
 }
 
 # --- main ------------------------------------------------------------------
@@ -283,7 +319,7 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
 sandbox_up
 host_firewall_open
 
-printf 'run\tbackend\tscenario\titer\tudp_bps\tudp_pps\tudp_lost\tudp_jitter_ms\ttcp_bps\trtt_avg_ms\tcpu_jif\trss_kb\tadd_ms\tdel_ms\n' \
+printf 'run\tbackend\tscenario\titer\tudp_bps\tudp_pps\tudp_lost\tudp_jitter_ms\ttcp_bps\trtt_avg_ms\tcpu_jif\trss_kb\tadd_ms\tdel_ms\tdrop_pps\tudp2_bps\tudp2_pps\tudp2_lost\tudp2_jitter_ms\n' \
     > "${SUMMARY}"
 
 for backend in "${BACKENDS[@]}"; do

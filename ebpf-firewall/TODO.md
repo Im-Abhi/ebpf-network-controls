@@ -61,6 +61,12 @@ MTP2+ are the thesis-level extensions built on top of it.
 - [x] Metrics: throughput, latency, CPU, memory, rule-update time
 - [x] Verify measurement is the true forwarding datapath (uplink direction; XDP
       `fc_stats` counter deltas confirm data crossed the hook)
+- [x] `drop` scenario: block the sandbox LAN (single `/24`), hook-side drop rate
+      via XDP `fc_stats` + nft `counter` rules (exercises the DROP hot path)
+- [x] Controlled (loss-free) UDP pass (`UDP_CTL_BW`, `udp2_*` columns) to isolate
+      per-packet decision cost from sender saturation
+- [ ] Full-matrix rerun with the drop + controlled-UDP columns; re-lock baseline
+      (supersede `20260914-151138`)
 - [ ] IS_UPLOAD ⇄ future `-R` / download comparisons documented in `benchmark/README.md`
 - [ ] Rerun unchanged after stateful firewall; document feature cost
 - [ ] Results documentation

@@ -37,7 +37,7 @@ FORWARD_CIDR="198.51.100.0/24"         # one matchable blocked prefix
 # Scenarios. `scenario_targets <name>` must echo exactly one network/ip per
 # line; every backend installs drop rules covering exactly those (and their
 # mirrored source/destination form, matching the XDP datapath).
-all_scenarios=(none single forward many)
+all_scenarios=(none single forward many drop)
 
 scenario_targets() {
     case "$1" in
@@ -48,6 +48,12 @@ scenario_targets() {
         # 1000 distinct /30 prefixes in a 10.10.0.0/19 block. Deterministic,
         # generated once and reused for every backend so counts match exactly.
         seq 0 999 | awk '{ f = $1 * 4; printf "10.10.%d.%d/30\n", int(f / 256), f % 256 }'
+        ;;
+    drop)
+        # The sandbox's own LAN (HOST_IP x NS_IP): every workload packet that
+        # crosses the hook matches, so this exercises the DROP decision path
+        # end-to-end instead of pass-through.
+        echo "10.200.0.0/24"
         ;;
     *)
         echo "bench: unknown scenario '$1'" >&2
@@ -139,10 +145,10 @@ sample_rss_kb() {
 # send) carries the true datapath throughput. The UDP pass is unthrottled by
 # default (`UDP_BW=0`) so loss/jitter/pps at saturation discriminate the
 # backends; override with UDP_BW, e.g. `UDP_BW=500M`.
-run_iperf() {
-    local mode="$1" dur="$2" out="$3" extra=()
+run_iperf() {  # run_iperf <udp|tcp> <dur> <json_out> [bw] ; bw overrides UDP_BW
+    local mode="$1" dur="$2" out="$3" bw="$4" extra=()
     if [ "${mode}" = udp ]; then
-        extra=(-u -b "${UDP_BW:-0}")
+        extra=(-u -b "${bw:-${UDP_BW:-0}}")
     fi
     if ! ns_exec iperf3 -c "${HOST_IP}" -p 5201 -t "${dur}" "${extra[@]}" \
          -J > "${out}" 2>/dev/null; then
@@ -247,7 +253,69 @@ if not b or not a:
     sys.exit(0)
 def d(k):
     return a.get(k, 0) - b.get(k, 0)
-print("  fw-crossing: +pass-pkts=%d +pass-bytes=%d +drop-pkts=%d (datapath saw the traffic)" % (d("pass_packets"), d("pass_bytes"), d("drop_packets")))
+    print("  fw-crossing: +pass-pkts=%d +pass-bytes=%d +drop-pkts=%d (datapath saw the traffic)" % (d("pass_packets"), d("pass_bytes"), d("drop_packets")))
+PY
+}
+
+# snap_nft_counters <file> : dumps the nft benchmark table as JSON so the
+# orchestrator can read hook-side drop counters (the `drop` scenario installs
+# rules with a `counter` statement). Best-effort like snap_xdp_stats.
+snap_nft_counters() {
+    nft -j list table inet "${NFT_TABLE}" > "$1" 2>/dev/null || true
+}
+
+# xdp_drop_delta <rundir> : hook-side dropped-packet delta between the
+# stats-before.json and stats-after.json snapshots (xdp rows only); empty on
+# failure. DROP rate = delta / duration (computed by the orchestrator).
+xdp_drop_delta() {
+    python3 - "$1" <<'PY'
+import json
+import os
+import sys
+
+def load(p):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+b = load(os.path.join(sys.argv[1], "stats-before.json"))
+a = load(os.path.join(sys.argv[1], "stats-after.json"))
+if not b or not a:
+    raise SystemExit(0)
+print(a.get("drop_packets", 0) - b.get("drop_packets", 0))
+PY
+}
+
+# nft_drop_delta <rundir> : sum of `counter` packet counts across the nft
+# benchmark table between the nft-before.json and nft-after.json snapshots.
+nft_drop_delta() {
+    python3 - "$1" <<'PY'
+import json
+import os
+import sys
+
+def total(p):
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    n = 0
+    for t in d.get("nftables", []):
+        rule = t.get("rule")
+        if not rule:
+            continue
+        for e in rule.get("expr", []):
+            c = e.get("counter")
+            if c:
+                n += int(c.get("packets", 0))
+    return n
+
+b = total(os.path.join(sys.argv[1], "nft-before.json"))
+a = total(os.path.join(sys.argv[1], "nft-after.json"))
+print(a - b)
 PY
 }
 
@@ -388,12 +456,22 @@ host_firewall_close() {
 }
 
 apply_nft_rules() {
-    local ip targets
+    local ip targets counter=""
     targets="$(scenario_targets "$1")" || return 1
+    # The `drop` scenario targets the sandbox LAN: XDP drops on the source
+    # (src-first lookup), so nft mirrors it with a single `saddr` rule. The
+    # `counter` statement gives nft a hook-side drop count (read by
+    # snap_nft_counters); every other scenario stays counter-free so its rows
+    # match the locked baseline exactly.
+    [ "$1" = drop ] && counter=" counter"
     while read -r ip; do
         [ -n "${ip}" ] || continue
         valid_cidr "${ip}" || { echo "bench: invalid CIDR target '${ip}' (scenario '$1')" >&2; return 1; }
-        nft add rule inet "${NFT_TABLE}" input ip saddr "${ip}" drop
-        nft add rule inet "${NFT_TABLE}" input ip daddr "${ip}" drop
+        if [ -n "${counter}" ]; then
+            nft add rule inet "${NFT_TABLE}" input ip saddr "${ip}" counter drop
+        else
+            nft add rule inet "${NFT_TABLE}" input ip saddr "${ip}" drop
+            nft add rule inet "${NFT_TABLE}" input ip daddr "${ip}" drop
+        fi
     done <<< "${targets}"
 }

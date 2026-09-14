@@ -48,6 +48,11 @@ METRICS = [
     ("rss_kb",        "RSS (KiB)",               float, "{:,.0f}"),
     ("add_ms",        "rule add time (ms)",      float, "{:.1f}"),
     ("del_ms",        "rule del time (ms)",      float, "{:.1f}"),
+    ("drop_pps",      "DROP rate (pkts/s)",      float, "{:,.0f}"),
+    ("udp2_bps",      "UDP ctl throughput (bits/s)", float, "{:,.0f}"),
+    ("udp2_pps",      "UDP ctl packets/s",       float, "{:,.0f}"),
+    ("udp2_lost",     "UDP ctl lost packets",    float, "{:,.0f}"),
+    ("udp2_jitter_ms","UDP ctl jitter (ms)",     float, "{:.3f}"),
 ]
 
 # (metric, axis label) and the value divider for plotting (bps -> Mbit/s).
@@ -62,6 +67,11 @@ BAR_METRICS = [
     ("rss_kb",        "RSS (KiB)",               1.0),
     ("add_ms",        "rule add time (ms)",      1.0),
     ("del_ms",        "rule del time (ms)",      1.0),
+    ("drop_pps",      "DROP rate (pkts/s)",      1.0),
+    ("udp2_bps",      "UDP controlled throughput (Mbit/s)", 1e6),
+    ("udp2_pps",      "UDP controlled packets/s", 1.0),
+    ("udp2_lost",     "UDP controlled lost packets", 1.0),
+    ("udp2_jitter_ms","UDP controlled jitter (ms)", 1.0),
 ]
 
 
