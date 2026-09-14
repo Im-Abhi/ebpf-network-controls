@@ -26,11 +26,17 @@ func NewFirewall(ifaceName string) (*Firewall, error) {
 		return nil, err
 	}
 
+	presence := prog.RulePresence()
+	mgr := NewMapManager(prog.BlockedIps())
+	mgr.SetPresence(presence)
+	portPolicyMgr := NewPortPolicyManager(prog.PortPolicy())
+	portPolicyMgr.SetPresence(presence)
+
 	return &Firewall{
 		prog:          prog,
-		mgr:           NewMapManager(prog.BlockedIps()),
+		mgr:           mgr,
 		counterMgr:    NewCounterManager(prog.Counters()),
-		portPolicyMgr: NewPortPolicyManager(prog.PortPolicy()),
+		portPolicyMgr: portPolicyMgr,
 		configMgr:     NewConfigManager(prog.Config()),
 	}, nil
 }

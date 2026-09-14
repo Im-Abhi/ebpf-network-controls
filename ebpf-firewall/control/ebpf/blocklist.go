@@ -40,6 +40,7 @@ func newLpmKey(ipBytes net.IP, prefixLen int) firewallIpv4LpmKey {
 // MapManager provides an abstraction over the eBPF maps used for policy enforcement.
 type MapManager struct {
 	blockedIps *ebpf.Map
+	presence   *ebpf.Map
 }
 
 // NewMapManager creates a new MapManager wrapping the provided eBPF map.
@@ -47,6 +48,26 @@ func NewMapManager(blockedIpsMap *ebpf.Map) *MapManager {
 	return &MapManager{
 		blockedIps: blockedIpsMap,
 	}
+}
+
+// SetPresence attaches the rule_presence map so the manager can advertise to
+// the datapath whether this blocklist holds any entry. Optional: a nil map
+// disables the fast-path flag maintenance (used by standalone test maps).
+func (pm *MapManager) SetPresence(m *ebpf.Map) {
+	pm.presence = m
+}
+
+// syncPresence makes the RULE_IP_PRESENT bit match reality (map empty or not).
+// Called after mutations that may have emptied the map.
+func (pm *MapManager) syncPresence() error {
+	has, err := mapHasEntries(pm.blockedIps)
+	if err != nil {
+		return err
+	}
+	if has {
+		return setPresenceBit(pm.presence, rulePresenceIP)
+	}
+	return clearPresenceBit(pm.presence, rulePresenceIP)
 }
 
 // BlockIP adds an IP or CIDR to the blocked IPs eBPF map with a DROP action.
@@ -66,6 +87,12 @@ func (pm *MapManager) BlockIPWithAction(cidrStr string, action Action) error {
 	ones, _ := ipNet.Mask.Size()
 	key := newLpmKey(ipNet.IP, ones)
 
+	// Advertise before inserting so a pre-existing rule is never skipped by
+	// the datapath's empty-map fast path. A set-during-insert race can only
+	// cause redundant lookups, never a bypassed rule.
+	if err := setPresenceBit(pm.presence, rulePresenceIP); err != nil {
+		return err
+	}
 	return pm.blockedIps.Put(key, uint32(action))
 }
 
@@ -79,7 +106,10 @@ func (pm *MapManager) UnblockIP(cidrStr string) error {
 	ones, _ := ipNet.Mask.Size()
 	key := newLpmKey(ipNet.IP, ones)
 
-	return pm.blockedIps.Delete(key)
+	if err := pm.blockedIps.Delete(key); err != nil {
+		return err
+	}
+	return pm.syncPresence()
 }
 
 // ipToKey converts either a bare IP or a CIDR into a /32 lookup key. The lookup
@@ -163,5 +193,8 @@ func (pm *MapManager) Clear() error {
 			return err
 		}
 	}
-	return iter.Err()
+	if err := iter.Err(); err != nil {
+		return err
+	}
+	return pm.syncPresence()
 }

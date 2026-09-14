@@ -69,6 +69,30 @@ struct {
     __uint(max_entries, 3);
 } counters SEC(".maps");
 
+/* ── Rule-presence flags ─────────────────────────────────────────────── */
+/* Single-entry array the daemon uses to tell the datapath whether each
+ * policy map currently holds at least one rule. Entry 0 packs two bits:
+ *   bit 0 (RULE_IP_PRESENT)   -> blocked_ips has >= 1 entry
+ *   bit 1 (RULE_PORT_PRESENT) -> port_policy has >= 1 entry
+ * When a bit is clear the datapath skips the (LPM/hash) lookups for that
+ * map entirely, since an empty map cannot match. This preserves the exact
+ * same verdicts: a lookup against an empty map can only miss, and the
+ * decision falls through to the default policy in both cases.
+ *
+ * Ordering for correctness: the daemon SETS the relevant bit *before* the
+ * first rule is inserted and CLEARS it only *after* the last entry has been
+ * removed. A stale set bit costs a few lookups (all miss) but can never let
+ * a live rule go unconsulted. */
+#define RULE_IP_PRESENT   (1U << 0)
+#define RULE_PORT_PRESENT (1U << 1)
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1);
+} rule_presence SEC(".maps");
+
 /* ── Port policy map ────────────────────────────────────────────────── */
 /* Finer-grained rules that combine a destination IP (exact /32), a
  * protocol, a destination port and a source port. The value is a

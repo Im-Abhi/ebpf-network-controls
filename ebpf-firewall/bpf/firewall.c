@@ -274,10 +274,23 @@ int firewall_prog(struct xdp_md *ctx) {
         return verdict;
     }
 
-    /* 2. policy lookups, each returning an action */
-    enum rule_action ip_action, port_action;
-    int ip_matched = ip_block_action(&info, &ip_action);
-    int port_matched = port_rule_action(&info, &port_action);
+    /* 2. policy lookups, each returning an action. The rule_presence flags
+     * short-circuit the lookups when the corresponding map is empty (an empty
+     * map can only miss, so the decision is identical); the daemon keeps the
+     * flags conservative (set before first insert, cleared only after the last
+     * delete) so a live rule is never skipped. */
+    __u32 zero = 0;
+    __u32 *presence = bpf_map_lookup_elem(&rule_presence, &zero);
+    __u32 flags = presence ? *presence : 0;
+
+    enum rule_action ip_action = ACTION_PASS, port_action = ACTION_PASS;
+    int ip_matched = 0, port_matched = 0;
+    if (flags & RULE_IP_PRESENT) {
+        ip_matched = ip_block_action(&info, &ip_action);
+    }
+    if (flags & RULE_PORT_PRESENT) {
+        port_matched = port_rule_action(&info, &port_action);
+    }
 
     /* 3. decision (data-driven; DROP wins, else PASS, else default) */
     int verdict = decide(ip_matched, ip_action, port_matched, port_action);

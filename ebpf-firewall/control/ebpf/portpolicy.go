@@ -35,11 +35,31 @@ const (
 // PortPolicyManager provides an abstraction over the port_policy eBPF map.
 type PortPolicyManager struct {
 	portPolicy *ebpf.Map
+	presence   *ebpf.Map
 }
 
 // NewPortPolicyManager wraps the port_policy map.
 func NewPortPolicyManager(m *ebpf.Map) *PortPolicyManager {
 	return &PortPolicyManager{portPolicy: m}
+}
+
+// SetPresence attaches the rule_presence map so the manager can advertise to
+// the datapath whether this rule set holds any entry. Optional: a nil map
+// disables the fast-path flag maintenance (used by standalone test maps).
+func (pm *PortPolicyManager) SetPresence(m *ebpf.Map) {
+	pm.presence = m
+}
+
+// syncPresence makes the RULE_PORT_PRESENT bit match reality (map empty or not).
+func (pm *PortPolicyManager) syncPresence() error {
+	has, err := mapHasEntries(pm.portPolicy)
+	if err != nil {
+		return err
+	}
+	if has {
+		return setPresenceBit(pm.presence, rulePresencePort)
+	}
+	return clearPresenceBit(pm.presence, rulePresencePort)
 }
 
 // protoToCode maps a protocol name to its IP protocol number (0 = any).
@@ -123,6 +143,11 @@ func (pm *PortPolicyManager) BlockWithAction(dst, protocol string, dport, sport 
 	if err != nil {
 		return err
 	}
+	// Advertise before inserting: a set-during-insert race only costs
+	// redundant lookups, never a rule bypass.
+	if err := setPresenceBit(pm.presence, rulePresencePort); err != nil {
+		return err
+	}
 	return pm.portPolicy.Put(key, uint32(action))
 }
 
@@ -141,7 +166,10 @@ func (pm *PortPolicyManager) UnblockWithAction(dst, protocol string, dport, spor
 	if err != nil {
 		return err
 	}
-	return pm.portPolicy.Delete(key)
+	if err := pm.portPolicy.Delete(key); err != nil {
+		return err
+	}
+	return pm.syncPresence()
 }
 
 // List returns all port rules currently in the map.
@@ -181,5 +209,8 @@ func (pm *PortPolicyManager) Clear() error {
 			return err
 		}
 	}
-	return iter.Err()
+	if err := iter.Err(); err != nil {
+		return err
+	}
+	return pm.syncPresence()
 }

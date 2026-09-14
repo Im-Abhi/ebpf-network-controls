@@ -42,6 +42,7 @@ const (
 	firewallMapCounters       = "counters"
 	firewallMapFirewallConfig = "firewall_config"
 	firewallMapPortPolicy     = "port_policy"
+	firewallMapRulePresence   = "rule_presence"
 	firewallProgFirewallProg  = "firewall_prog"
 )
 
@@ -98,6 +99,7 @@ type firewallMapSpecs struct {
 	Counters       *ebpf.MapSpec `ebpf:"counters"`
 	FirewallConfig *ebpf.MapSpec `ebpf:"firewall_config"`
 	PortPolicy     *ebpf.MapSpec `ebpf:"port_policy"`
+	RulePresence   *ebpf.MapSpec `ebpf:"rule_presence"`
 }
 
 // firewallVariableSpecs contains global variables before they are loaded into the kernel.
@@ -130,6 +132,7 @@ type firewallMaps struct {
 	Counters       *ebpf.Map `ebpf:"counters"`
 	FirewallConfig *ebpf.Map `ebpf:"firewall_config"`
 	PortPolicy     *ebpf.Map `ebpf:"port_policy"`
+	RulePresence   *ebpf.Map `ebpf:"rule_presence"`
 }
 
 func (m *firewallMaps) Close() error {
@@ -138,6 +141,7 @@ func (m *firewallMaps) Close() error {
 		m.Counters,
 		m.FirewallConfig,
 		m.PortPolicy,
+		m.RulePresence,
 	)
 }
 

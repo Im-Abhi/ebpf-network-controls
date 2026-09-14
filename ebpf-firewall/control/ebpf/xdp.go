@@ -83,6 +83,12 @@ func (x *XDPProgram) Config() *ebpf.Map {
 	return x.objs.FirewallConfig
 }
 
+// RulePresence returns the eBPF map advertising which policy maps are
+// populated (see bpf/maps.h rule_presence).
+func (x *XDPProgram) RulePresence() *ebpf.Map {
+	return x.objs.RulePresence
+}
+
 // Close detaches the program (if attached) and closes all loaded objects.
 func (x *XDPProgram) Close() error {
 	var firstErr error
