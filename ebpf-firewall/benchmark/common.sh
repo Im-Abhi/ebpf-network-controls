@@ -164,7 +164,7 @@ check_bpf_object_fresh() {
 # default (`UDP_BW=0`) so loss/jitter/pps at saturation discriminate the
 # backends; override with UDP_BW, e.g. `UDP_BW=500M`.
 run_iperf() {  # run_iperf <udp|tcp> <dur> <json_out> [bw] ; bw overrides UDP_BW
-    local mode="$1" dur="$2" out="$3" bw="$4" extra=()
+    local mode="$1" dur="$2" out="$3" bw="${4:-}" extra=()
     if [ "${mode}" = udp ]; then
         extra=(-u -b "${bw:-${UDP_BW:-0}}")
     fi

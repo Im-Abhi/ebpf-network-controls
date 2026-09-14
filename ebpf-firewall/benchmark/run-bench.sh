@@ -32,6 +32,10 @@
 
 set -euo pipefail
 
+# Any uncaught failure must say where, not die silently (stderr on the call
+# sites used to swallow "unbound variable" and the like).
+trap 'printf "[bench] ERR rc=%s line=%s: %s\n" "$?" "$LINENO" "$BASH_COMMAND" >&2' ERR
+
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "${BENCH_DIR}/common.sh"
@@ -132,7 +136,7 @@ cleanup() {
     sandbox_down
     reset_results_owner
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 # --- per-backend lifecycle -------------------------------------------------
 
@@ -253,25 +257,25 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
         # iperf3 cannot drive `drop`: its TCP control channel is dropped with
         # the workload, so no DATA would ever flow. Use a raw-UDP flood for the
         # offered load; the hook-side DROP rate below is the ground truth.
-        if run_flood "${DURATION}" > "${rundir}/flood.kv" 2>/dev/null; then
+        if run_flood "${DURATION}" > "${rundir}/flood.kv" 2>>"${rundir}/flood.err"; then
             flood_kv="${rundir}/flood.kv"
         fi
     else
         if run_iperf udp "${DURATION}" "${rundir}/iperf-udp.json" \
-            > "${rundir}/udp.kv" 2>/dev/null; then
+            > "${rundir}/udp.kv" 2>>"${rundir}/udp.err"; then
             udp_kv="${rundir}/udp.kv"
         else
             udp_kv="/dev/null"
         fi
         if [ "${UDP_CTL_BW:-1500M}" != 0 ] \
             && run_iperf udp "${DURATION}" "${rundir}/iperf-udp-ctl.json" "${UDP_CTL_BW:-1500M}" \
-            > "${rundir}/udp2.kv" 2>/dev/null; then
+            > "${rundir}/udp2.kv" 2>>"${rundir}/udp2.err"; then
             udp2_kv="${rundir}/udp2.kv"
         else
             udp2_kv="/dev/null"
         fi
         if run_iperf tcp "${DURATION}" "${rundir}/iperf-tcp.json" \
-            > "${rundir}/tcp.kv" 2>/dev/null; then
+            > "${rundir}/tcp.kv" 2>>"${rundir}/tcp.err"; then
             tcp_kv="${rundir}/tcp.kv"
         else
             tcp_kv="/dev/null"
