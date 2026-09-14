@@ -93,9 +93,9 @@ if ! check_bpf_object_fresh; then
     exit 1
 fi
 
-log "building firewall + firewallctl from current source"
-(cd "${REPO_DIR}" && go build -o "${FIREWALLD}" ./cmd/firewall)
-(cd "${REPO_DIR}" && go build -o "${CTL}" ./cmd/firewallctl)
+log "building firewall + firewallctl from current source (-buildvcs=false: VCS stamping is invalid under sudo and unused by the daemon)"
+(cd "${REPO_DIR}" && go build -buildvcs=false -o "${FIREWALLD}" ./cmd/firewall)
+(cd "${REPO_DIR}" && go build -buildvcs=false -o "${CTL}" ./cmd/firewallctl)
 
 log "results -> ${RUN_DIR}"
 mkdir -p "${RUN_DIR}"
