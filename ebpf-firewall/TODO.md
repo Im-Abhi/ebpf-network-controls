@@ -70,10 +70,13 @@ MTP2+ are the thesis-level extensions built on top of it.
 - [x] Preflight guard: refuse to run with a missing/stale embedded
       `firewall_bpf.o` (guards against load-time `missing map rule_presence`)
 - [ ] Full-matrix rerun with the drop + controlled-UDP columns; re-lock baseline
-      (supersede `20260914-151138`)
+      (supersede `20260914-151138`) — first capture `20260914-230211` completed
+      but its TCP rows are 0 (iperf3 3.20 `retransmits` parser bug, fixed);
+      awaiting the clean rerun
 - [ ] IS_UPLOAD ⇄ future `-R` / download comparisons documented in `benchmark/README.md`
 - [ ] Rerun unchanged after stateful firewall; document feature cost
-- [ ] Results documentation
+- [x] Results documentation — `benchmark/README.md` "Benchmark results" section
+      (capture `20260914-230211`; medians + drop-path counter parity)
 
 ---
 

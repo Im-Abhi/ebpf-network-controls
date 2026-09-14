@@ -205,8 +205,8 @@ if sys.argv[2] == "udp":
     print("udp_jitter_ms=%s" % s["jitter_ms"])
 else:
     s = d["end"]["sum_received"]
-    print("tcp_bits_per_sec=%d" % s["bits_per_second"])
-    print("tcp_bytes_retrans=%d" % s["retransmits"])
+    print("tcp_bits_per_sec=%d" % s["bits_per_second"], flush=True)
+    print("tcp_bytes_retrans=%d" % s.get("retransmits", 0), flush=True)
 PY
     else
         echo "parser_missing=1 (install jq or python3)"

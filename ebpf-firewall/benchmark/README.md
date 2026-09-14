@@ -229,6 +229,68 @@ Thesis framing, word for word:
 > passthrough throughput was not superior to nftables, and native driver-mode
 > XDP could not be evaluated due to NIC/driver limitations.
 
+## Benchmark results — capture `20260914-230211`
+
+First full-matrix run of the drop-flood harness: **all 50 cells completed**
+(2 backends x 5 scenarios x 5 iterations x 10 s). Environment (kernel, iperf3
+3.20, XDP attach mode, versions) is in the run's `meta.txt`.
+
+**Caveat — TCP rows are invalid in this run.** Every `tcp_bps` is 0 because the
+harness's JSON parser crashed on iperf3 3.20 (the TCP summary drops the
+`retransmits` key; the Python parser threw before flushing `tcp_bits_per_sec`).
+The iperf3 server itself transferred ~1.17 Gbit/s — the datapath is fine, the
+parser was not. This is fixed in the commit next to this documentation; the
+**post-fix rerun supersedes these TCP rows**. Every other column is valid.
+
+Values below are **medians across the 5 iterations**; raw per-iteration data is
+in `results/20260914-230211/` (gitignored, kept on the benchmark host).
+
+| Scenario | UDP XDP / nft (Mbit/s) | UDP pps XDP / nft | cpu_jif XDP / nft | add/del ms XDP | add/del ms nft |
+| --- | --- | --- | --- | --- | --- |
+| `none` | 647 / 961 | 55,897 / 82,982 | 2,874 / 2,718 | 32 / 33 | 27 / 36 |
+| `single` | 650 / 941 | 56,150 / 81,295 | 2,855 / 2,916 | 36 / 38 | 24 / 36 |
+| `forward` | 721 / 920 | 62,299 / 79,436 | 2,589 / 2,904 | 31 / 29 | 28 / 33 |
+| `many` | 821 / 43 | 74,014 / 3,715 | 2,943 / 2,115 | 32 / 32 | 27 / 36 |
+| `drop` | void (workload refused) | — | 364 / 55 | 32 / 34 | 23 / 37 |
+
+`drop` cells (hook-side counter ground truth, 5-iteration medians):
+
+| Backend | offered `flood_sent` | `drop_pps` (hook-side) | ratio |
+| --- | --- | --- | --- |
+| XDP | 1,094,457 | 109,445 | 1.000 |
+| nft | 1,150,440 | 115,044 | 1.000 |
+
+What the capture shows:
+
+- **Drop path (new evidence):** both backends refuse the full offered flood —
+  `drop_pps` matches `flood_sent`/10 s to 3-4 significant figures. The claim
+  rests on counter parity (XDP `fc_stats` deltas / nft rule `counter`), not on
+  the per-cell CPU number.
+- **Rule-count scaling:** `many` is the discriminator — XDP stays flat (821 vs
+  647 Mbit/s at `none`, i.e. ~27% off an already-sender-capped rate), while nft
+  collapses ~96% (43 vs 961). Same signature as the locked baseline: LPM-trie
+  vs linear chain.
+- **UDP passthrough:** XDP runs ~30% below nft at saturation (647 vs 961 on
+  `none`) — consistent with the veth-topology framing in "Hardware /
+  topology limitations". Both are sender-capped (single-threaded iperf3 tops
+  out ≈ 1 Gbit/s here).
+- **Rule updates:** add/del medians cluster in the ~20-38 ms range for both
+  backends in this capture (individually noisier than the locked baseline's
+  2-13 ms on the same class of host).
+
+Caveats on this capture:
+
+- The flood **offered rate varies between runs** (109 kpps here vs 389 kpps in
+  the earlier smoke) — host softirq contention. Always compare `drop_pps`
+  against the run's own `flood_sent`, never across runs.
+- The `udp2_*` controlled pass (1500 M) also exceeds the sender ceiling here
+  (measured 0.6-1.1 Gbit/s, `udp2_lost` non-zero) — on this host it is a
+  second saturation sample, not the loss-free reference the harness was
+  designed for. For a loss-free reference use `UDP_CTL_BW` under the sender
+  ceiling (e.g. `500M`).
+- Per-cell `cpu_jif` did not discriminate consistently run-to-run (XDP lower in
+  the smoke, nft lower here); it is excluded from the drop-path claim.
+
 ## Baselines and superseded runs
 
 The **locked pre-conntrack baseline** is
