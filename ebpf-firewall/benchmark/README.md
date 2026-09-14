@@ -16,8 +16,8 @@ destroyed after each run — safe to run against a development machine.
 - Linux root: `sudo ./benchmark/run-bench.sh`
 - `iperf3`, `nft`, `ip` (iproute2)
 - Go toolchain (`make bench` builds `bin/firewall` + `bin/firewallctl` first)
-- `jq` **or** `python3` for iperf3 JSON metric extraction (the harness uses
-  whichever is present; `python3` is also used by `make bench-plot`)
+- `python3` (required: iperf3 JSON extraction and the `drop`-scenario raw-UDP
+  flood sender); `jq` is optional (preferred by the JSON parser when present)
 - Optional: `sysstat`, `matplotlib` (renders PNG charts in `bench-plot`)
 
 ## Usage
@@ -55,17 +55,23 @@ identical for both backends.
 | `single` | one `/32` | cost of a single block rule |
 | `forward` | one `/24` (`198.51.100.0/24`) | rule that never matches the workload |
 | `many` | 1000 `/30` prefixes | scaling: LPM trie vs linear nft chain |
-| `drop` | one `/24` (`10.200.0.0/24`, the sandbox LAN) | the workload itself is blocked: exercises the DROP decision path end-to-end; `drop_pps` + loss show the hook-side drop rate |
+| `drop` | one `/24` (`10.200.0.0/24`, the sandbox LAN) | the workload itself is blocked: exercises the DROP decision path end-to-end; `flood_sent` offered → `drop_pps` hook-side drop rate (iperf/UDP/RTT columns void by design) |
 
 Fairness: the C datapath matches a network on **source, then destination**, so
 the nftables backend installs both `ip saddr <net> drop` and `ip daddr <net> drop`
 per network — the same number of effective lookups. The one exception is
-`drop`, which targets the sandbox LAN: XDP's src-first lookup drops these on
-the source match, so nft mirrors it with a single `ip saddr <net> counter drop`
-rule. A `drop` row reports ~0 delivered throughput (the firewall working) and
-`udp_lost ≈ udp_sent`: the workload is correctly refused at the hook, and
-`drop_pps` (from XDP `fc_stats`, or the nft rule `counter`) is the hook-side
-drop rate — comparable across backends.
+`drop`, which targets the sandbox LAN: the XDP program's src-first lookup drops
+these on the source match, so nft mirrors it with a single
+`ip saddr <net> counter drop` rule.
+
+`drop` cannot be driven by iperf3: every mode opens a TCP control connection
+first, and the firewall blocks that SYN with the workload — so zero DATA would
+ever flow. Instead the harness runs a raw-UDP flood (`run_flood`, a python3
+`sendto` loop inside `benchns` with no control channel) and records the offered
+rate in `flood_sent`. The row then reports the workload fully refused at the
+hook, with `drop_pps` (XDP `fc_stats` drop deltas / the nft rule `counter`)
+tracking `flood_sent`/duration — an iperf-independent, counter-verified early
+drop path. The iperf/UDP/RTT columns are void by design in this scenario.
 
 ## Metrics
 
@@ -79,6 +85,7 @@ drop rate — comparable across backends.
 | Memory | `VmRSS` of the firewall daemon (XDP); `0` for nft (kernel-internal state) |
 | Rule update time | ms for `firewallctl block/unblock` (XDP) vs `nft add/delete rule` (nft) |
 | Hook-side DROP rate | `drop_pps`: XDP `fc_stats` drop deltas; nft rule `counter` deltas (`drop` scenario) |
+| Offered drop load | `flood_sent`: raw-UDP datagrams queued by the `drop`-scenario flood sender (iperf3 cannot run against a DROP rule) |
 | Controlled UDP | `udp2_*`: second `iperf3 -u` pass at `UDP_CTL_BW` (loss-free reference) |
 
 **Traffic direction is upload (data crosses the firewalls).** The iperf3 client
@@ -149,7 +156,7 @@ Each run creates `benchmark/results/<YYYYmmdd-HHMMSS>/`, with one directory per
 `ping.txt`, and a `summary.tsv` with one TSV row per measurement:
 
 ```
-run  backend  scenario  iter  udp_bps  udp_pps  udp_lost  udp_jitter_ms  tcp_bps  rtt_avg_ms  cpu_jif  rss_kb  add_ms  del_ms  drop_pps  udp2_bps  udp2_pps  udp2_lost  udp2_jitter_ms
+run  backend  scenario  iter  udp_bps  udp_pps  udp_lost  udp_jitter_ms  tcp_bps  rtt_avg_ms  cpu_jif  rss_kb  add_ms  del_ms  drop_pps  udp2_bps  udp2_pps  udp2_lost  udp2_jitter_ms  flood_sent
 ```
 
 `benchmark/results/` is gitignored; `git add -f` only the runs you want to keep.
@@ -192,6 +199,36 @@ make bench-plot                  # latest run
 python3 benchmark/plot.py results/20260914-151138 --scenario many
 ```
 
+## Hardware / topology limitations and thesis framing
+
+The XDP-vs-nftables numbers below are scoped to what this hardware can
+actually measure. Three limitations are stated explicitly rather than smoothed
+over:
+
+1. **Native (driver-mode) XDP could not be evaluated.** The benchmark runs on a
+   veth pair, where native XDP is native-in-name: `veth_xmit` builds the skb
+   before the NAPI poll dequeues it, so driver mode skips no driver cost. The
+   physical NIC (`eno1`, e1000e-class) reports no native XDP support and the
+   daemon falls back to generic (SKB) mode — so a true driver-datapath
+   measurement **could not be performed** on this machine.
+2. **The raw-passthrough result is a topology observation, not a fundamental
+   claim.** On veth, XDP is slower than nftables for TCP and UDP: the
+   per-packet decision cost (header parse, up to four map lookups, two counter
+   atomics) is visible on a device that has no driver work for XDP to bypass.
+   This says nothing about driver-mode XDP on a real NIC; it says veth is the
+   wrong place to look for a raw-speed advantage.
+3. **The mechanistic results are not affected by these caveats:** constant
+   decision cost as the rule count grows (`many`), sub-millisecond rule
+   updates, and an early drop path verified by counters at full offered load
+   are all valid on veth and would only improve on a driver-mode NIC.
+
+Thesis framing, word for word:
+
+> On the available hardware, XDP demonstrated predictable rule-decision
+> scaling, lower rule-update latency, and an early packet-drop path; raw
+> passthrough throughput was not superior to nftables, and native driver-mode
+> XDP could not be evaluated due to NIC/driver limitations.
+
 ## Baselines and superseded runs
 
 The **locked pre-conntrack baseline** is
@@ -199,10 +236,10 @@ The **locked pre-conntrack baseline** is
 fast path + host-firewall handling, 5 iterations). It is the reference to quote
 for Phase 4 onwards.
 
-> **Pending:** the `drop` scenario and controlled-UDP columns above are new;
-> the full-matrix rerun that captures them supersedes this baseline. Record the
-> new run id here and move `20260914-151138` into the "superseded" list once
-> it exists.
+> **Pending:** the `drop` scenario (raw-UDP flood), controlled-UDP columns and
+> thesis framing above are new; the full-matrix rerun that captures them
+> supersedes this baseline. Record the new run id here and move
+> `20260914-151138` into the "superseded" list once it exists.
 
 Superseded and **do not cite**:
 
@@ -222,6 +259,11 @@ be quoted either.
 
 - Always measure the **non-debug** datapath (`make generate`, not
   `generate-debug`) so `bpf_printk` traces do not skew results.
+- After any `git pull`, run `make bench` (or `make generate build`): the
+  embedded eBPF object `control/ebpf/firewall_bpf.o` is a bpf2go artifact and
+  is **not tracked in git**. A stale object no longer matches the generated Go
+  bindings and the daemon fails at load with `missing map rule_presence`;
+  `run-bench.sh` refuses to run until the object is refreshed.
 - Record the kernel version and `uname -r` alongside runs (the summary header
   does not include it yet — add it to your notes/column header for the thesis).
 - Run the same harness against the current datapath to get the **baseline**, and

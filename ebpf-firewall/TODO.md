@@ -65,6 +65,10 @@ MTP2+ are the thesis-level extensions built on top of it.
       via XDP `fc_stats` + nft `counter` rules (exercises the DROP hot path)
 - [x] Controlled (loss-free) UDP pass (`UDP_CTL_BW`, `udp2_*` columns) to isolate
       per-packet decision cost from sender saturation
+- [x] Raw-UDP flood offered load for `drop` rows (`run_flood`, `flood_sent`);
+      iperf3 is unusable against a DROP rule (its TCP control channel is blocked)
+- [x] Preflight guard: refuse to run with a missing/stale embedded
+      `firewall_bpf.o` (guards against load-time `missing map rule_presence`)
 - [ ] Full-matrix rerun with the drop + controlled-UDP columns; re-lock baseline
       (supersede `20260914-151138`)
 - [ ] IS_UPLOAD ⇄ future `-R` / download comparisons documented in `benchmark/README.md`
