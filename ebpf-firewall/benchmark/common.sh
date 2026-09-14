@@ -20,6 +20,8 @@ BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${BENCH_DIR}/.." && pwd)"
 
 RESULTS_ROOT="${BENCH_DIR}/results"
+EBPF_DIR="${REPO_DIR}/control/ebpf"
+BPF_DIR="${REPO_DIR}/bpf"
 HOST_IP="10.200.0.1"
 NS_IP="10.200.0.2"
 NS_NAME="benchns"
@@ -135,8 +137,24 @@ sample_rss_kb() {
     awk '/^VmRSS:/{print $2; exit}' "/proc/${1}/status"
 }
 
+# check_bpf_object_fresh : true when the embedded BPF object exists and is
+# newer than every bpf/ source it is generated from. The object (//go:embed
+# firewall_bpf.o) is a bpf2go artifact and is NOT tracked in git, so a clone or
+# pull can leave a stale one that no longer matches the generated Go bindings
+# (the daemon then fails at load with "missing map <name>"). run-bench.sh
+# refuses to run until `make generate` / `make bench` has refreshed it.
+check_bpf_object_fresh() {
+    local obj="${EBPF_DIR}/firewall_bpf.o" src
+    [ -f "${obj}" ] || return 1
+    for src in "${BPF_DIR}"/*.c "${BPF_DIR}"/*.h; do
+        [ -f "${src}" ] || continue
+        [ "${obj}" -nt "${src}" ] || return 1
+    done
+    return 0
+}
+
 # ---------------------------------------------------------------------------
-# Traffic measurement (iperf3 + ping); requires `iperf3`
+# Traffic measurement (iperf3 + python3 flood + ping)
 # ---------------------------------------------------------------------------
 
 # run_iperf <udp|tcp> <duration> <json_out> : iperf3 client inside the sandbox
@@ -201,6 +219,36 @@ run_ping() {
     ns_exec ping -c "${rounds}" -i 0.05 -q "${HOST_IP}" > "${out}" 2>&1 || true
     awk '/rtt/{split($4, a, "/"); print "rtt_min_ms=" a[1]; print "rtt_avg_ms=" a[2]; print "rtt_max_ms=" a[3]}' \
         "${out}" 2>/dev/null || true
+}
+
+# run_flood <duration> : raw-UDP offered load from inside the sandbox. iperf3
+# cannot drive the `drop` scenario — every mode opens a TCP control connection
+# first, and the firewall blocks that SYN with the workload, so no DATA ever
+# flows. This python3 sendto loop needs no control channel: it floods 1400-byte
+# datagrams at HOST_IP:5201 for <duration> seconds and prints `flood_sent=N`
+# on stdout (redirected by the caller).
+run_flood() {
+    local dur="$1"
+    ns_exec python3 - "${dur}" "${HOST_IP}" <<'PY' 2>/dev/null || { echo "flood_failed=1"; return 1; }
+import socket
+import sys
+import time
+
+dur = float(sys.argv[1])
+host = sys.argv[2]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setblocking(False)
+payload = b"\x00" * 1400
+start = time.monotonic()
+sent = 0
+while time.monotonic() - start < dur:
+    try:
+        s.sendto(payload, (host, 5201))
+        sent += 1
+    except BlockingIOError:
+        pass
+print("flood_sent=%d" % sent)
+PY
 }
 
 # snap_xdp_stats <json-file> : dumps the firewall's raw packet/byte counters

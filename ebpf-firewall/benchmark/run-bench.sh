@@ -20,6 +20,10 @@
 # Environment knobs: ITERS (iterations), DURATION (seconds per iperf3 pass),
 # UDP_BW (iperf3 -b for the saturated UDP pass; 0 = unthrottled),
 # UDP_CTL_BW (controlled UDP pass rate; 1500M default, 0 disables that pass).
+# The `drop` scenario cannot be driven by iperf3 (its TCP control channel is
+# dropped with the workload, so no DATA ever flows): offered load comes from a
+# raw-UDP flood (flood_sent column) and the hook-side DROP rate is read from
+# backend counters (drop_pps).
 #
 # Directions: iperf3's client (run in the sandbox netns) is the sender by
 # default, so bulk DATA always flows client -> server through the host-side XDP
@@ -70,7 +74,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$(id -u)" -eq 0 ] || { echo "bench: run as root" >&2; exit 1; }
-require_cmds ip nft iperf3 ping date || exit 1
+require_cmds ip nft iperf3 ping date python3 || exit 1
 if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
     echo "bench: iperf3 JSON parsing needs jq or python3 (neither found)" >&2
     exit 1
@@ -78,6 +82,14 @@ fi
 
 if pgrep -f "/bin/firewall " >/dev/null 2>&1; then
     echo "bench: a firewall daemon is already running; stop it first (the benchmark starts its own on the sandbox veth)" >&2
+    exit 1
+fi
+
+# `firewall_bpf.o` (//go:embed) is a bpf2go artifact and is NOT tracked in git;
+# a missing/stale one embeds wrong maps and the daemon dies at load with
+# "missing map <name>". Fail fast with a clear hint instead.
+if ! check_bpf_object_fresh; then
+    echo "bench: embedded eBPF object missing or stale -- run 'make generate' (or 'make bench', which regenerates first)" >&2
     exit 1
 fi
 
@@ -236,24 +248,36 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
         snap_nft_counters "${rundir}/nft-before.json"
     fi
 
-    local udp_kv udp2_kv tcp_kv
-    if run_iperf udp "${DURATION}" "${rundir}/iperf-udp.json" > "${rundir}/udp.kv" 2>/dev/null; then
-        udp_kv="${rundir}/udp.kv"
+    local udp_kv udp2_kv tcp_kv flood_kv="/dev/null"
+    if [ "${scenario}" = drop ]; then
+        # iperf3 cannot drive `drop`: its TCP control channel is dropped with
+        # the workload, so no DATA would ever flow. Use a raw-UDP flood for the
+        # offered load; the hook-side DROP rate below is the ground truth.
+        if run_flood "${DURATION}" > "${rundir}/flood.kv" 2>/dev/null; then
+            flood_kv="${rundir}/flood.kv"
+        fi
     else
-        udp_kv="/dev/null"
+        if run_iperf udp "${DURATION}" "${rundir}/iperf-udp.json" \
+            > "${rundir}/udp.kv" 2>/dev/null; then
+            udp_kv="${rundir}/udp.kv"
+        else
+            udp_kv="/dev/null"
+        fi
+        if [ "${UDP_CTL_BW:-1500M}" != 0 ] \
+            && run_iperf udp "${DURATION}" "${rundir}/iperf-udp-ctl.json" "${UDP_CTL_BW:-1500M}" \
+            > "${rundir}/udp2.kv" 2>/dev/null; then
+            udp2_kv="${rundir}/udp2.kv"
+        else
+            udp2_kv="/dev/null"
+        fi
+        if run_iperf tcp "${DURATION}" "${rundir}/iperf-tcp.json" \
+            > "${rundir}/tcp.kv" 2>/dev/null; then
+            tcp_kv="${rundir}/tcp.kv"
+        else
+            tcp_kv="/dev/null"
+        fi
+        run_ping 20 "${rundir}/ping.txt" > "${rundir}/rtt.kv" 2>/dev/null || true
     fi
-    if [ "${UDP_CTL_BW:-1500M}" != 0 ] \
-        && run_iperf udp "${DURATION}" "${rundir}/iperf-udp-ctl.json" "${UDP_CTL_BW:-1500M}" > "${rundir}/udp2.kv" 2>/dev/null; then
-        udp2_kv="${rundir}/udp2.kv"
-    else
-        udp2_kv="/dev/null"
-    fi
-    if run_iperf tcp "${DURATION}" "${rundir}/iperf-tcp.json" > "${rundir}/tcp.kv" 2>/dev/null; then
-        tcp_kv="${rundir}/tcp.kv"
-    else
-        tcp_kv="/dev/null"
-    fi
-    run_ping 20 "${rundir}/ping.txt" > "${rundir}/rtt.kv" 2>/dev/null || true
     sample_cpu cpu1
 
     if [ "${backend}" = xdp ]; then
@@ -265,7 +289,7 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     kill "${IPERF_PID}" 2>/dev/null || true
     IPERF_PID=""
 
-    local bps pps loss jitter tcp_bps rtt mem addr del drop_pps udp2_bps udp2_pps udp2_loss udp2_jitter
+    local bps pps loss jitter tcp_bps rtt mem addr del drop_pps udp2_bps udp2_pps udp2_loss udp2_jitter flood_sent
     bps="$(kv "${udp_kv}" udp_bits_per_sec)";        [ -z "${bps}" ]    && bps=0
     pps="$(kv "${udp_kv}" udp_sent_packets)";         [ -z "${pps}" ]    && pps=0
     pps=$(( pps / DURATION ))
@@ -290,6 +314,7 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     udp2_pps=$(( udp2_pps / DURATION ))
     udp2_loss="$(kv "${udp2_kv}" udp_lost_packets)";     [ -z "${udp2_loss}" ]   && udp2_loss=0
     udp2_jitter="$(kv "${udp2_kv}" udp_jitter_ms)";      [ -z "${udp2_jitter}" ] && udp2_jitter=0
+    flood_sent="$(kv "${flood_kv}" flood_sent)";         [ -z "${flood_sent}" ] && flood_sent=0
 
     # In `drop` zero throughput is the expected success (every workload packet
     # is dropped before delivery), so those rows must not WARN.
@@ -302,16 +327,20 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     if [ "${UDP_CTL_BW:-1500M}" != 0 ] && [ "${scenario}" != drop ] && is_zero "${udp2_bps}"; then
         log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: udp2_bps=0 (controlled UDP pass failed)"
     fi
+    if [ "${scenario}" = drop ] && is_zero "${flood_sent}"; then
+        log "WARN: backend=${backend} scenario=drop iter=${iter}: flood offered 0 packets (sender or datapath problem; see ${rundir}/flood.kv)"
+    fi
 
     [ "${backend}" = xdp ] && log_xdp_delta "${rundir}"
 
-    printf '%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%d\n' \
         "${RUN_TS}" "${backend}" "${scenario}" "${iter}" \
         "${bps}" "${pps}" "${loss}" "${jitter}" "${tcp_bps}" "${rtt}" \
         "$(cpu_delta "${cpu0}" "${cpu1}")" "${mem}" "${addr}" "${del}" \
         "${drop_pps}" "${udp2_bps}" "${udp2_pps}" "${udp2_loss}" "${udp2_jitter}" \
+        "${flood_sent}" \
         >> "${SUMMARY}"
-    log "  udp_bps=${bps} pps=${pps} loss=${loss} tcp_bps=${tcp_bps} rtt=${rtt} mem=${mem} add=${addr}ms del=${del}ms udp2_bps=${udp2_bps} drop_pps=${drop_pps}"
+    log "  udp_bps=${bps} pps=${pps} loss=${loss} tcp_bps=${tcp_bps} rtt=${rtt} mem=${mem} add=${addr}ms del=${del}ms udp2_bps=${udp2_bps} drop_pps=${drop_pps} flood_sent=${flood_sent}"
 }
 
 # --- main ------------------------------------------------------------------
@@ -319,7 +348,7 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
 sandbox_up
 host_firewall_open
 
-printf 'run\tbackend\tscenario\titer\tudp_bps\tudp_pps\tudp_lost\tudp_jitter_ms\ttcp_bps\trtt_avg_ms\tcpu_jif\trss_kb\tadd_ms\tdel_ms\tdrop_pps\tudp2_bps\tudp2_pps\tudp2_lost\tudp2_jitter_ms\n' \
+printf 'run\tbackend\tscenario\titer\tudp_bps\tudp_pps\tudp_lost\tudp_jitter_ms\ttcp_bps\trtt_avg_ms\tcpu_jif\trss_kb\tadd_ms\tdel_ms\tdrop_pps\tudp2_bps\tudp2_pps\tudp2_lost\tudp2_jitter_ms\tflood_sent\n' \
     > "${SUMMARY}"
 
 for backend in "${BACKENDS[@]}"; do

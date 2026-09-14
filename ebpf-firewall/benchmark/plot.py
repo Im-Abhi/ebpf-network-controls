@@ -53,6 +53,7 @@ METRICS = [
     ("udp2_pps",      "UDP ctl packets/s",       float, "{:,.0f}"),
     ("udp2_lost",     "UDP ctl lost packets",    float, "{:,.0f}"),
     ("udp2_jitter_ms","UDP ctl jitter (ms)",     float, "{:.3f}"),
+    ("flood_sent",    "Offered flood datagrams", float, "{:,.0f}"),
 ]
 
 # (metric, axis label) and the value divider for plotting (bps -> Mbit/s).
@@ -72,6 +73,7 @@ BAR_METRICS = [
     ("udp2_pps",      "UDP controlled packets/s", 1.0),
     ("udp2_lost",     "UDP controlled lost packets", 1.0),
     ("udp2_jitter_ms","UDP controlled jitter (ms)", 1.0),
+    ("flood_sent",    "Offered flood (pkts)",       1.0),
 ]
 
 
