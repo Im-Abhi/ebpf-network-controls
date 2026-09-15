@@ -47,6 +47,10 @@ MTP2+ are the thesis-level extensions built on top of it.
 - [x] Presence bits maintained by Go managers (set before first insert, cleared
       after last delete) and wired through the facade
 - [x] Verify `make test` / `make integration-test` with the fast path enabled
+- [ ] XDP hardware offload mode (offload → driver → generic cascade). Library
+      exposes `link.XDPOffloadMode` (cilium/ebpf v0.22.0) but offload drivers
+      don't support `BPF_MAP_TYPE_LPM_TRIE` — deferred until offload-capable NIC
+      available. ~40 lines across 4 files + docs when needed.
 
 ### MTP1-D: Stateful firewall
 
