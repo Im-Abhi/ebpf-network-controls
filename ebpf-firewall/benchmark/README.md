@@ -151,6 +151,16 @@ has no driver XDP path** (veth builds the skb before the XDP hook), so its raw
 throughput is veth-scoped; the mechanistic results (scaling, rule updates, drop
 parity) are not affected.
 
+**Hardware (offload) XDP — not implemented.** The library
+(`cilium/ebpf v0.22.0`) already exposes `link.XDPOffloadMode`; adding the
+fallback attempt would be ~40 lines across 4 files. It is intentionally
+deferred: offload-capable NICs (Netronome-class) support only a limited subset
+of map types, and the firewall's `BPF_MAP_TYPE_LPM_TRIE` is often unsupported
+by offload drivers — so the attach would fail and fall back to driver mode on
+any current NIC. Adding it would gain a documented capability ladder (offload →
+driver → generic cascade) but no measurable effect on the benchmark until an
+offload-capable NIC is available.
+
 ## Output
 
 Each run creates `benchmark/results/<YYYYmmdd-HHMMSS>/`, with one directory per
