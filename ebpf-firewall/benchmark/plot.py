@@ -74,6 +74,7 @@ BAR_METRICS = [
     ("udp2_lost",     "UDP controlled lost packets", 1.0),
     ("udp2_jitter_ms","UDP controlled jitter (ms)", 1.0),
     ("flood_sent",    "Offered flood (pkts)",       1.0),
+    ("cpu_per_m_pkts", "CPU cost (jiffies / M pkts)", 1.0),
 ]
 
 
@@ -123,6 +124,37 @@ def aggregate(rows):
                     "stdev": statistics.stdev(nums) if len(nums) > 1 else 0.0,
                     "n": len(nums),
                 }
+
+    # Derive CPU cost per million processed/dropped packets. Exact for the
+    # `drop` scenario (offered load == flood_sent, one 10 s pass). For traffic
+    # scenarios the packet volume is the two 10 s UDP passes
+    # ((udp_pps + udp2_pps) * 10); TCP/Ack packets are not counted, so those
+    # rows understate cost slightly and are marked approximate in the label.
+    dur = 10
+    agg["cpu_per_m_pkts"] = {b: {} for b in BACKENDS}
+    for b in BACKENDS:
+        for s in scenarios:
+            c = agg["cpu_jif"][b].get(s)
+            if not c or c["median"] is None:
+                agg["cpu_per_m_pkts"][b][s] = {
+                    "vals": [], "median": None, "stdev": 0.0, "n": 0}
+                continue
+            if s == "drop":
+                totals = agg["flood_sent"][b][s]["vals"]
+            else:
+                up = agg["udp_pps"][b][s]["vals"]
+                u2 = agg["udp2_pps"][b][s]["vals"]
+                totals = [(a + b) * dur for a, b in zip(up, u2)]
+            vals = []
+            for i, t in enumerate(totals):
+                if t > 0 and i < len(c["vals"]):
+                    vals.append(c["vals"][i] / (t / 1e6))
+            agg["cpu_per_m_pkts"][b][s] = {
+                "vals": vals,
+                "median": statistics.median(vals) if vals else None,
+                "stdev": statistics.stdev(vals) if len(vals) > 1 else 0.0,
+                "n": len(vals),
+            }
     return agg, scenarios
 
 
@@ -140,6 +172,17 @@ def print_table(agg, scenarios):
                       f"{fmt.format(cell['median']):>16}"
                       f"{fmt.format(cell['stdev']):>12}"
                       f"{cell['n']:>4}")
+    # Derived metric: CPU jiffies per million packets. Exact for `drop`,
+    # approximate for traffic scenarios (UDP passes only, TCP uncounted).
+    print("cpu_per_m_pkts (jiffies / M pkts; traffic rows = approx, UDP passes only)")
+    for b in BACKENDS:
+        for s in scenarios:
+            cell = agg["cpu_per_m_pkts"][b].get(s)
+            if not cell or cell["median"] is None:
+                print(f"{'':<24}{b:<8}{s:<10}{'-':>16}{'-':>12}{0:>4}")
+                continue
+            print(f"{'':<24}{b:<8}{s:<10}"
+                  f"{cell['median']:>16.2f}{cell['stdev']:>12.2f}{cell['n']:>4}")
 
 
 def human(v):
@@ -161,13 +204,11 @@ def render_bars(agg, scenarios, out_dir):
         fig, ax = plt.subplots(figsize=(9, 4.5))
         for b in BACKENDS:
             medians = [agg[metric][b].get(s, {}).get("median") for s in scenarios]
-            stdevs = [agg[metric][b].get(s, {}).get("stdev") for s in scenarios]
             heights = [((v or 0.0) / scale) for v in medians]
-            errs = [(e or 0.0) / scale for e in stdevs]
             off = ((width / 2) if b == "xdp" else -(width / 2))
-            ax.bar([pos + off for pos in x], heights, width, yerr=errs,
+            ax.bar([pos + off for pos in x], heights, width,
                    label=("XDP" if b == "xdp" else "nftables"),
-                   color=colors[b], capsize=3)
+                   color=colors[b])
             for pos, h in zip(x, heights):
                 if h:
                     ax.annotate(human(h * scale), xy=(pos + off, h),

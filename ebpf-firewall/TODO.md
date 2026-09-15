@@ -69,14 +69,15 @@ MTP2+ are the thesis-level extensions built on top of it.
       iperf3 is unusable against a DROP rule (its TCP control channel is blocked)
 - [x] Preflight guard: refuse to run with a missing/stale embedded
       `firewall_bpf.o` (guards against load-time `missing map rule_presence`)
-- [ ] Full-matrix rerun with the drop + controlled-UDP columns; re-lock baseline
-      (supersede `20260914-151138`) — first capture `20260914-230211` completed
-      but its TCP rows are 0 (iperf3 3.20 `retransmits` parser bug, fixed);
-      awaiting the clean rerun
+- [x] Full-matrix rerun with the drop + controlled-UDP columns; re-lock baseline
+      — locked baseline is `20260914-234855` (valid TCP; supersedes
+      `20260914-151138` and the TCP-invalid `20260914-230211`). Includes a
+      derived CPU-cost-per-million-packets metric in `plot.py`.
 - [ ] IS_UPLOAD ⇄ future `-R` / download comparisons documented in `benchmark/README.md`
 - [ ] Rerun unchanged after stateful firewall; document feature cost
 - [x] Results documentation — `benchmark/README.md` "Benchmark results" section
-      (capture `20260914-230211`; medians + drop-path counter parity)
+      (capture `20260914-234855`; medians + drop-path counter parity + derived
+      CPU-per-M-pkts table)
 
 ---
 
