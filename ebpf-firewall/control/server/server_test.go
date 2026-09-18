@@ -13,7 +13,7 @@ import (
 // fakePolicy is a thread-safe in-memory Policy for unit tests (no kernel).
 type fakePolicy struct {
 	mu     sync.Mutex
-	ips    map[string]struct{}
+	ips    map[string]BlockedRule
 	rules  map[string]PortRule
 	call   bool
 	stat   Stats
@@ -23,23 +23,24 @@ type fakePolicy struct {
 
 func newFakePolicy() *fakePolicy {
 	return &fakePolicy{
-		ips:   make(map[string]struct{}),
+		ips:   make(map[string]BlockedRule),
 		rules: make(map[string]PortRule),
 		def:   "allow",
 	}
 }
 
 func (f *fakePolicy) BlockIP(cidr string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.ips[cidr] = struct{}{}
-	return nil
+	return f.BlockIPWithActionPriority(cidr, "drop", 0)
 }
 
 func (f *fakePolicy) BlockIPWithAction(cidr, action string) error {
+	return f.BlockIPWithActionPriority(cidr, action, 0)
+}
+
+func (f *fakePolicy) BlockIPWithActionPriority(cidr, action string, priority uint32) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.ips[cidr] = struct{}{}
+	f.ips[cidr] = BlockedRule{Cidr: cidr, Action: action, Priority: priority}
 	return nil
 }
 
@@ -51,11 +52,23 @@ func (f *fakePolicy) UnblockIP(cidr string) error {
 }
 
 func (f *fakePolicy) ListBlockedIPs() ([]string, error) {
+	rules, err := f.ListBlockedRules()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, r.Cidr)
+	}
+	return out, nil
+}
+
+func (f *fakePolicy) ListBlockedRules() ([]BlockedRule, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]string, 0, len(f.ips))
-	for k := range f.ips {
-		out = append(out, k)
+	out := make([]BlockedRule, 0, len(f.ips))
+	for _, r := range f.ips {
+		out = append(out, r)
 	}
 	return out, nil
 }
@@ -63,7 +76,7 @@ func (f *fakePolicy) ListBlockedIPs() ([]string, error) {
 func (f *fakePolicy) Clear() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.ips = make(map[string]struct{})
+	f.ips = make(map[string]BlockedRule)
 	return nil
 }
 
@@ -99,9 +112,13 @@ func (f *fakePolicy) BlockPortRule(dst, protocol string, dport, sport uint16) er
 }
 
 func (f *fakePolicy) BlockPortRuleWithAction(dst, protocol string, dport, sport uint16, action string) error {
+	return f.BlockPortRuleWithActionPriority(dst, protocol, dport, sport, action, 0)
+}
+
+func (f *fakePolicy) BlockPortRuleWithActionPriority(dst, protocol string, dport, sport uint16, action string, priority uint32) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.rules[portKey(dst, protocol, dport, sport)] = PortRule{Protocol: protocol, Port: dport, SPort: sport, Dst: dst, Action: action}
+	f.rules[portKey(dst, protocol, dport, sport)] = PortRule{Protocol: protocol, Port: dport, SPort: sport, Dst: dst, Action: action, Priority: priority}
 	return nil
 }
 
@@ -267,6 +284,35 @@ func TestHandle_BlockWithAction(t *testing.T) {
 	}
 }
 
+func TestHandle_BlockPriority(t *testing.T) {
+	policy := newFakePolicy()
+	s := New("unused.sock", policy)
+
+	// port rule with explicit action + priority carries the priority through
+	if resp := s.handle(Request{Command: CmdBlock, Value: "192.168.1.100", Protocol: "tcp", Port: 22, Action: "pass", Priority: 100}); !resp.OK {
+		t.Fatalf("block port with priority: %+v", resp)
+	}
+	resp := s.handle(Request{Command: CmdListPorts})
+	if !resp.OK || resp.Count != 1 {
+		t.Fatalf("listports: %+v", resp)
+	}
+	if resp.PortRules[0].Priority != 100 {
+		t.Errorf("port rule priority = %d, want 100", resp.PortRules[0].Priority)
+	}
+
+	// IP rule with explicit action + priority is returned in BlockedRules
+	if resp := s.handle(Request{Command: CmdBlock, Value: "10.0.0.0/8", Action: "pass", Priority: 7}); !resp.OK {
+		t.Fatalf("block IP with priority: %+v", resp)
+	}
+	resp = s.handle(Request{Command: CmdList})
+	if !resp.OK || resp.Count != 1 || len(resp.BlockedRules) != 1 {
+		t.Fatalf("list: %+v", resp)
+	}
+	if resp.BlockedRules[0].Priority != 7 || resp.BlockedRules[0].Action != "pass" {
+		t.Errorf("blocked rule = %+v, want action pass priority 7", resp.BlockedRules[0])
+	}
+}
+
 func TestHandle_ClearRemovesPortRules(t *testing.T) {
 	policy := newFakePolicy()
 	s := New("unused.sock", policy)
@@ -317,23 +363,30 @@ func TestHandle_Stats(t *testing.T) {
 // errPolicy returns an error from every blocked-side operation.
 type errPolicy struct{}
 
-func (p *errPolicy) BlockIP(string) error                       { return errors.New("boom") }
-func (p *errPolicy) BlockIPWithAction(string, string) error     { return errors.New("boom") }
-func (p *errPolicy) UnblockIP(string) error                     { return errors.New("boom") }
-func (p *errPolicy) ListBlockedIPs() ([]string, error)          { return nil, errors.New("boom") }
-func (p *errPolicy) Clear() error                               { return errors.New("boom") }
-func (p *errPolicy) Interface() string                          { return "" }
-func (p *errPolicy) AttachMode() string                         { return "" }
-func (p *errPolicy) Stats() (Stats, error)                      { return Stats{}, errors.New("boom") }
+func (p *errPolicy) BlockIP(string) error                           { return errors.New("boom") }
+func (p *errPolicy) BlockIPWithAction(string, string) error         { return errors.New("boom") }
+func (p *errPolicy) BlockIPWithActionPriority(string, string, uint32) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) UnblockIP(string) error                  { return errors.New("boom") }
+func (p *errPolicy) ListBlockedIPs() ([]string, error)       { return nil, errors.New("boom") }
+func (p *errPolicy) ListBlockedRules() ([]BlockedRule, error) { return nil, errors.New("boom") }
+func (p *errPolicy) Clear() error                            { return errors.New("boom") }
+func (p *errPolicy) Interface() string                       { return "" }
+func (p *errPolicy) AttachMode() string                      { return "" }
+func (p *errPolicy) Stats() (Stats, error)                   { return Stats{}, errors.New("boom") }
 func (p *errPolicy) BlockPortRule(string, string, uint16, uint16) error { return errors.New("boom") }
 func (p *errPolicy) BlockPortRuleWithAction(string, string, uint16, uint16, string) error {
 	return errors.New("boom")
 }
+func (p *errPolicy) BlockPortRuleWithActionPriority(string, string, uint16, uint16, string, uint32) error {
+	return errors.New("boom")
+}
 func (p *errPolicy) UnblockPortRule(string, string, uint16, uint16) error { return errors.New("boom") }
-func (p *errPolicy) ListPortRules() ([]PortRule, error)           { return nil, errors.New("boom") }
-func (p *errPolicy) ClearPortRules() error                        { return errors.New("boom") }
-func (p *errPolicy) SetDefaultPolicy(string) error                { return errors.New("boom") }
-func (p *errPolicy) DefaultPolicy() (string, error)               { return "", errors.New("boom") }
+func (p *errPolicy) ListPortRules() ([]PortRule, error)                    { return nil, errors.New("boom") }
+func (p *errPolicy) ClearPortRules() error                                 { return errors.New("boom") }
+func (p *errPolicy) SetDefaultPolicy(string) error                         { return errors.New("boom") }
+func (p *errPolicy) DefaultPolicy() (string, error)                        { return "", errors.New("boom") }
 
 func TestHandle_PropagatesErrors(t *testing.T) {
 	s := New("unused.sock", &errPolicy{})

@@ -12,20 +12,29 @@
  *     1. parse packet headers
  *     2. build packet_info (src/dst address, protocol)
  *     3. policy lookups: blocked_ips LPM trie + port_policy hash,
- *        each returning a rule_action (PASS or DROP)
+ *        each returning a rule_value (action + priority)
  *     4. decision (data-driven, see decision_table below)
  *
- * Decision table (deterministic, DROP takes precedence):
- *   any matched rule action == DROP      -> DROP
- *   else any matched rule action == PASS -> PASS
- *   else (no rule matched by any lookup) -> default policy
- *   unparseable / non-IPv4               -> default policy
+ * Decision table (deterministic, highest priority wins):
+ *   matched rules exist -> action of the highest-priority match; at equal
+ *                          priority the port table keeps its most specific
+ *                          match, and a tie between an IP rule and a port
+ *                          rule resolves to DROP
+ *   no rule matched     -> default policy
+ *   unparseable/non-IPv4-> default policy
+ *
+ * Within the IP table the kernel's LPM trie decides which entry matches
+ * (longest prefix); `priority` only orders an IP match against a port
+ * match, or against another port rule. Rules are stored as struct
+ * rule_value (see maps.h); priority 0 is the default and reproduces the
+ * pre-priority behaviour.
  *
  * The default policy is read from the `firewall_config` map (entry 0 =
- * DEFAULT_ALLOW or DEFAULT_DENY). A matched DROP always wins, so adding an
- * explicit block stays effective even under a default-allow policy. An
- * explicit PASS rule takes effect only for traffic it matches, permitting
- * exactly that traffic under a default-deny policy.
+ * DEFAULT_ALLOW or DEFAULT_DENY). A matched DROP can be overridden only by
+ * a higher-priority PASS, so an explicit block stays effective against
+ * equal- or lower-priority permits. An explicit PASS rule takes effect
+ * only for traffic it matches, permitting exactly that traffic under a
+ * default-deny policy.
  *
  * Debugging (optional, compile-time): protocol/port inspection and
  * bpf_printk logging are compiled out unless FIREWALL_DEBUG is defined.
@@ -96,45 +105,51 @@ static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
     return info;
 }
 
-/* Policy lookup for the IP blocklist. Returns the rule_action stored for the
+/* Policy lookup for the IP blocklist. Returns the rule_value stored for the
  * longest-prefix LPM match on the source address, falling back to the
  * destination address' match. Checks source first, then destination. Both keys
  * use the same 8-byte LPM layout with the address in network byte order,
- * matching the Go side (control/ebpf/blocklist.go). */
+ * matching the Go side (control/ebpf/blocklist.go). Returns 1 and fills *out
+ * on a match, 0 if neither address matched. */
 static __always_inline int ip_block_action(const struct packet_info *info,
-                                           enum rule_action *out_action) {
+                                           struct rule_value *out) {
     struct ipv4_lpm_key key = {
         .prefixlen = 32,
         .data = info->saddr,
     };
 
-    __u32 *elem = bpf_map_lookup_elem(&blocked_ips, &key);
+    struct rule_value *elem = bpf_map_lookup_elem(&blocked_ips, &key);
     if (!elem) {
         key.data = info->daddr;
         elem = bpf_map_lookup_elem(&blocked_ips, &key);
     }
 
     if (!elem) {
-        *out_action = ACTION_PASS;
         return 0;
     }
 
-    *out_action = (enum rule_action)*elem;
+    *out = *elem;
     return 1;
 }
 
 /* Port-policy lookup. Matches protocol + source/destination port against
  * the destination address. Ports are optional: a stored rule with dport or
- * sport == 0 means "any" for that field, so the datapath tries the rules in
- * specificity order and returns the action of the first key that exists:
+ * sport == 0 means "any" for that field, so the datapath probes all four
+ * specificity keys:
  * (proto, dport, sport) -> (proto, dport, 0) -> (proto, 0, sport) ->
- * (proto, 0, 0). The key carries addresses/ports in network byte order,
- * matching the Go side (control/ebpf/portpolicy.go). Returns 1 + action on
- * a match, 0 if no rule covers the packet. */
+ * (proto, 0, 0), and keeps the matching rule with the highest priority. At
+ * equal priority the first (most specific) probed match is kept, preserving
+ * the documented most-specific-first behaviour exactly at the default
+ * priority 0; only a strictly higher priority replaces it. The key carries
+ * addresses/ports in network byte order, matching the Go side
+ * (control/ebpf/portpolicy.go). Returns 1 and fills *out on a match, 0 if
+ * no rule covers the packet. */
 static __always_inline int port_rule_action(const struct packet_info *info,
-                                            enum rule_action *out_action) {
+                                            struct rule_value *out) {
     struct port_rule_key key;
-    __u32 *elem;
+    struct rule_value *elem;
+    struct rule_value best = {};
+    int matched = 0;
 
     /* Zero the whole key, including padding. The hash comparison covers all
      * 12 bytes of the struct and the Go side stores zero padding, so any
@@ -146,14 +161,17 @@ static __always_inline int port_rule_action(const struct packet_info *info,
     key.sport = info->sport;
     key.dst = info->daddr;
 
+    /* Replace the current best only when the candidate has a strictly higher
+     * priority. Keys are probed most-specific first, so an equal-priority
+     * candidate never displaces an earlier, more specific match. */
 #define TRY_LOOKUP(d, s)                                        \
     do {                                                        \
         key.dport = (d);                                        \
         key.sport = (s);                                        \
         elem = bpf_map_lookup_elem(&port_policy, &key);         \
-        if (elem) {                                             \
-            *out_action = (enum rule_action)*elem;              \
-            return 1;                                           \
+        if (elem && (!matched || elem->priority > best.priority)) { \
+            best = *elem;                                       \
+            matched = 1;                                        \
         }                                                       \
     } while (0)
 
@@ -164,8 +182,12 @@ static __always_inline int port_rule_action(const struct packet_info *info,
 
 #undef TRY_LOOKUP
 
-    *out_action = ACTION_PASS;
-    return 0;
+    if (!matched) {
+        return 0;
+    }
+
+    *out = best;
+    return 1;
 }
 
 /* Reads the configured default policy from the config map. Falls back to
@@ -179,21 +201,29 @@ static __always_inline enum default_policy default_policy(void) {
     return (enum default_policy)*policy;
 }
 
-/* Applies the decision table. DROP from any matched rule wins; otherwise PASS
- * from any matched rule; otherwise the configured default policy. */
-static __always_inline int decide(int ip_matched, enum rule_action ip_action,
-                                  int port_matched, enum rule_action port_action) {
-    if (ip_matched && ip_action == ACTION_DROP) {
-        return XDP_DROP;
-    }
-    if (port_matched && port_action == ACTION_DROP) {
-        return XDP_DROP;
-    }
-    if (ip_matched && ip_action == ACTION_PASS) {
+/* Applies the decision table across the (at most two) matched rules. The
+ * highest priority wins; an equal-priority tie between an IP rule and a port
+ * rule resolves to DROP (the pre-priority behaviour). With no match the
+ * configured default policy applies. */
+static __always_inline int decide(int ip_matched, const struct rule_value *ip,
+                                  int port_matched, const struct rule_value *port) {
+    if (ip_matched && port_matched) {
+        if (ip->priority != port->priority) {
+            const struct rule_value *winner =
+                ip->priority > port->priority ? ip : port;
+            return winner->action == ACTION_DROP ? XDP_DROP : XDP_PASS;
+        }
+        /* Equal priority: DROP wins if either side is a DROP. */
+        if (ip->action == ACTION_DROP || port->action == ACTION_DROP) {
+            return XDP_DROP;
+        }
         return XDP_PASS;
     }
-    if (port_matched && port_action == ACTION_PASS) {
-        return XDP_PASS;
+    if (ip_matched) {
+        return ip->action == ACTION_DROP ? XDP_DROP : XDP_PASS;
+    }
+    if (port_matched) {
+        return port->action == ACTION_DROP ? XDP_DROP : XDP_PASS;
     }
     return default_policy() == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
 }
@@ -283,17 +313,17 @@ int firewall_prog(struct xdp_md *ctx) {
     __u32 *presence = bpf_map_lookup_elem(&rule_presence, &zero);
     __u32 flags = presence ? *presence : 0;
 
-    enum rule_action ip_action = ACTION_PASS, port_action = ACTION_PASS;
+    struct rule_value ip_rule = {}, port_rule = {};
     int ip_matched = 0, port_matched = 0;
     if (flags & RULE_IP_PRESENT) {
-        ip_matched = ip_block_action(&info, &ip_action);
+        ip_matched = ip_block_action(&info, &ip_rule);
     }
     if (flags & RULE_PORT_PRESENT) {
-        port_matched = port_rule_action(&info, &port_action);
+        port_matched = port_rule_action(&info, &port_rule);
     }
 
-    /* 3. decision (data-driven; DROP wins, else PASS, else default) */
-    int verdict = decide(ip_matched, ip_action, port_matched, port_action);
+    /* 3. decision (data-driven; highest priority wins, tie -> DROP, else default) */
+    int verdict = decide(ip_matched, &ip_rule, port_matched, &port_rule);
     if (verdict == XDP_DROP) {
         DEBUG_PRINTK("packet DROPPED");
         incr_counter(COUNTER_TOTAL, pkt_len);

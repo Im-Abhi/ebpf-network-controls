@@ -47,10 +47,11 @@ func clearPresenceBit(presence *ebpf.Map, bit uint32) error {
 
 // mapHasEntries reports whether the given map contains at least one entry,
 // halting at the first hit so it runs in O(1) when populated. The generic
-// []byte key avoids tying this helper to a specific key struct.
+// []byte key and value avoid tying this helper to a specific struct layout or
+// map value size (which differs between the IP and port rule maps).
 func mapHasEntries(m *ebpf.Map) (bool, error) {
 	var key []byte
-	var value uint32
+	var value []byte
 	iter := m.Iterate()
 	has := iter.Next(&key, &value)
 	if err := iter.Err(); err != nil {

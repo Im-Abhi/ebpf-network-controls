@@ -5,6 +5,8 @@ package ebpf
 import (
 	"testing"
 
+	"ebpf-firewall/control/server"
+
 	"github.com/cilium/ebpf"
 )
 
@@ -23,7 +25,7 @@ func newTestLpmMap(t *testing.T) *ebpf.Map {
 	tm, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.LPMTrie,
 		KeySize:    8,
-		ValueSize:  4,
+		ValueSize:  8, // struct rule_value (action + priority)
 		MaxEntries: 64,
 		Flags:      uint32(bpfMapFlagNoPrealloc),
 	})
@@ -141,6 +143,36 @@ func TestMapManager_ListAndClear(t *testing.T) {
 	ok, err := pm.IsBlocked("1.2.3.4")
 	if err != nil || ok {
 		t.Errorf("IsBlocked(1.2.3.4) after clear = %v, %v; want false", ok, err)
+	}
+}
+
+func TestMapManager_PriorityRoundTrip(t *testing.T) {
+	pm := NewMapManager(newTestLpmMap(t))
+
+	if err := pm.BlockIPWithActionPriority("1.2.3.4", ActionDrop, 100); err != nil {
+		t.Fatalf("BlockIPWithActionPriority(drop,100): %v", err)
+	}
+	if err := pm.BlockIPWithActionPriority("10.0.0.0/8", ActionPass, 7); err != nil {
+		t.Fatalf("BlockIPWithActionPriority(pass,7): %v", err)
+	}
+
+	rules, err := pm.ListBlockedRules()
+	if err != nil {
+		t.Fatalf("ListBlockedRules: %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("ListBlockedRules len = %d, want 2 (%+v)", len(rules), rules)
+	}
+
+	byCidr := make(map[string]server.BlockedRule, len(rules))
+	for _, r := range rules {
+		byCidr[r.Cidr] = r
+	}
+	if r := byCidr["1.2.3.4/32"]; r.Action != "drop" || r.Priority != 100 {
+		t.Errorf("1.2.3.4/32 = %+v, want action drop priority 100", r)
+	}
+	if r := byCidr["10.0.0.0/8"]; r.Action != "pass" || r.Priority != 7 {
+		t.Errorf("10.0.0.0/8 = %+v, want action pass priority 7", r)
 	}
 }
 

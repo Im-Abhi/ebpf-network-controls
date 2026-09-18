@@ -16,14 +16,17 @@ import (
 type Policy interface {
 	BlockIP(cidr string) error
 	BlockIPWithAction(cidr, action string) error
+	BlockIPWithActionPriority(cidr, action string, priority uint32) error
 	UnblockIP(cidr string) error
 	ListBlockedIPs() ([]string, error)
+	ListBlockedRules() ([]BlockedRule, error)
 	Clear() error
 	Interface() string
 	AttachMode() string
 	Stats() (Stats, error)
 	BlockPortRule(dst, protocol string, dport, sport uint16) error
 	BlockPortRuleWithAction(dst, protocol string, dport, sport uint16, action string) error
+	BlockPortRuleWithActionPriority(dst, protocol string, dport, sport uint16, action string, priority uint32) error
 	UnblockPortRule(dst, protocol string, dport, sport uint16) error
 	ListPortRules() ([]PortRule, error)
 	ClearPortRules() error
@@ -171,7 +174,7 @@ func (s *Server) handle(req Request) Response {
 	case CmdBlock:
 		if req.Protocol != "" || req.Port != 0 || req.SPort != 0 {
 			if req.Action != "" {
-				if err := s.policy.BlockPortRuleWithAction(req.Value, req.Protocol, req.Port, req.SPort, req.Action); err != nil {
+				if err := s.policy.BlockPortRuleWithActionPriority(req.Value, req.Protocol, req.Port, req.SPort, req.Action, req.Priority); err != nil {
 					return Response{OK: false, Error: err.Error()}
 				}
 			} else if err := s.policy.BlockPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
@@ -180,7 +183,7 @@ func (s *Server) handle(req Request) Response {
 			return Response{OK: true}
 		}
 		if req.Action != "" {
-			if err := s.policy.BlockIPWithAction(req.Value, req.Action); err != nil {
+			if err := s.policy.BlockIPWithActionPriority(req.Value, req.Action, req.Priority); err != nil {
 				return Response{OK: false, Error: err.Error()}
 			}
 		} else if err := s.policy.BlockIP(req.Value); err != nil {
@@ -201,11 +204,15 @@ func (s *Server) handle(req Request) Response {
 		return Response{OK: true}
 
 	case CmdList:
-		blocked, err := s.policy.ListBlockedIPs()
+		rules, err := s.policy.ListBlockedRules()
 		if err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
-		return Response{OK: true, Blocked: blocked, Count: len(blocked)}
+		blocked := make([]string, 0, len(rules))
+		for _, r := range rules {
+			blocked = append(blocked, r.Cidr)
+		}
+		return Response{OK: true, Blocked: blocked, BlockedRules: rules, Count: len(blocked)}
 
 	case CmdListPorts:
 		rules, err := s.policy.ListPortRules()

@@ -7,6 +7,7 @@ import (
 	"net"
 
 	"ebpf-firewall/control/rules"
+	"ebpf-firewall/control/server"
 
 	"github.com/cilium/ebpf"
 )
@@ -76,9 +77,19 @@ func (pm *MapManager) BlockIP(cidrStr string) error {
 }
 
 // BlockIPWithAction adds an IP or CIDR to the IP policy map with the given
-// action (PASS or DROP). The action value is stored in the map and read by the
-// datapath at lookup time.
+// action (PASS or DROP) and the default priority (0).
 func (pm *MapManager) BlockIPWithAction(cidrStr string, action Action) error {
+	return pm.BlockIPWithActionPriority(cidrStr, action, 0)
+}
+
+// BlockIPWithActionPriority adds an IP or CIDR to the IP policy map with the
+// given action (PASS or DROP) and priority. The action and priority are stored
+// in the map and read by the datapath at lookup time; the highest-priority
+// matching rule wins, and an equal-priority tie between an IP rule and a port
+// rule resolves to DROP. Note the kernel's LPM trie still chooses which prefix
+// matches (longest prefix); priority only orders that match against other
+// rules.
+func (pm *MapManager) BlockIPWithActionPriority(cidrStr string, action Action, priority uint32) error {
 	ipNet, err := rules.ParseIPOrCIDR(cidrStr)
 	if err != nil {
 		return err
@@ -93,7 +104,7 @@ func (pm *MapManager) BlockIPWithAction(cidrStr string, action Action) error {
 	if err := setPresenceBit(pm.presence, rulePresenceIP); err != nil {
 		return err
 	}
-	return pm.blockedIps.Put(key, uint32(action))
+	return pm.blockedIps.Put(key, ruleValue{Action: uint32(action), Priority: priority})
 }
 
 // UnblockIP removes an IP or CIDR from the blocked IPs eBPF map.
@@ -148,7 +159,7 @@ func (pm *MapManager) IsBlocked(s string) (bool, error) {
 		return false, err
 	}
 
-	var value uint32
+	var value ruleValue
 	err = pm.blockedIps.Lookup(key, &value)
 	if err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
@@ -159,24 +170,41 @@ func (pm *MapManager) IsBlocked(s string) (bool, error) {
 	return true, nil
 }
 
-// ListBlockedIPs returns the current set of blocked prefixes as CIDR strings.
-func (pm *MapManager) ListBlockedIPs() ([]string, error) {
+// ListBlockedRules returns the current IP rules as CIDR/action/priority.
+func (pm *MapManager) ListBlockedRules() ([]server.BlockedRule, error) {
 	var (
-		prefixes []string
-		key      firewallIpv4LpmKey
-		value    uint32
+		rules []server.BlockedRule
+		key   firewallIpv4LpmKey
+		value ruleValue
 	)
 
 	iter := pm.blockedIps.Iterate()
 	for iter.Next(&key, &value) {
 		ipBytes := make(net.IP, 4)
 		binary.LittleEndian.PutUint32(ipBytes, key.Data)
-		prefixes = append(prefixes, fmt.Sprintf("%s/%d", ipBytes.String(), key.Prefixlen))
+		rules = append(rules, server.BlockedRule{
+			Cidr:     fmt.Sprintf("%s/%d", ipBytes.String(), key.Prefixlen),
+			Action:   Action(value.Action).String(),
+			Priority: value.Priority,
+		})
 	}
 	if err := iter.Err(); err != nil {
 		return nil, err
 	}
 
+	return rules, nil
+}
+
+// ListBlockedIPs returns the current set of blocked prefixes as CIDR strings.
+func (pm *MapManager) ListBlockedIPs() ([]string, error) {
+	rules, err := pm.ListBlockedRules()
+	if err != nil {
+		return nil, err
+	}
+	prefixes := make([]string, 0, len(rules))
+	for _, r := range rules {
+		prefixes = append(prefixes, r.Cidr)
+	}
 	return prefixes, nil
 }
 
@@ -184,7 +212,7 @@ func (pm *MapManager) ListBlockedIPs() ([]string, error) {
 func (pm *MapManager) Clear() error {
 	var (
 		key   firewallIpv4LpmKey
-		value uint32
+		value ruleValue
 	)
 
 	iter := pm.blockedIps.Iterate()

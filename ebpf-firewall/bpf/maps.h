@@ -17,6 +17,17 @@ enum rule_action {
     ACTION_DROP = 1,
 };
 
+/* Value stored in both rule maps. `action` is an enum rule_action; `priority`
+ * orders rules when more than one could apply to the same packet: the higher
+ * priority wins. At equal priority the datapath falls back to its original
+ * tie-breaks (most-specific-first within the port map; DROP across the IP and
+ * port maps), so the default priority 0 reproduces the pre-priority verdicts
+ * exactly. */
+struct rule_value {
+    __u32 action;    /* enum rule_action */
+    __u32 priority;  /* higher wins; 0 = default */
+};
+
 /* ── Config map ─────────────────────────────────────────────────────── */
 /* Single-entry array holding the fallback (default) policy applied when no
  * rule matches. Entry 0 of the `default_policy` sub-field is an enum
@@ -43,7 +54,7 @@ struct ipv4_lpm_key {
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __type(key, struct ipv4_lpm_key);
-    __type(value, __u32);
+    __type(value, struct rule_value);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __uint(max_entries, 65535);
 } blocked_ips SEC(".maps");
@@ -96,18 +107,20 @@ struct {
 /* ── Port policy map ────────────────────────────────────────────────── */
 /* Finer-grained rules that combine a destination IP (exact /32), a
  * protocol, a destination port and a source port. The value is a
- * rule_action (0 = PASS, 1 = DROP). The key is the natural-alignment
+ * struct rule_value (action + priority). The key is the natural-alignment
  * struct below (12 bytes: proto(1) + pad(1) + dport(2) + sport(2) +
  * dst(4)), ports kept in network byte order. 0 in protocol, dport or
- * sport means "any". The datapath performs up to four lookups per packet,
- * most-specific first:
+ * sport means "any". The datapath performs all four lookups per packet:
  *   (proto, dport, sport)  -> exact both
  *   (proto, dport, 0)      -> dport exact, sport any
  *   (proto, 0, sport)      -> dport any,  sport exact
  *   (proto, 0, 0)          -> neither restricted
- * The first key that exists in the map decides the rule action (see
- * port_rule_action in firewall.c). This makes the "0 = any" semantics
- * actually work with an exact-key hash map. */
+ * and keeps the matching rule with the highest priority. At equal priority
+ * the first (most specific) match is kept, preserving the documented
+ * most-specific-first order at the default priority 0. This makes the
+ * "0 = any" semantics work with an exact-key hash map while letting a
+ * higher-priority rule override a more specific one (see port_rule_action
+ * in firewall.c). */
 
 struct port_rule_key {
     __u8  protocol;
@@ -119,7 +132,7 @@ struct port_rule_key {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct port_rule_key);
-    __type(value, __u32);
+    __type(value, struct rule_value);
     __uint(max_entries, 65535);
 } port_policy SEC(".maps");
 

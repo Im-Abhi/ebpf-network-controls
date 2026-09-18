@@ -259,6 +259,101 @@ func TestDatapath_DropWinsOverPass(t *testing.T) {
 	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 80), testXDPPass)
 }
 
+func TestDatapath_Priority_HigherPassOverridesBroadDrop(t *testing.T) {
+	fw := loadTestFirewall(t)
+
+	// Broad DROP for the whole IP at a low priority, plus a high-priority PASS
+	// exception for tcp/22. This is the canonical use case: punch a hole in a
+	// block without widening it.
+	if err := fw.BlockIPWithActionPriority("1.2.3.4", "drop", 10); err != nil {
+		t.Fatalf("BlockIPWithActionPriority: %v", err)
+	}
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 0, "pass", 20); err != nil {
+		t.Fatalf("BlockPortRuleWithActionPriority: %v", err)
+	}
+
+	// Both rules match tcp/22; the higher-priority PASS wins.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 22), testXDPPass)
+	// Other traffic only matches the IP DROP.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 80), testXDPDrop)
+}
+
+func TestDatapath_Priority_HigherDropBeatsLowerPass(t *testing.T) {
+	fw := loadTestFirewall(t)
+
+	// Inverse: high-priority IP DROP beats a lower-priority port PASS.
+	if err := fw.BlockIPWithActionPriority("1.2.3.4", "drop", 20); err != nil {
+		t.Fatalf("BlockIPWithActionPriority: %v", err)
+	}
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 0, "pass", 5); err != nil {
+		t.Fatalf("BlockPortRuleWithActionPriority: %v", err)
+	}
+
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 22), testXDPDrop)
+}
+
+func TestDatapath_Priority_TieResolvesToDrop(t *testing.T) {
+	fw := loadTestFirewall(t)
+
+	// Equal priority, one PASS and one DROP: DROP wins regardless of which
+	// table it came from.
+	if err := fw.BlockIPWithActionPriority("1.2.3.4", "pass", 5); err != nil {
+		t.Fatalf("BlockIPWithActionPriority: %v", err)
+	}
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 0, "drop", 5); err != nil {
+		t.Fatalf("BlockPortRuleWithActionPriority: %v", err)
+	}
+
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 22), testXDPDrop)
+	// Traffic that only matches the PASS rule still passes.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 80), testXDPPass)
+}
+
+func TestDatapath_Priority_OverridesPortSpecificity(t *testing.T) {
+	fw := loadTestFirewall(t)
+	if err := fw.SetDefaultPolicy("deny"); err != nil {
+		t.Fatalf("SetDefaultPolicy: %v", err)
+	}
+
+	// A more specific rule at a lower priority must lose to a broader rule at
+	// a higher priority: exact (dst:22, sport:50000) DROP prio 1 versus
+	// wildcard dst:22 PASS prio 10.
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 50000, "drop", 1); err != nil {
+		t.Fatalf("BlockPortRuleWithActionPriority: %v", err)
+	}
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 0, "pass", 10); err != nil {
+		t.Fatalf("BlockPortRuleWithActionPriority: %v", err)
+	}
+
+	// The exact packet matches both; priority, not specificity, decides.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 50000, 22), testXDPPass)
+	// Other source ports match only the wildcard PASS.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 22), testXDPPass)
+	// Unrelated port still hits default deny.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 80), testXDPDrop)
+}
+
+func TestDatapath_PortRule_EqualPriorityKeepsSpecificity(t *testing.T) {
+	fw := loadTestFirewall(t)
+	if err := fw.SetDefaultPolicy("deny"); err != nil {
+		t.Fatalf("SetDefaultPolicy: %v", err)
+	}
+
+	// At the default priority 0 the historical most-specific-first order is
+	// unchanged: an exact PASS rule wins over a broader DROP rule for the
+	// traffic it matches (regression guard for pre-priority rulesets).
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 50000, "pass", 0); err != nil {
+		t.Fatalf("BlockPortRuleWithActionPriority(pass): %v", err)
+	}
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 0, "drop", 0); err != nil {
+		t.Fatalf("BlockPortRuleWithActionPriority(drop): %v", err)
+	}
+
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 50000, 22), testXDPPass)
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 22), testXDPDrop)
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 80), testXDPDrop)
+}
+
 func TestDatapath_NonIPv4_UsesDefault(t *testing.T) {
 	fw := loadTestFirewall(t)
 

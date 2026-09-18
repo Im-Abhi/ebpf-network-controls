@@ -10,8 +10,8 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// portRuleValue is the value stored for every entry in the port_policy map.
-// It must match enum rule_action in bpf/maps.h. ActionDrop = 1, ActionPass = 0.
+// Protocol/port sentinel values. A protocol, destination port or source port
+// of zero means "any" (see struct port_rule_key in bpf/maps.h).
 const (
 	portAnyProtocol uint8  = 0
 	portAnyPort     uint16 = 0
@@ -133,8 +133,18 @@ func (pm *PortPolicyManager) Block(dst, protocol string, dport uint16) error {
 }
 
 // BlockWithAction adds a port rule with an explicit action (PASS or DROP),
-// matching dport and sport as given (0 = any for either).
+// matching dport and sport as given (0 = any for either), at the default
+// priority (0).
 func (pm *PortPolicyManager) BlockWithAction(dst, protocol string, dport, sport uint16, action Action) error {
+	return pm.BlockWithActionPriority(dst, protocol, dport, sport, action, 0)
+}
+
+// BlockWithActionPriority adds a port rule with an explicit action and
+// priority. The datapath probes all four specificity keys for the packet and
+// keeps the matching rule with the highest priority; at equal priority the
+// most specific rule wins, so the default priority 0 reproduces the original
+// most-specific-first behaviour.
+func (pm *PortPolicyManager) BlockWithActionPriority(dst, protocol string, dport, sport uint16, action Action, priority uint32) error {
 	proto, err := protoToCode(protocol)
 	if err != nil {
 		return err
@@ -148,7 +158,7 @@ func (pm *PortPolicyManager) BlockWithAction(dst, protocol string, dport, sport 
 	if err := setPresenceBit(pm.presence, rulePresencePort); err != nil {
 		return err
 	}
-	return pm.portPolicy.Put(key, uint32(action))
+	return pm.portPolicy.Put(key, ruleValue{Action: uint32(action), Priority: priority})
 }
 
 // Unblock removes a port rule matching dst, protocol, and dport.
@@ -177,7 +187,7 @@ func (pm *PortPolicyManager) List() ([]server.PortRule, error) {
 	var (
 		rules []server.PortRule
 		key   firewallPortRuleKey
-		value uint32
+		value ruleValue
 	)
 	iter := pm.portPolicy.Iterate()
 	for iter.Next(&key, &value) {
@@ -188,7 +198,8 @@ func (pm *PortPolicyManager) List() ([]server.PortRule, error) {
 			Port:     wireToPort(key.Dport),
 			SPort:    wireToPort(key.Sport),
 			Dst:      ipBytes.String(),
-			Action:   Action(value).String(),
+			Action:   Action(value.Action).String(),
+			Priority: value.Priority,
 		})
 	}
 	if err := iter.Err(); err != nil {
@@ -201,7 +212,7 @@ func (pm *PortPolicyManager) List() ([]server.PortRule, error) {
 func (pm *PortPolicyManager) Clear() error {
 	var (
 		key   firewallPortRuleKey
-		value uint32
+		value ruleValue
 	)
 	iter := pm.portPolicy.Iterate()
 	for iter.Next(&key, &value) {

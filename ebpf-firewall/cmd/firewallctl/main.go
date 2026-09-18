@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	args, sockPath, protocol, action, portUint, sportUint, err := extractOptions(os.Args[1:])
+	args, sockPath, protocol, action, portUint, sportUint, priorityUint, err := extractOptions(os.Args[1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "firewallctl: %v\n", err)
 		os.Exit(2)
@@ -25,6 +25,7 @@ func main() {
 
 	port := uint16(portUint)
 	sport := uint16(sportUint)
+	priority := uint32(priorityUint)
 
 	cmd := args[0]
 
@@ -35,7 +36,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "firewallctl: %s requires an IP/CIDR argument\n", cmd)
 			os.Exit(2)
 		}
-		req = server.Request{Command: server.Command(cmd), Value: args[1], Protocol: protocol, Port: port, SPort: sport, Action: action}
+		req = server.Request{Command: server.Command(cmd), Value: args[1], Protocol: protocol, Port: port, SPort: sport, Action: action, Priority: priority}
 	case "list":
 		req = server.Request{Command: server.CmdList}
 	case "listports":
@@ -76,7 +77,7 @@ func main() {
 // positional argument, which made the documented form
 // `block <ip> --protocol tcp --dport 22` silently ignore the options.
 // Returns the remaining positional arguments.
-func extractOptions(raw []string) (args []string, sockPath, protocol, action string, port, sport uint, err error) {
+func extractOptions(raw []string) (args []string, sockPath, protocol, action string, port, sport, priority uint, err error) {
 	sockPath = "/var/run/ebpf-firewall.sock"
 
 	for i := 0; i < len(raw); i++ {
@@ -87,7 +88,7 @@ func extractOptions(raw []string) (args []string, sockPath, protocol, action str
 			os.Exit(0)
 		case arg == "-sock" || arg == "--sock":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", 0, 0, fmt.Errorf("%s requires a path", arg)
+				return nil, "", "", "", 0, 0, 0, fmt.Errorf("%s requires a path", arg)
 			}
 			i++
 			sockPath = raw[i]
@@ -97,7 +98,7 @@ func extractOptions(raw []string) (args []string, sockPath, protocol, action str
 			sockPath = strings.TrimPrefix(arg, "--sock=")
 		case arg == "-protocol" || arg == "--protocol":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", 0, 0, fmt.Errorf("%s requires a value (tcp or udp)", arg)
+				return nil, "", "", "", 0, 0, 0, fmt.Errorf("%s requires a value (tcp or udp)", arg)
 			}
 			i++
 			protocol = raw[i]
@@ -107,7 +108,7 @@ func extractOptions(raw []string) (args []string, sockPath, protocol, action str
 			protocol = strings.TrimPrefix(arg, "--protocol=")
 		case arg == "-action" || arg == "--action":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", 0, 0, fmt.Errorf("%s requires a value (pass or drop)", arg)
+				return nil, "", "", "", 0, 0, 0, fmt.Errorf("%s requires a value (pass or drop)", arg)
 			}
 			i++
 			action = raw[i]
@@ -115,52 +116,71 @@ func extractOptions(raw []string) (args []string, sockPath, protocol, action str
 			action = strings.TrimPrefix(arg, "-action=")
 		case strings.HasPrefix(arg, "--action="):
 			action = strings.TrimPrefix(arg, "--action=")
+		case arg == "-priority" || arg == "--priority":
+			if i+1 >= len(raw) {
+				return nil, "", "", "", 0, 0, 0, fmt.Errorf("%s requires a numeric value (0-4294967295)", arg)
+			}
+			i++
+			priority, err = parsePriority(raw[i], "-priority")
+			if err != nil {
+				return nil, "", "", "", 0, 0, 0, err
+			}
+		case strings.HasPrefix(arg, "-priority="):
+			priority, err = parsePriority(strings.TrimPrefix(arg, "-priority="), "-priority")
+			if err != nil {
+				return nil, "", "", "", 0, 0, 0, err
+			}
+		case strings.HasPrefix(arg, "--priority="):
+			priority, err = parsePriority(strings.TrimPrefix(arg, "--priority="), "-priority")
+			if err != nil {
+				return nil, "", "", "", 0, 0, 0, err
+			}
 		case arg == "-dport" || arg == "--dport":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", 0, 0, fmt.Errorf("%s requires a numeric value (0-65535)", arg)
+				return nil, "", "", "", 0, 0, 0, fmt.Errorf("%s requires a numeric value (0-65535)", arg)
 			}
 			i++
 			port, err = parsePort(raw[i], "-dport")
 			if err != nil {
-				return nil, "", "", "", 0, 0, err
+				return nil, "", "", "", 0, 0, 0, err
 			}
 		case strings.HasPrefix(arg, "-dport="):
 			port, err = parsePort(strings.TrimPrefix(arg, "-dport="), "-dport")
 			if err != nil {
-				return nil, "", "", "", 0, 0, err
+				return nil, "", "", "", 0, 0, 0, err
 			}
 		case strings.HasPrefix(arg, "--dport="):
 			port, err = parsePort(strings.TrimPrefix(arg, "--dport="), "-dport")
 			if err != nil {
-				return nil, "", "", "", 0, 0, err
+				return nil, "", "", "", 0, 0, 0, err
 			}
 		case arg == "-sport" || arg == "--sport":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", 0, 0, fmt.Errorf("%s requires a numeric value (0-65535)", arg)
+				return nil, "", "", "", 0, 0, 0, fmt.Errorf("%s requires a numeric value (0-65535)", arg)
 			}
 			i++
 			sport, err = parsePort(raw[i], "-sport")
 			if err != nil {
-				return nil, "", "", "", 0, 0, err
+				return nil, "", "", "", 0, 0, 0, err
 			}
 		case strings.HasPrefix(arg, "-sport="):
 			sport, err = parsePort(strings.TrimPrefix(arg, "-sport="), "-sport")
 			if err != nil {
-				return nil, "", "", "", 0, 0, err
+				return nil, "", "", "", 0, 0, 0, err
 			}
 		case strings.HasPrefix(arg, "--sport="):
 			sport, err = parsePort(strings.TrimPrefix(arg, "--sport="), "-sport")
 			if err != nil {
-				return nil, "", "", "", 0, 0, err
+				return nil, "", "", "", 0, 0, 0, err
 			}
 		case strings.HasPrefix(arg, "-"):
-			return nil, "", "", "", 0, 0, fmt.Errorf("unknown option %q", arg)
+			return nil, "", "", "", 0, 0, 0, fmt.Errorf("unknown option %q", arg)
 		default:
 			args = append(args, arg)
 		}
 	}
 
-	return args, sockPath, protocol, action, port, sport, nil
+	return args, sockPath, protocol, action, port, sport, priority, nil
 }
 
 // parsePort validates a -dport/-sport value, which must fit in a uint16.
@@ -168,6 +188,15 @@ func parsePort(s, flagName string) (uint, error) {
 	n, err := strconv.ParseUint(s, 10, 16)
 	if err != nil {
 		return 0, fmt.Errorf("invalid %s %q (must be 0-65535)", flagName, s)
+	}
+	return uint(n), nil
+}
+
+// parsePriority validates a -priority value, which must fit in a uint32.
+func parsePriority(s, flagName string) (uint, error) {
+	n, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q (must be 0-4294967295)", flagName, s)
 	}
 	return uint(n), nil
 }
@@ -210,17 +239,23 @@ func printResponse(resp server.Response) {
 		fmt.Println("port rules:")
 		for _, r := range resp.PortRules {
 			if r.SPort != 0 {
-				fmt.Printf("  %s/%d (sport %d) -> %s [%s]\n", r.Protocol, r.Port, r.SPort, r.Dst, r.Action)
+				fmt.Printf("  %s/%d (sport %d) -> %s [%s] prio %d\n", r.Protocol, r.Port, r.SPort, r.Dst, r.Action, r.Priority)
 			} else {
-				fmt.Printf("  %s/%d -> %s [%s]\n", r.Protocol, r.Port, r.Dst, r.Action)
+				fmt.Printf("  %s/%d -> %s [%s] prio %d\n", r.Protocol, r.Port, r.Dst, r.Action, r.Priority)
 			}
 		}
-	case resp.Blocked != nil:
+	case resp.Blocked != nil || resp.BlockedRules != nil:
 		if resp.Count == 0 {
 			fmt.Println("no blocked addresses")
 			return
 		}
 		fmt.Printf("blocked (%d):\n", resp.Count)
+		if len(resp.BlockedRules) > 0 {
+			for _, r := range resp.BlockedRules {
+				fmt.Printf("  %s [%s] prio %d\n", r.Cidr, r.Action, r.Priority)
+			}
+			return
+		}
 		for _, cidr := range resp.Blocked {
 			fmt.Printf("  %s\n", cidr)
 		}
@@ -264,11 +299,13 @@ func formatBytes(b uint64) string {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `Usage: firewallctl [-sock path] [-protocol p] [-dport n] [-sport n] [-action a] <command> [args]
+	fmt.Fprintf(os.Stderr, `Usage: firewallctl [-sock path] [-protocol p] [-dport n] [-sport n] [-action a] [-priority n] <command> [args]
 
 Options may appear before or after the command, e.g.
   firewallctl block 1.2.3.4 --protocol tcp --dport 22
   firewallctl --dport 443 --protocol udp --sport 12345 unblock 1.2.3.4
+  firewallctl block 10.0.0.0/8 --action drop --priority 100
+  firewallctl block 10.0.0.1 --action pass --priority 200
 
 Commands:
   status                 show firewall status
@@ -287,5 +324,9 @@ Options:
   -dport n         destination port for a port rule
   -sport n         source port for a port rule (0 = any source port)
   -action a        rule action: pass or drop (default drop)
+  -priority n      rule priority (0-4294967295, default 0); among rules that
+                   match a packet the highest priority wins. At equal
+                   priority the more specific port rule wins and a tie
+                   between an IP rule and a port rule resolves to drop
 `)
 }

@@ -23,16 +23,28 @@ type Request struct {
 	Port     uint16  `json:"port,omitempty"`
 	SPort    uint16  `json:"sport,omitempty"`
 	Action   string  `json:"action,omitempty"`
+	Priority uint32  `json:"priority,omitempty"`
 }
 
 // PortRule is a protocol+port+destination rule as returned by the server.
-// Action is the per-rule verdict ("pass" or "drop").
+// Action is the per-rule verdict ("pass" or "drop"); Priority orders rules
+// that could match the same packet (higher wins; at equal priority the more
+// specific port rule wins, and a tie against an IP rule resolves to DROP).
 type PortRule struct {
 	Protocol string `json:"protocol,omitempty"`
 	Port     uint16 `json:"port,omitempty"`
 	SPort    uint16 `json:"sport,omitempty"`
 	Dst      string `json:"dst"`
 	Action   string `json:"action"`
+	Priority uint32 `json:"priority,omitempty"`
+}
+
+// BlockedRule is a CIDR rule as returned by the server, including its action
+// and priority.
+type BlockedRule struct {
+	Cidr     string `json:"cidr"`
+	Action   string `json:"action"`
+	Priority uint32 `json:"priority"`
 }
 
 // Stats holds aggregated global packet and byte counters.
@@ -47,14 +59,15 @@ type Stats struct {
 
 // Response is the JSON reply sent back to the client.
 type Response struct {
-	OK        bool       `json:"ok"`
-	Error     string     `json:"error,omitempty"`
-	Blocked   []string   `json:"blocked,omitempty"`
-	Count     int        `json:"count,omitempty"`
-	Iface     string     `json:"interface,omitempty"`
-	Attached  bool       `json:"attached,omitempty"`
-	Stats     *Stats     `json:"stats,omitempty"`
-	PortRules []PortRule `json:"port_rules,omitempty"`
-	Default   string     `json:"default_policy,omitempty"`
-	AttachMode string    `json:"attach_mode,omitempty"`
+	OK           bool          `json:"ok"`
+	Error        string        `json:"error,omitempty"`
+	Blocked      []string      `json:"blocked,omitempty"`
+	BlockedRules []BlockedRule `json:"blocked_rules,omitempty"`
+	Count        int           `json:"count,omitempty"`
+	Iface        string        `json:"interface,omitempty"`
+	Attached     bool          `json:"attached,omitempty"`
+	Stats        *Stats        `json:"stats,omitempty"`
+	PortRules    []PortRule    `json:"port_rules,omitempty"`
+	Default      string        `json:"default_policy,omitempty"`
+	AttachMode   string        `json:"attach_mode,omitempty"`
 }

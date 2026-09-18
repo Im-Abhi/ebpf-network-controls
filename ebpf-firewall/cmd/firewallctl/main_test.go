@@ -6,8 +6,8 @@ import (
 )
 
 func TestExtractOptions_FlagsAfterCommand(t *testing.T) {
-	args, sock, proto, action, port, sport, err := extractOptions(
-		[]string{"block", "10.153.245.175", "--protocol", "tcp", "--dport", "22", "--sport", "50000", "--action", "pass"},
+	args, sock, proto, action, port, sport, priority, err := extractOptions(
+		[]string{"block", "10.153.245.175", "--protocol", "tcp", "--dport", "22", "--sport", "50000", "--action", "pass", "--priority", "100"},
 	)
 	if err != nil {
 		t.Fatalf("extractOptions: %v", err)
@@ -24,10 +24,13 @@ func TestExtractOptions_FlagsAfterCommand(t *testing.T) {
 	if action != "pass" {
 		t.Errorf("action = %q, want pass", action)
 	}
+	if priority != 100 {
+		t.Errorf("priority = %d, want 100", priority)
+	}
 }
 
 func TestExtractOptions_FlagsBeforeCommand(t *testing.T) {
-	args, _, proto, action, port, sport, err := extractOptions(
+	args, _, proto, action, port, sport, _, err := extractOptions(
 		[]string{"-protocol", "udp", "-dport", "53", "-sport", "1234", "block", "1.2.3.4"},
 	)
 	if err != nil {
@@ -45,8 +48,8 @@ func TestExtractOptions_FlagsBeforeCommand(t *testing.T) {
 }
 
 func TestExtractOptions_EqualsForms(t *testing.T) {
-	args, sock, proto, action, port, sport, err := extractOptions(
-		[]string{"block", "1.2.3.4", "--protocol=tcp", "--dport=8080", "--sport=40000", "--action=drop", "-sock=/tmp/fw.sock"},
+	args, sock, proto, action, port, sport, priority, err := extractOptions(
+		[]string{"block", "1.2.3.4", "--protocol=tcp", "--dport=8080", "--sport=40000", "--action=drop", "-sock=/tmp/fw.sock", "--priority=42"},
 	)
 	if err != nil {
 		t.Fatalf("extractOptions: %v", err)
@@ -63,10 +66,13 @@ func TestExtractOptions_EqualsForms(t *testing.T) {
 	if action != "drop" {
 		t.Errorf("action = %q, want drop", action)
 	}
+	if priority != 42 {
+		t.Errorf("priority = %d, want 42", priority)
+	}
 }
 
 func TestExtractOptions_PlainCommand(t *testing.T) {
-	args, _, proto, action, port, sport, err := extractOptions([]string{"listports"})
+	args, _, proto, action, port, sport, _, err := extractOptions([]string{"listports"})
 	if err != nil {
 		t.Fatalf("extractOptions: %v", err)
 	}
@@ -87,11 +93,34 @@ func TestExtractOptions_Errors(t *testing.T) {
 		{"block", "1.2.3.4", "--dport", "oops"},  // not a number
 		{"block", "1.2.3.4", "--sport", "70000"}, // > 65535
 		{"block", "1.2.3.4", "--action"},         // missing value
+		{"block", "1.2.3.4", "--priority"},       // missing value
+		{"block", "1.2.3.4", "--priority", "x"},  // not a number
+		{"block", "1.2.3.4", "--priority", "4294967296"}, // > uint32
 		{"block", "1.2.3.4", "--bogus"},          // unknown option
 	}
 	for _, raw := range tests {
-		if _, _, _, _, _, _, err := extractOptions(raw); err == nil {
+		if _, _, _, _, _, _, _, err := extractOptions(raw); err == nil {
 			t.Errorf("extractOptions(%v): expected error, got nil", raw)
+		}
+	}
+}
+
+func TestParsePriority(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want uint
+	}{
+		{"0", 0},
+		{"100", 100},
+		{"4294967295", 4294967295},
+	} {
+		if p, err := parsePriority(tc.in, "-priority"); err != nil || p != tc.want {
+			t.Errorf("parsePriority(%q) = %d, %v; want %d", tc.in, p, err, tc.want)
+		}
+	}
+	for _, bad := range []string{"", "-1", "4294967296", "abc"} {
+		if _, err := parsePriority(bad, "-priority"); err == nil {
+			t.Errorf("parsePriority(%q): expected error, got nil", bad)
 		}
 	}
 }

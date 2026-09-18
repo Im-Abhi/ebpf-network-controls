@@ -70,14 +70,21 @@ func (f *Firewall) BlockIP(cidr string) error {
 	return nil
 }
 
-// BlockIPWithAction adds an IP or CIDR rule with an explicit action.
+// BlockIPWithAction adds an IP or CIDR rule with an explicit action and the
+// default priority (0).
 func (f *Firewall) BlockIPWithAction(cidr, actionStr string) error {
+	return f.BlockIPWithActionPriority(cidr, actionStr, 0)
+}
+
+// BlockIPWithActionPriority adds an IP or CIDR rule with an explicit action
+// and priority.
+func (f *Firewall) BlockIPWithActionPriority(cidr, actionStr string, priority uint32) error {
 	action, err := ParseAction(actionStr)
 	if err != nil {
 		return err
 	}
-	if err := f.mgr.BlockIPWithAction(cidr, action); err != nil {
-		return fmt.Errorf("adding %q with action %s: %w", cidr, action, err)
+	if err := f.mgr.BlockIPWithActionPriority(cidr, action, priority); err != nil {
+		return fmt.Errorf("adding %q with action %s priority %d: %w", cidr, action, priority, err)
 	}
 	return nil
 }
@@ -100,6 +107,11 @@ func (f *Firewall) ListBlockedIPs() ([]string, error) {
 	return f.mgr.ListBlockedIPs()
 }
 
+// ListBlockedRules returns the current IP rules with their action and priority.
+func (f *Firewall) ListBlockedRules() ([]server.BlockedRule, error) {
+	return f.mgr.ListBlockedRules()
+}
+
 // Clear removes every blocked prefix.
 func (f *Firewall) Clear() error {
 	return f.mgr.Clear()
@@ -119,14 +131,21 @@ func (f *Firewall) BlockPortRule(dst, protocol string, dport, sport uint16) erro
 	return nil
 }
 
-// BlockPortRuleWithAction adds a port rule with an explicit action.
+// BlockPortRuleWithAction adds a port rule with an explicit action and the
+// default priority (0).
 func (f *Firewall) BlockPortRuleWithAction(dst, protocol string, dport, sport uint16, actionStr string) error {
+	return f.BlockPortRuleWithActionPriority(dst, protocol, dport, sport, actionStr, 0)
+}
+
+// BlockPortRuleWithActionPriority adds a port rule with an explicit action and
+// priority.
+func (f *Firewall) BlockPortRuleWithActionPriority(dst, protocol string, dport, sport uint16, actionStr string, priority uint32) error {
 	action, err := ParseAction(actionStr)
 	if err != nil {
 		return err
 	}
-	if err := f.portPolicyMgr.BlockWithAction(dst, protocol, dport, sport, action); err != nil {
-		return fmt.Errorf("adding port rule %s/%d (sport %d) to %s with action %s: %w", protocol, dport, sport, dst, action, err)
+	if err := f.portPolicyMgr.BlockWithActionPriority(dst, protocol, dport, sport, action, priority); err != nil {
+		return fmt.Errorf("adding port rule %s/%d (sport %d) to %s with action %s priority %d: %w", protocol, dport, sport, dst, action, priority, err)
 	}
 	return nil
 }
