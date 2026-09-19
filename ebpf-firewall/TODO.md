@@ -36,7 +36,9 @@ MTP2+ are the thesis-level extensions built on top of it.
 - [x] Configurable default policy (ALLOW / DENY) via `firewallctl default`
 - [x] Packet-level tests (BPF_PROG_TEST_RUN: blocked → DROP, allowed → PASS, CIDR → DROP, port → DROP, src-port → DROP, specificity, PASS overrides default-deny, DROP wins)
 - [ ] Port-based filtering with CIDR networks (currently exact `/32` only)
-- [ ] Rule priority (deterministic winner when rules overlap)
+- [x] Rule priority (deterministic winner when rules overlap; highest wins,
+      ties: most-specific-first within the port table, IP-vs-port → DROP;
+      `IP+priority` in `ldm_bindings.h`) — pending `make integration-test` on Linux
 - [ ] Direction-aware rules (INGRESS / EGRESS)
 
 ### MTP1-F: Fast-path optimization
@@ -54,9 +56,21 @@ MTP2+ are the thesis-level extensions built on top of it.
 
 ### MTP1-D: Stateful firewall
 
-- [ ] Flow / connection state tracking
-- [ ] NEW / ESTABLISHED / FIN / CLOSED states
-- [ ] Allow established, block unexpected inbound
+- [x] Flow / connection state tracking (TCP-only `conntrack` hash map,
+      `bpf/maps.h`; key = 5-tuple, value = `last_seen` + state)
+- [x] NEW / ESTABLISHED / FIN / CLOSED states (`enum ct_state`; transitions in
+      `ct_update`: first accepted SYN → NEW, ACK on NEW → ESTABLISHED,
+      FIN/RST → CLOSED, mid-stream accepted packet → ESTABLISHED)
+- [x] Allow established, block unexpected inbound (established flow passes
+      under default-deny when no rule matches)
+- [x] State written only after PASS (a dropped SYN creates nothing, so a
+      spoofed ACK cannot fabricate ESTABLISHED); map consulted only under
+      default-deny
+- [x] Userspace reaper (`cmd/firewall -ct-timeout`, default 5m) ages out idle
+      flows from the plain hash map
+- [x] `firewallctl conntrack` listing; `clear` also clears conntrack
+- [ ] Verify `make test` / `make integration-test` on a clean Linux checkout
+      (incl. the new datapath conntrack scenarios + manager tests)
 
 ### MTP1-E: Benchmarking module (separate from firewall)
 
@@ -78,7 +92,8 @@ MTP2+ are the thesis-level extensions built on top of it.
       `20260914-151138` and the TCP-invalid `20260914-230211`). Includes a
       derived CPU-cost-per-million-packets metric in `plot.py`.
 - [ ] IS_UPLOAD ⇄ future `-R` / download comparisons documented in `benchmark/README.md`
-- [ ] Rerun unchanged after stateful firewall; document feature cost
+- [ ] Rerun unchanged after the priority + stateful changes; document feature
+      cost in `benchmark/README.md`
 - [x] Results documentation — `benchmark/README.md` "Benchmark results" section
       (capture `20260914-234855`; medians + drop-path counter parity + derived
       CPU-per-M-pkts table)

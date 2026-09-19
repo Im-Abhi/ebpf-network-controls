@@ -43,8 +43,8 @@ These use in-memory fakes and never touch the kernel:
 | --- | --- |
 | `control/rules` | CIDR/IP parsing and validation |
 | `control/ebpf` | map managers with stubbed maps: blocklist (exact + LPM + overlap + clear), port rules, action/config parsing |
-| `control/server` | socket protocol + command dispatch against a fake `Policy`: `block`/`unblock`/`list`/`clear`/`stats`/`default`/`--action`, error propagation, socket lifecycle |
-| `cmd/firewallctl` | option parsing anywhere in the argument list (`-sock`, `--protocol`, `--dport`, `--sport`, `--action`, `key=value` forms) and port validation |
+| `control/server` | socket protocol + command dispatch against a fake `Policy`: `block`/`unblock`/`list`/`clear`/`stats`/`default`/`conntrack`/`--action`/`--priority`, conntrack listing, error propagation, socket lifecycle |
+| `cmd/firewallctl` | option parsing anywhere in the argument list (`-sock`, `--protocol`, `--dport`, `--sport`, `--action`, `--priority`, `key=value` forms) and port/priority validation |
 
 ---
 
@@ -63,12 +63,15 @@ datapath** — not just Go map writes. Groups:
   list/clear, invalid inputs, key encoding/BTF size.
 - `portpolicy_integration_test.go` — port-rule block/list/unblock/clear
   round-trip against a real hash map, invalid inputs.
+- `conntrack_integration_test.go` — `ConntrackManager` List/Clear/Reap against a
+  standalone 16-byte-key / 16-byte-value hash map (ages, stale reaping), using
+  the same clock the datapath's `last_seen` is built on.
 
 ### Datapath tests — `datapath_integration_test.go`
 Builds **raw Ethernet/IPv4/TCP/UDP frames** and injects them through
 `BPF_PROG_TEST_RUN` (`prog.Run`), asserting the returned XDP verdict and counter
 deltas. The program is loaded on `lo` but **not attached** — no real traffic,
-fully deterministic. The 12 scenarios:
+fully deterministic. The 23 scenarios:
 
 | Test | Asserts |
 | --- | --- |
@@ -81,6 +84,17 @@ fully deterministic. The 12 scenarios:
 | `TestDatapath_PortRule_Specifity` | when a `(dport, sport)` DROP rule and a `(dport)` PASS rule overlap, the exact src-port match wins |
 | `TestDatapath_PassRule_OverridesDefaultDeny` | a matched `--action pass` rule allows traffic even under default-deny |
 | `TestDatapath_DropWinsOverPass` | a DROP port rule beats a PASS IP rule on the same packet |
+| `TestDatapath_Priority_HigherPassOverridesBroadDrop` | higher-priority PASS beats a broad lower-priority DROP |
+| `TestDatapath_Priority_HigherDropBeatsLowerPass` | higher-priority DROP beats a broader PASS |
+| `TestDatapath_Priority_TieResolvesToDrop` | equal-priority IP vs port overlap → DROP |
+| `TestDatapath_Priority_OverridesPortSpecificity` | higher priority beats a more-specific lower-priority rule |
+| `TestDatapath_PortRule_EqualPriorityKeepsSpecificity` | equal-priority port overlap keeps most-specific-first matching |
+| `TestDatapath_Conntrack_SpoofedAckCreatesNoState` | a dropped SYN writes no state; spoofed ACK still denied and untracked |
+| `TestDatapath_Conntrack_EstablishedFlowPassesAfterRuleRemoved` | SYN→NEW, ACK→ESTABLISHED, rule removed, flow still passes via state; other flows denied |
+| `TestDatapath_Conntrack_FinClosesFlow` | FIN→CLOSED; a later packet on the closed flow is denied |
+| `TestDatapath_Conntrack_MidStreamRuleAcceptMarksEstablished` | mid-stream ACK accepted by a rule is recorded as ESTABLISHED |
+| `TestDatapath_Conntrack_NotTrackedUnderDefaultAllow` | default-allow consults/never writes the conntrack map |
+| `TestDatapath_Conntrack_TcpOnlyUnderDefaultDeny` | denied UDP traffic leaves no state (TCP-only) |
 | `TestDatapath_NonIPv4_UsesDefault` | ARP follows the default policy |
 | `TestDatapath_Malformed_UsesDefault` | truncated/unparseable frames follow the default policy |
 | `TestDatapath_CountersTrackDropsAndPasses` | total/drop/pass counters increment |
@@ -115,11 +129,19 @@ sudo ./bin/firewallctl listports               # port rules with [pass]/[drop]
 sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 22
 sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 22 --action pass
 sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 22 --sport 50000   # src-port-scoped rule
-sudo ./bin/firewallctl listports               # shows tcp/22 (sport 50000) -> 1.2.3.4
+sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 22 --priority 100  # explicit priority
+sudo ./bin/firewallctl listports               # shows tcp/22 (sport 50000) -> 1.2.3.4 [drop] prio 100
 sudo ./bin/firewallctl default deny            # fallback policy on no match
-sudo ./bin/firewallctl clear                   # wipes IP blocklist + port rules
+sudo ./bin/firewallctl conntrack               # live TCP flow table (NEW/ESTABLISHED/CLOSED)
+sudo ./bin/firewallctl clear                   # wipes IP blocklist + port rules + conntrack
 sudo ./bin/firewallctl stats                   # total / drop / pass counters
 ```
+
+A daemon reaper ages idle conntrack entries out by default (`-ct-timeout 5m` in
+`bin/firewall`; `-ct-timeout 0` disables it). To watch the stateful path live,
+allowed a TCP connection (e.g. `ssh` to a host with a `--action pass` rule),
+then `firewallctl default deny` before stopping it and reconnecting — the
+established flow should keep working while a fresh connection is dropped.
 
 > Alert: the default interface is your **Wi-Fi** (`wlp0s20f3`). A `default deny` or a
 > block rule matching your own IP will cut your own inbound traffic — run policy

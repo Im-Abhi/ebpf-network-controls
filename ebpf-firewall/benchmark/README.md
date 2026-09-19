@@ -374,6 +374,11 @@ be quoted either.
 - Record the kernel version and `uname -r` alongside runs (the summary header
   does not include it yet — add it to your notes/column header for the thesis).
 - Run the same harness against the current datapath to get the **baseline**, and
-  rerun it **unchanged** after stateful conntrack to quantify the feature cost
-  (Baseline XDP vs nftables → Final enhanced XDP vs nftables).
+  rerun it **unchanged** after the priority + stateful (conntrack) features to
+  quantify the added per-packet cost (Baseline XDP vs nftables → Final enhanced
+  XDP vs nftables). The conntrack fast-path is skipped entirely under
+  default-allow and adds only a read+write of one hash entry per accepted TCP
+  packet under default-deny; the userspace reaper never runs in the iperf3
+  measurement window (5 min timeout ≫ 10 s passes), so benchmark cells are
+  unaffected by aging.
 - Prefer a CPU-pinned machine or idle host for low-jitter numbers.
