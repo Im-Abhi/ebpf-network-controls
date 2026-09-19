@@ -13,6 +13,7 @@ const (
 	CmdListPorts  Command = "listports"
 	CmdSetDefault Command = "setdefault"
 	CmdDefault    Command = "default"
+	CmdConntrack  Command = "conntrack"
 )
 
 // Request is a single JSON command received over the control socket.
@@ -47,6 +48,19 @@ type BlockedRule struct {
 	Priority uint32 `json:"priority"`
 }
 
+// ConntrackEntry is a tracked TCP flow as returned by the server. State is
+// one of "new", "established", or "closed"; AgeSeconds is the time since the
+// last accepted packet on the flow.
+type ConntrackEntry struct {
+	Src        string  `json:"src"`
+	Dst        string  `json:"dst"`
+	Sport      uint16  `json:"sport"`
+	Dport      uint16  `json:"dport"`
+	Protocol   string  `json:"protocol"`
+	State      string  `json:"state"`
+	AgeSeconds float64 `json:"age_seconds"`
+}
+
 // Stats holds aggregated global packet and byte counters.
 type Stats struct {
 	TotalPackets uint64 `json:"total_packets"`
@@ -67,7 +81,8 @@ type Response struct {
 	Iface        string        `json:"interface,omitempty"`
 	Attached     bool          `json:"attached,omitempty"`
 	Stats        *Stats        `json:"stats,omitempty"`
-	PortRules    []PortRule    `json:"port_rules,omitempty"`
-	Default      string        `json:"default_policy,omitempty"`
-	AttachMode   string        `json:"attach_mode,omitempty"`
+	PortRules    []PortRule       `json:"port_rules,omitempty"`
+	Conntrack    []ConntrackEntry `json:"conntrack,omitempty"`
+	Default      string           `json:"default_policy,omitempty"`
+	AttachMode   string           `json:"attach_mode,omitempty"`
 }

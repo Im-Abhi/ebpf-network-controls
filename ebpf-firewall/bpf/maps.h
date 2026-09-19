@@ -8,6 +8,9 @@
 #ifndef BPF_F_NO_PREALLOC
 #define BPF_F_NO_PREALLOC (1U << 0)
 #endif
+#ifndef BPF_ANY
+#define BPF_ANY 0
+#endif
 
 /* ── Rule actions ───────────────────────────────────────────────────── */
 /* Values stored in rule maps encode the action to take on a match. These
@@ -135,5 +138,55 @@ struct {
     __type(value, struct rule_value);
     __uint(max_entries, 65535);
 } port_policy SEC(".maps");
+
+/* ── Conntrack map ──────────────────────────────────────────────────── */
+/* TCP-only state table consulted only when the default policy is DENY, so
+ * return traffic of an accepted connection keeps passing without a stateless
+ * rule for every direction. Under default-allow the map is neither read nor
+ * written (unmatched traffic already passes, so state would add cost for no
+ * verdict change).
+ *
+ * Lifecycle (see ct_update in firewall.c): an entry is written ONLY after a
+ * packet has been accepted, so a dropped SYN can never create state (a
+ * spoofed ACK must not be able to fabricate an ESTABLISHED flow).
+ *   first accepted SYN        -> NEW
+ *   ACK accepted on a NEW flow-> ESTABLISHED
+ *   FIN or RST accepted       -> CLOSED
+ *   any accepted packet       -> last_seen refresh
+ * Entries live in a plain (non-LRU) hash so the daemon can age them out
+ * deterministically; cmd/firewall runs a periodic reaper keyed on last_seen
+ * (control/ebpf/conntrack.go). A CLOSED entry never matches the established
+ * fast-path and is removed by the reaper.
+ *
+ * The key/value layouts are mirrored, field for field, by ctKey/ctValue in
+ * control/ebpf/values.go and must stay in sync. The explicit trailing pad
+ * fields keep the byte layout identical between C and Go. */
+enum ct_state {
+    CT_NEW         = 1,
+    CT_ESTABLISHED = 2,
+    CT_CLOSED      = 3,
+};
+
+struct ct_key {
+    __u32 saddr;     /* network byte order */
+    __u32 daddr;     /* network byte order */
+    __u16 sport;     /* network byte order */
+    __u16 dport;     /* network byte order */
+    __u8  protocol;  /* IPPROTO_TCP */
+    __u8  _pad[3];   /* explicit padding: deterministic across C and Go */
+};
+
+struct ct_value {
+    __u64 last_seen; /* bpf_ktime_get_ns() at the last accepted packet */
+    __u32 state;     /* enum ct_state */
+    __u32 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct ct_key);
+    __type(value, struct ct_value);
+    __uint(max_entries, 65536);
+} conntrack SEC(".maps");
 
 #endif

@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"fmt"
 	"net"
 	"testing"
 
@@ -13,6 +14,14 @@ import (
 const (
 	testXDPDrop = 1
 	testXDPPass = 2
+)
+
+// TCP flag bits, matching the datapath masks in bpf/firewall.c.
+const (
+	tcpFlagFIN byte = 0x01
+	tcpFlagSYN byte = 0x02
+	tcpFlagRST byte = 0x04
+	tcpFlagACK byte = 0x10
 )
 
 // These tests exercise the real datapath (bpf/firewall.c) by injecting packets
@@ -81,14 +90,18 @@ func ipv4Header(src, dst net.IP, proto uint8, l4len int) []byte {
 }
 
 func tcpHeader(sport, dport uint16) []byte {
+	// Default to a SYN, the historical handshake opener.
+	return tcpHeaderFlags(sport, dport, tcpFlagSYN)
+}
+
+func tcpHeaderFlags(sport, dport uint16, flags byte) []byte {
 	h := make([]byte, 20)
 	h[0] = byte(sport >> 8)
 	h[1] = byte(sport)
 	h[2] = byte(dport >> 8)
 	h[3] = byte(dport)
 	h[12] = 0x50 // data offset 5
-	// flags: SYN
-	h[13] = 0x02
+	h[13] = flags
 	return h
 }
 
@@ -104,10 +117,14 @@ func udpHeader(sport, dport uint16) []byte {
 }
 
 func v4Packet(src, dst net.IP, proto uint8, sport, dport uint16) []byte {
+	return v4PacketFlags(src, dst, proto, sport, dport, tcpFlagSYN)
+}
+
+func v4PacketFlags(src, dst net.IP, proto uint8, sport, dport uint16, flags byte) []byte {
 	var l4 []byte
 	switch proto {
 	case 6: // TCP
-		l4 = tcpHeader(sport, dport)
+		l4 = tcpHeaderFlags(sport, dport, flags)
 	case 17: // UDP
 		l4 = udpHeader(sport, dport)
 	}
@@ -123,6 +140,28 @@ func ip(s string) net.IP {
 
 func tcpPkt(src, dst string, sport, dport uint16) []byte {
 	return v4Packet(ip(src), ip(dst), 6, sport, dport)
+}
+
+func tcpPktFlags(src, dst string, sport, dport uint16, flags byte) []byte {
+	return v4PacketFlags(ip(src), ip(dst), 6, sport, dport, flags)
+}
+
+// ctStates parses the manager's listing into a map of "sport:dport" -> state
+// for unambiguous assertions on the standard 5-tuples used in these tests.
+func ctStates(t *testing.T, fw *Firewall) map[string]string {
+	t.Helper()
+	entries, err := fw.ListConntrack()
+	if err != nil {
+		t.Fatalf("ListConntrack: %v", err)
+	}
+	byFlow := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if e.Protocol != "tcp" {
+			t.Fatalf("conntrack entry with protocol %q, want tcp only: %+v", e.Protocol, e)
+		}
+		byFlow[fmt.Sprintf("%d:%d", e.Sport, e.Dport)] = e.State
+	}
+	return byFlow
 }
 
 func udpPkt(src, dst string, sport, dport uint16) []byte {
@@ -388,6 +427,118 @@ func TestDatapath_Malformed_UsesDefault(t *testing.T) {
 	}
 	mustVerdict(t, fw, ethOnly, testXDPDrop)
 	mustVerdict(t, fw, trunc, testXDPDrop)
+}
+
+func TestDatapath_Conntrack_SpoofedAckCreatesNoState(t *testing.T) {
+	fw := loadTestFirewall(t)
+	if err := fw.SetDefaultPolicy("deny"); err != nil {
+		t.Fatalf("SetDefaultPolicy: %v", err)
+	}
+
+	// SYN is denied by default-deny, so no state is written...
+	mustVerdict(t, fw, tcpPkt("10.0.0.1", "1.2.3.4", 50000, 22), testXDPDrop)
+	// ...and a spoofed ACK (no prior SYN) must not fabricate an established
+	// flow: it is still denied and still leaves no state behind.
+	mustVerdict(t, fw, tcpPktFlags("10.0.0.1", "1.2.3.4", 50000, 22, tcpFlagACK), testXDPDrop)
+
+	if states := ctStates(t, fw); len(states) != 0 {
+		t.Errorf("conntrack = %v, want empty after dropped SYN + spoofed ACK", states)
+	}
+}
+
+func TestDatapath_Conntrack_EstablishedFlowPassesAfterRuleRemoved(t *testing.T) {
+	fw := loadTestFirewall(t)
+	if err := fw.SetDefaultPolicy("deny"); err != nil {
+		t.Fatalf("SetDefaultPolicy: %v", err)
+	}
+	// A narrow PASS rule lets the handshake in; afterwards it is removed to
+	// prove the ESTABLISHED state itself (not the rule) carries the flow.
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 50000, "pass", 5); err != nil {
+		t.Fatalf("BlockPortRuleWithActionPriority: %v", err)
+	}
+
+	// SYN -> NEW, ACK on NEW -> ESTABLISHED.
+	mustVerdict(t, fw, tcpPkt("10.0.0.1", "1.2.3.4", 50000, 22), testXDPPass)
+	mustVerdict(t, fw, tcpPktFlags("10.0.0.1", "1.2.3.4", 50000, 22, tcpFlagACK), testXDPPass)
+	if s := ctStates(t, fw)["50000:22"]; s != "established" {
+		t.Fatalf("flow state = %q, want established", s)
+	}
+
+	if err := fw.UnblockPortRule("1.2.3.4", "tcp", 22, 50000); err != nil {
+		t.Fatalf("UnblockPortRule: %v", err)
+	}
+
+	// With the rule gone, the established flow still passes under default-deny.
+	mustVerdict(t, fw, tcpPktFlags("10.0.0.1", "1.2.3.4", 50000, 22, tcpFlagACK), testXDPPass)
+	// A different flow has no state and no rule: denied.
+	mustVerdict(t, fw, tcpPktFlags("10.0.0.1", "1.2.3.4", 60000, 22, tcpFlagACK), testXDPDrop)
+}
+
+func TestDatapath_Conntrack_FinClosesFlow(t *testing.T) {
+	fw := loadTestFirewall(t)
+	if err := fw.SetDefaultPolicy("deny"); err != nil {
+		t.Fatalf("SetDefaultPolicy: %v", err)
+	}
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 50000, "pass", 5); err != nil {
+		t.Fatalf("BlockPortRuleWithActionPriority: %v", err)
+	}
+
+	mustVerdict(t, fw, tcpPkt("10.0.0.1", "1.2.3.4", 50000, 22), testXDPPass)
+	mustVerdict(t, fw, tcpPktFlags("10.0.0.1", "1.2.3.4", 50000, 22, tcpFlagACK), testXDPPass)
+	if err := fw.UnblockPortRule("1.2.3.4", "tcp", 22, 50000); err != nil {
+		t.Fatalf("UnblockPortRule: %v", err)
+	}
+
+	// FIN closes the flow (still passes, then flips to CLOSED).
+	mustVerdict(t, fw, tcpPktFlags("10.0.0.1", "1.2.3.4", 50000, 22, tcpFlagFIN|tcpFlagACK), testXDPPass)
+	if s := ctStates(t, fw)["50000:22"]; s != "closed" {
+		t.Fatalf("flow state = %q, want closed", s)
+	}
+
+	// After close, a stray packet no longer has the established fast-path.
+	mustVerdict(t, fw, tcpPktFlags("10.0.0.1", "1.2.3.4", 50000, 22, tcpFlagACK), testXDPDrop)
+}
+
+func TestDatapath_Conntrack_MidStreamRuleAcceptMarksEstablished(t *testing.T) {
+	fw := loadTestFirewall(t)
+	if err := fw.SetDefaultPolicy("deny"); err != nil {
+		t.Fatalf("SetDefaultPolicy: %v", err)
+	}
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 0, "pass", 5); err != nil {
+		t.Fatalf("BlockPortRuleWithActionPriority: %v", err)
+	}
+
+	// A mid-stream ACK (no SYN seen) accepted by a rule records the flow as
+	// already established, so removal of the rule still lets it through.
+	mustVerdict(t, fw, tcpPktFlags("10.0.0.1", "1.2.3.4", 12345, 22, tcpFlagACK), testXDPPass)
+	if s := ctStates(t, fw)["12345:22"]; s != "established" {
+		t.Fatalf("flow state = %q, want established", s)
+	}
+}
+
+func TestDatapath_Conntrack_NotTrackedUnderDefaultAllow(t *testing.T) {
+	fw := loadTestFirewall(t)
+
+	// Under default-allow the stateful table is never consulted or written:
+	// it could not change any verdict, only add cost.
+	mustVerdict(t, fw, tcpPkt("10.0.0.1", "1.2.3.4", 50000, 22), testXDPPass)
+	mustVerdict(t, fw, tcpPktFlags("10.0.0.1", "1.2.3.4", 50000, 22, tcpFlagACK), testXDPPass)
+	if states := ctStates(t, fw); len(states) != 0 {
+		t.Errorf("conntrack = %v, want empty under default-allow", states)
+	}
+}
+
+func TestDatapath_Conntrack_TcpOnlyUnderDefaultDeny(t *testing.T) {
+	fw := loadTestFirewall(t)
+	if err := fw.SetDefaultPolicy("deny"); err != nil {
+		t.Fatalf("SetDefaultPolicy: %v", err)
+	}
+
+	// Denied UDP traffic is not tracked (TCP-only table).
+	mustVerdict(t, fw, udpPkt("10.0.0.1", "1.2.3.4", 50000, 22), testXDPDrop)
+	if states := ctStates(t, fw); len(states) != 0 {
+		t.Errorf("conntrack = %v, want empty (TCP-only)", states)
+	}
 }
 
 func TestDatapath_CountersTrackDropsAndPasses(t *testing.T) {

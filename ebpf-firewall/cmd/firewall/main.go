@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"ebpf-firewall/control/ebpf"
 	"ebpf-firewall/control/server"
@@ -19,9 +20,11 @@ func main() {
 	var ifname string
 	var blockList string
 	var sockPath string
+	var ctTimeout time.Duration
 	flag.StringVar(&ifname, "i", "wlp0s20f3", "Network interface name where the eBPF programs will be attached")
 	flag.StringVar(&blockList, "block", "", "Comma-separated list of IPs/CIDRs to block (e.g. '192.168.1.5, 10.0.0.0/8')")
 	flag.StringVar(&sockPath, "sock", "/var/run/ebpf-firewall.sock", "unix socket path for control")
+	flag.DurationVar(&ctTimeout, "ct-timeout", 5*time.Minute, "idle timeout for conntrack entries (0 disables the reaper)")
 	flag.Parse()
 
 	log := log.New(os.Stdout, "[firewall] ", log.LstdFlags)
@@ -62,6 +65,33 @@ func main() {
 				log.Printf("Blocked IP/CIDR: %s", ipStr)
 			}
 		}
+	}
+
+	// Conntrack is a plain (non-LRU) hash map, so a userspace reaper bounds its
+	// size by deleting flows idle for ctTimeout. It scans roughly every half
+	// timeout so a flow is evicted within ~1.5x the configured timeout.
+	if ctTimeout > 0 {
+		interval := ctTimeout / 2
+		if interval < time.Second {
+			interval = time.Second
+		}
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					n, err := fw.ReapConntrack(ctTimeout)
+					if err != nil {
+						log.Printf("conntrack reap: %v", err)
+					} else if n > 0 {
+						log.Printf("conntrack: reaped %d stale flow(s)", n)
+					}
+				}
+			}
+		}()
 	}
 
 	srv := server.New(sockPath, fw)

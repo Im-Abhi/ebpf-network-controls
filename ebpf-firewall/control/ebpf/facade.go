@@ -2,20 +2,23 @@ package ebpf
 
 import (
 	"fmt"
+	"time"
 
 	"ebpf-firewall/control/server"
 )
 
 // Firewall is a thin facade coordinating the XDP program lifecycle (XDPProgram)
-// with policy map operations (MapManager), counter reads (CounterManager), and
-// the config/default-policy state (ConfigManager). It is the single handle
-// used by cmd/firewall and the runtime control plane.
+// with policy map operations (MapManager), counter reads (CounterManager), the
+// config/default-policy state (ConfigManager), and the conntrack table
+// (ConntrackManager). It is the single handle used by cmd/firewall and the
+// runtime control plane.
 type Firewall struct {
 	prog          *XDPProgram
 	mgr           *MapManager
 	counterMgr    *CounterManager
 	portPolicyMgr *PortPolicyManager
 	configMgr     *ConfigManager
+	ctMgr         *ConntrackManager
 }
 
 // NewFirewall loads the XDP program and its maps for the given interface but
@@ -38,6 +41,7 @@ func NewFirewall(ifaceName string) (*Firewall, error) {
 		counterMgr:    NewCounterManager(prog.Counters()),
 		portPolicyMgr: portPolicyMgr,
 		configMgr:     NewConfigManager(prog.Config()),
+		ctMgr:         NewConntrackManager(prog.Conntrack()),
 	}, nil
 }
 
@@ -166,6 +170,22 @@ func (f *Firewall) ListPortRules() ([]server.PortRule, error) {
 // ClearPortRules removes every protocol/port rule.
 func (f *Firewall) ClearPortRules() error {
 	return f.portPolicyMgr.Clear()
+}
+
+// ListConntrack returns the currently tracked TCP flows.
+func (f *Firewall) ListConntrack() ([]server.ConntrackEntry, error) {
+	return f.ctMgr.List()
+}
+
+// ClearConntrack removes all tracked TCP flows.
+func (f *Firewall) ClearConntrack() error {
+	return f.ctMgr.Clear()
+}
+
+// ReapConntrack removes tracked flows idle for at least idle and returns how
+// many were removed. The daemon calls it on a timer to bound the table.
+func (f *Firewall) ReapConntrack(idle time.Duration) (int, error) {
+	return f.ctMgr.Reap(idle)
 }
 
 // SetDefaultPolicy sets the fallback policy ("allow" or "deny") applied when

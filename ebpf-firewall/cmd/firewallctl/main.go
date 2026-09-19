@@ -47,6 +47,8 @@ func main() {
 		req = server.Request{Command: server.CmdClear}
 	case "stats":
 		req = server.Request{Command: server.CmdStats}
+	case "conntrack":
+		req = server.Request{Command: server.CmdConntrack}
 	case "default":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "firewallctl: default requires allow or deny")
@@ -244,6 +246,17 @@ func printResponse(resp server.Response) {
 				fmt.Printf("  %s/%d -> %s [%s] prio %d\n", r.Protocol, r.Port, r.Dst, r.Action, r.Priority)
 			}
 		}
+	case resp.Conntrack != nil:
+		if resp.Count == 0 {
+			fmt.Println("no tracked flows")
+			return
+		}
+		fmt.Printf("conntrack (%d):\n", resp.Count)
+		for _, e := range resp.Conntrack {
+			fmt.Printf("  %s:%d -> %s:%d %s [%s] age %.1fs\n",
+				e.Src, e.Sport, e.Dst, e.Dport, e.Protocol, e.State, e.AgeSeconds)
+		}
+		return
 	case resp.Blocked != nil || resp.BlockedRules != nil:
 		if resp.Count == 0 {
 			fmt.Println("no blocked addresses")
@@ -314,8 +327,9 @@ Commands:
   block <ip/cidr>        block an IP/CIDR, or with --protocol/--dport a port rule
   unblock <ip/cidr>      unblock an IP/CIDR or port rule
   default allow|deny     set the default (fallback) policy on no match
-  clear                  remove all rules (IP blocklist and port rules)
+  clear                  remove all rules (IP blocklist, port rules, conntrack)
   stats                  show packet/byte counters
+  conntrack              list tracked TCP flows
   help                   show this help
 
 Options:

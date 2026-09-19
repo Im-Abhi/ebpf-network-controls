@@ -15,6 +15,7 @@ type fakePolicy struct {
 	mu     sync.Mutex
 	ips    map[string]BlockedRule
 	rules  map[string]PortRule
+	ct     map[string]ConntrackEntry
 	call   bool
 	stat   Stats
 	statOK bool
@@ -25,6 +26,7 @@ func newFakePolicy() *fakePolicy {
 	return &fakePolicy{
 		ips:   make(map[string]BlockedRule),
 		rules: make(map[string]PortRule),
+		ct:    make(map[string]ConntrackEntry),
 		def:   "allow",
 	}
 }
@@ -159,6 +161,23 @@ func (f *fakePolicy) ClearPortRules() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rules = make(map[string]PortRule)
+	return nil
+}
+
+func (f *fakePolicy) ListConntrack() ([]ConntrackEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]ConntrackEntry, 0, len(f.ct))
+	for _, e := range f.ct {
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+func (f *fakePolicy) ClearConntrack() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ct = make(map[string]ConntrackEntry)
 	return nil
 }
 
@@ -343,6 +362,27 @@ func TestHandle_UnknownCommand(t *testing.T) {
 	}
 }
 
+func TestHandle_Conntrack(t *testing.T) {
+	policy := newFakePolicy()
+	s := New("unused.sock", policy)
+
+	policy.mu.Lock()
+	policy.ct["flow"] = ConntrackEntry{
+		Src: "10.0.0.1", Dst: "1.2.3.4",
+		Sport: 50000, Dport: 22, Protocol: "tcp",
+		State: "established", AgeSeconds: 1.5,
+	}
+	policy.mu.Unlock()
+
+	resp := s.handle(Request{Command: CmdConntrack})
+	if !resp.OK || resp.Count != 1 || len(resp.Conntrack) != 1 {
+		t.Fatalf("conntrack: %+v", resp)
+	}
+	if resp.Conntrack[0].State != "established" || resp.Conntrack[0].Dport != 22 {
+		t.Errorf("conntrack entry = %+v, want tcp/22 established", resp.Conntrack[0])
+	}
+}
+
 func TestHandle_Stats(t *testing.T) {
 	s := New("unused.sock", newFakePolicy())
 	resp := s.handle(Request{Command: CmdStats})
@@ -385,13 +425,15 @@ func (p *errPolicy) BlockPortRuleWithActionPriority(string, string, uint16, uint
 func (p *errPolicy) UnblockPortRule(string, string, uint16, uint16) error { return errors.New("boom") }
 func (p *errPolicy) ListPortRules() ([]PortRule, error)                    { return nil, errors.New("boom") }
 func (p *errPolicy) ClearPortRules() error                                 { return errors.New("boom") }
+func (p *errPolicy) ListConntrack() ([]ConntrackEntry, error)              { return nil, errors.New("boom") }
+func (p *errPolicy) ClearConntrack() error                                 { return errors.New("boom") }
 func (p *errPolicy) SetDefaultPolicy(string) error                         { return errors.New("boom") }
 func (p *errPolicy) DefaultPolicy() (string, error)                        { return "", errors.New("boom") }
 
 func TestHandle_PropagatesErrors(t *testing.T) {
 	s := New("unused.sock", &errPolicy{})
 
-	for _, cmd := range []Command{CmdBlock, CmdUnblock, CmdList, CmdClear, CmdStats, CmdListPorts, CmdDefault} {
+	for _, cmd := range []Command{CmdBlock, CmdUnblock, CmdList, CmdClear, CmdStats, CmdListPorts, CmdDefault, CmdConntrack} {
 		if resp := s.handle(Request{Command: cmd, Value: "x"}); resp.OK {
 			t.Errorf("%s should not be ok with failing policy: %+v", cmd, resp)
 		}

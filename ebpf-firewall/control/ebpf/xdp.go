@@ -131,6 +131,11 @@ func (x *XDPProgram) RulePresence() *ebpf.Map {
 	return x.objs.RulePresence
 }
 
+// Conntrack returns the eBPF map holding tracked TCP flows.
+func (x *XDPProgram) Conntrack() *ebpf.Map {
+	return x.objs.Conntrack
+}
+
 // Close detaches the program (if attached) and closes all loaded objects.
 func (x *XDPProgram) Close() error {
 	var firstErr error

@@ -36,6 +36,12 @@
  * only for traffic it matches, permitting exactly that traffic under a
  * default-deny policy.
  *
+ * Stateful fast-path (TCP-only, default-deny only): an accepted TCP packet
+ * records/refreshes its flow in the `conntrack` map (see ct_update), and a
+ * later packet with no matching rule passes if its flow is ESTABLISHED.
+ * State is written only after a PASS decision, so a dropped SYN creates
+ * nothing and a spoofed ACK cannot fabricate an established flow.
+ *
  * Debugging (optional, compile-time): protocol/port inspection and
  * bpf_printk logging are compiled out unless FIREWALL_DEBUG is defined.
  * Keep debugging off for performance-sensitive measurements so tracing
@@ -48,6 +54,21 @@
 #define DEBUG_PRINTK(fmt, ...) do { } while (0)
 #endif
 
+/* TCP flag bits used for conntrack transitions. vmlinux.h exposes the
+ * tcphdr flag bitfields but not these masks (UAPI macros). */
+#ifndef TCP_FIN
+#define TCP_FIN 0x01
+#endif
+#ifndef TCP_SYN
+#define TCP_SYN 0x02
+#endif
+#ifndef TCP_RST
+#define TCP_RST 0x04
+#endif
+#ifndef TCP_ACK
+#define TCP_ACK 0x10
+#endif
+
 /* Minimal parsed view of an IPv4 packet, sufficient for the current
  * IP/CIDR policy plus protocol/port rules. Extended later with direction
  * for richer rules without touching the datapath control flow. */
@@ -57,6 +78,7 @@ struct packet_info {
     __u8  protocol;
     __u16 dport;   /* destination port, network byte order (0 if not TCP/UDP) */
     __u16 sport;   /* source port, network byte order (0 if not TCP/UDP) */
+    __u8  tcp_flags; /* TCP_FIN/SYN/RST/ACK bits (0 if not TCP) */
 };
 
 static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
@@ -92,6 +114,10 @@ static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
         if (parse_tcphdr(nh, data_end, &tcp) == 0) {
             info.dport = tcp->dest;
             info.sport = tcp->source;
+            info.tcp_flags = (tcp->fin ? TCP_FIN : 0) |
+                             (tcp->syn ? TCP_SYN : 0) |
+                             (tcp->rst ? TCP_RST : 0) |
+                             (tcp->ack ? TCP_ACK : 0);
         }
     } else if (protocol == IPPROTO_UDP) {
         struct udphdr *udp;
@@ -228,6 +254,63 @@ static __always_inline int decide(int ip_matched, const struct rule_value *ip,
     return default_policy() == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
 }
 
+/* Builds the conntrack key for a parsed packet. Zeroes the whole struct,
+ * including the padding bytes, so the hash lookup matches the key written by
+ * the Go side / the previous packet. */
+static __always_inline void ct_build_key(struct ct_key *key,
+                                         const struct packet_info *info) {
+    __builtin_memset(key, 0, sizeof(*key));
+    key->saddr = info->saddr;
+    key->daddr = info->daddr;
+    key->sport = info->sport;
+    key->dport = info->dport;
+    key->protocol = info->protocol;
+}
+
+/* Read-only conntrack probe. Returns 1 when an ESTABLISHED flow matches the
+ * packet's 5-tuple, 0 otherwise (including NEW/CLOSED and no entry). */
+static __always_inline int ct_is_established(const struct packet_info *info) {
+    struct ct_key key;
+    ct_build_key(&key, info);
+    struct ct_value *v = bpf_map_lookup_elem(&conntrack, &key);
+    return v && v->state == CT_ESTABLISHED;
+}
+
+/* Records an accepted TCP packet. Called only after a PASS decision, so a
+ * dropped SYN never creates state (and a subsequent spoofed ACK cannot
+ * fabricate an ESTABLISHED flow). Transitions: SYN -> NEW, ACK on NEW ->
+ * ESTABLISHED, FIN/RST -> CLOSED, every accepted packet refreshes
+ * last_seen. */
+static __always_inline void ct_update(const struct packet_info *info) {
+    struct ct_key key;
+    ct_build_key(&key, info);
+    __u64 now = bpf_ktime_get_ns();
+
+    struct ct_value *v = bpf_map_lookup_elem(&conntrack, &key);
+    if (v) {
+        v->last_seen = now;
+        if (info->tcp_flags & (TCP_FIN | TCP_RST)) {
+            v->state = CT_CLOSED;
+        } else if (v->state == CT_NEW && (info->tcp_flags & TCP_ACK)) {
+            v->state = CT_ESTABLISHED;
+        }
+        return;
+    }
+
+    struct ct_value nv = {};
+    nv.last_seen = now;
+    if (info->tcp_flags & (TCP_FIN | TCP_RST)) {
+        nv.state = CT_CLOSED;
+    } else if (info->tcp_flags & TCP_SYN) {
+        nv.state = CT_NEW;
+    } else {
+        /* Mid-stream packet accepted by a rule: treat the flow as already
+         * established so its return traffic is covered too. */
+        nv.state = CT_ESTABLISHED;
+    }
+    bpf_map_update_elem(&conntrack, &key, &nv, BPF_ANY);
+}
+
 /* Global counter increment. Looks up the counter by index and atomically
  * adds 1 packet and the given byte count. Must match struct counter_value
  * and enum counter_index in maps.h. */
@@ -322,8 +405,20 @@ int firewall_prog(struct xdp_md *ctx) {
         port_matched = port_rule_action(&info, &port_rule);
     }
 
-    /* 3. decision (data-driven; highest priority wins, tie -> DROP, else default) */
-    int verdict = decide(ip_matched, &ip_rule, port_matched, &port_rule);
+    /* 3. decision (data-driven; highest priority wins, tie -> DROP, else
+     * default). Under default-deny a TCP packet belonging to an already
+     * ESTABLISHED flow is also let through when no rule matches; the stateful
+     * fast-path is meaningless (and skipped) under default-allow. */
+    enum default_policy def = default_policy();
+    int verdict;
+    if (ip_matched || port_matched) {
+        verdict = decide(ip_matched, &ip_rule, port_matched, &port_rule);
+    } else if (def == DEFAULT_DENY && info.protocol == IPPROTO_TCP &&
+               ct_is_established(&info)) {
+        verdict = XDP_PASS;
+    } else {
+        verdict = def == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
+    }
     if (verdict == XDP_DROP) {
         DEBUG_PRINTK("packet DROPPED");
         incr_counter(COUNTER_TOTAL, pkt_len);
@@ -331,10 +426,17 @@ int firewall_prog(struct xdp_md *ctx) {
         return XDP_DROP;
     }
 
-    /* 4. optional debugging (compiled out with FIREWALL_DEBUG undefined) */
+    /* 4. accepted: record/refresh TCP state. Must run only on PASS, never on
+     * DROP, so a dropped SYN leaves no state behind. Only tracked under
+     * default-deny, where the state actually changes future verdicts. */
+    if (def == DEFAULT_DENY && info.protocol == IPPROTO_TCP) {
+        ct_update(&info);
+    }
+
+    /* 5. optional debugging (compiled out with FIREWALL_DEBUG undefined) */
     debug_packet(&info, &nh, data_end);
 
-    /* 5. passed: matching PASS rule or default allow */
+    /* 6. passed: matching PASS rule, established flow, or default allow */
     incr_counter(COUNTER_TOTAL, pkt_len);
     incr_counter(COUNTER_PASS, pkt_len);
     return XDP_PASS;

@@ -30,6 +30,8 @@ type Policy interface {
 	UnblockPortRule(dst, protocol string, dport, sport uint16) error
 	ListPortRules() ([]PortRule, error)
 	ClearPortRules() error
+	ListConntrack() ([]ConntrackEntry, error)
+	ClearConntrack() error
 	SetDefaultPolicy(s string) error
 	DefaultPolicy() (string, error)
 }
@@ -245,7 +247,19 @@ func (s *Server) handle(req Request) Response {
 		if err := s.policy.ClearPortRules(); err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
+		// Rule changes can invalidate established flows, so clear the tracked
+		// state too.
+		if err := s.policy.ClearConntrack(); err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
 		return Response{OK: true}
+
+	case CmdConntrack:
+		entries, err := s.policy.ListConntrack()
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+		return Response{OK: true, Conntrack: entries, Count: len(entries)}
 
 	case CmdStats:
 		stats, err := s.policy.Stats()

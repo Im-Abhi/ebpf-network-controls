@@ -39,6 +39,7 @@ type firewallPortRuleKey struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	firewallMapBlockedIps     = "blocked_ips"
+	firewallMapConntrack      = "conntrack"
 	firewallMapCounters       = "counters"
 	firewallMapFirewallConfig = "firewall_config"
 	firewallMapPortPolicy     = "port_policy"
@@ -96,6 +97,7 @@ type firewallProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type firewallMapSpecs struct {
 	BlockedIps     *ebpf.MapSpec `ebpf:"blocked_ips"`
+	Conntrack      *ebpf.MapSpec `ebpf:"conntrack"`
 	Counters       *ebpf.MapSpec `ebpf:"counters"`
 	FirewallConfig *ebpf.MapSpec `ebpf:"firewall_config"`
 	PortPolicy     *ebpf.MapSpec `ebpf:"port_policy"`
@@ -129,6 +131,7 @@ func (o *firewallObjects) Close() error {
 // It can be passed to loadFirewallObjects or ebpf.CollectionSpec.LoadAndAssign.
 type firewallMaps struct {
 	BlockedIps     *ebpf.Map `ebpf:"blocked_ips"`
+	Conntrack      *ebpf.Map `ebpf:"conntrack"`
 	Counters       *ebpf.Map `ebpf:"counters"`
 	FirewallConfig *ebpf.Map `ebpf:"firewall_config"`
 	PortPolicy     *ebpf.Map `ebpf:"port_policy"`
@@ -138,6 +141,7 @@ type firewallMaps struct {
 func (m *firewallMaps) Close() error {
 	return _FirewallClose(
 		m.BlockedIps,
+		m.Conntrack,
 		m.Counters,
 		m.FirewallConfig,
 		m.PortPolicy,
