@@ -184,8 +184,8 @@ func (pm *PortPolicyManager) UnblockWithAction(dst, protocol string, dport, spor
 
 // List returns all port rules currently in the map.
 func (pm *PortPolicyManager) List() ([]server.PortRule, error) {
+	rules := make([]server.PortRule, 0, 8)
 	var (
-		rules []server.PortRule
 		key   firewallPortRuleKey
 		value ruleValue
 	)

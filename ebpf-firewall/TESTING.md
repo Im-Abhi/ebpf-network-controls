@@ -147,6 +147,37 @@ established flow should keep working while a fresh connection is dropped.
 > block rule matching your own IP will cut your own inbound traffic — run policy
 > experiments on a disposable test interface instead.
 
+### Layer 3.5 — live smoke suite (root required)
+
+`integration/fw-smoke.sh` automates the disposable-interface flow described
+above. It creates a veth pair + netns, allows (and later removes) an iptables
+`INPUT ACCEPT` for the host-side veth so a host firewall service (UFW) cannot
+interfere, and drives real TCP through the running firewall, asserting the
+documented verdicts. It also needs IPv6 disabled on the sandbox veth so netns
+link-local/multicast traffic cannot inflate drop-counter deltas.
+
+```bash
+make generate && make build
+sudo bash integration/fw-smoke.sh
+```
+
+Golden run: **29/29 checks**. Coverage:
+
+| Check | What is asserted |
+| --- | --- |
+| 1a–1c | default-allow passthrough; conntrack empty AND skipped under allow |
+| 2a–2f | full priority matrix: higher-PASS overrides broad DROP, higher-DROP beats specific PASS, equal-prio keeps the most-specific match, `listports` shows priorities |
+| 3a–3c | default-deny: bare ACK denied, creates no state |
+| 3d–3g | `--action pass` admits a flow; ESTABLISHED survives rule removal (stateful fast-path) |
+| 3i–3j | raw SYN denied, no conntrack state |
+| 3k–3l | FIN→CLOSED; packet on a CLOSED flow denied again |
+| 4a–4d | `clear` empties blocklist + port rules + conntrack; then a fresh SYN is denied |
+| 5a–5e | `-ct-timeout 5s` reaper: flow reaped, daemon logs it, later packet denied |
+
+Client sockets are `SO_REUSEADDR` + RST-close (`SO_LINGER=0`) so the teardown of
+each connection cannot leave a TIME_WAIT port that a later check reuses, and
+cannot retrigger the host-side FIN retransmits described in the MTP1-D note.
+
 ---
 
 ## ARP / non-IPv4 behaviour (by design)

@@ -18,6 +18,23 @@ type firewallCounterValue struct {
 	Bytes   uint64
 }
 
+type firewallCtKey struct {
+	_        structs.HostLayout
+	Saddr    uint32
+	Daddr    uint32
+	Sport    uint16
+	Dport    uint16
+	Protocol uint8
+	Pad      [3]uint8
+}
+
+type firewallCtValue struct {
+	_        structs.HostLayout
+	LastSeen uint64
+	State    uint32
+	Pad      uint32
+}
+
 type firewallIpv4LpmKey struct {
 	_         structs.HostLayout
 	Prefixlen uint32
@@ -32,6 +49,12 @@ type firewallPortRuleKey struct {
 	Sport    uint16
 	_        [2]byte
 	Dst      uint32
+}
+
+type firewallRuleValue struct {
+	_        structs.HostLayout
+	Action   uint32
+	Priority uint32
 }
 
 // Names of all BPF objects in the ELF.

@@ -26,7 +26,7 @@ MTP2+ are the thesis-level extensions built on top of it.
 - [x] Global counters map (total / dropped / passed packets + bytes)
 - [x] `firewallctl stats` command with human-readable output
 - [x] Counter integration tests
-- [ ] Verify `make test` / `make integration-test` on a clean Linux checkout
+- [x] Verify `make test` / `make integration-test` on a clean Linux checkout
 
 ### MTP1-C: Richer rule semantics
 
@@ -38,7 +38,8 @@ MTP2+ are the thesis-level extensions built on top of it.
 - [ ] Port-based filtering with CIDR networks (currently exact `/32` only)
 - [x] Rule priority (deterministic winner when rules overlap; highest wins,
       ties: most-specific-first within the port table, IP-vs-port → DROP;
-      `IP+priority` in `ldm_bindings.h`) — pending `make integration-test` on Linux
+      `IP+priority` in `ldm_bindings.h`) — unit + integration tests green,
+      full decision table covered live by `integration/fw-smoke.sh` (check 2)
 - [ ] Direction-aware rules (INGRESS / EGRESS)
 
 ### MTP1-F: Fast-path optimization
@@ -69,8 +70,16 @@ MTP2+ are the thesis-level extensions built on top of it.
 - [x] Userspace reaper (`cmd/firewall -ct-timeout`, default 5m) ages out idle
       flows from the plain hash map
 - [x] `firewallctl conntrack` listing; `clear` also clears conntrack
-- [ ] Verify `make test` / `make integration-test` on a clean Linux checkout
-      (incl. the new datapath conntrack scenarios + manager tests)
+- [x] Verify `make test` / `make integration-test` on a clean Linux checkout
+      (incl. the new datapath conntrack scenarios + manager tests) — plus live
+      coverage in `integration/fw-smoke.sh` (checks 3–5: spoofed ACK, stateful
+      fast-path after rule removal, FIN→CLOSED, clear, reaper)
+- [ ] Open design note: the datapath DROPs the final teardown ACK of a flow it
+      has already marked CLOSED (FIN/RST). A peer that closes cleanly therefore
+      retransmits its FIN until TCP retries are exhausted, because it never
+      sees an ACK for it. Verdicts are correct; the behaviour is a product
+      decision to revisit (e.g. treat the ACK closing a CLOSED flow as PASS) —
+      `integration/fw-smoke.sh` works around it by RST-closing clients
 
 ### MTP1-E: Benchmarking module (separate from firewall)
 
