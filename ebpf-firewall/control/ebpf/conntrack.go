@@ -87,10 +87,10 @@ func (cm *ConntrackManager) List() ([]server.ConntrackEntry, error) {
 		return nil, err
 	}
 
+	entries := make([]server.ConntrackEntry, 0, 8)
 	var (
-		entries []server.ConntrackEntry
-		key     ctKey
-		value   ctValue
+		key   ctKey
+		value ctValue
 	)
 	iter := cm.conntrack.Iterate()
 	for iter.Next(&key, &value) {

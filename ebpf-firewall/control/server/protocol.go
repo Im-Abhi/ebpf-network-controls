@@ -75,14 +75,14 @@ type Stats struct {
 type Response struct {
 	OK           bool          `json:"ok"`
 	Error        string        `json:"error,omitempty"`
-	Blocked      []string      `json:"blocked,omitempty"`
-	BlockedRules []BlockedRule `json:"blocked_rules,omitempty"`
+	Blocked      []string      `json:"blocked"`
+	BlockedRules []BlockedRule `json:"blocked_rules"`
 	Count        int           `json:"count,omitempty"`
 	Iface        string        `json:"interface,omitempty"`
 	Attached     bool          `json:"attached,omitempty"`
 	Stats        *Stats        `json:"stats,omitempty"`
-	PortRules    []PortRule       `json:"port_rules,omitempty"`
-	Conntrack    []ConntrackEntry `json:"conntrack,omitempty"`
+	PortRules    []PortRule       `json:"port_rules"`
+	Conntrack    []ConntrackEntry `json:"conntrack"`
 	Default      string           `json:"default_policy,omitempty"`
 	AttachMode   string           `json:"attach_mode,omitempty"`
 }
