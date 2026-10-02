@@ -102,6 +102,17 @@ the `firewallctl` commands (`list`, `listports`, `block`, `unblock`, `default`,
 replies back through the same way the ingress fast-path does. The TCX hook
 requires **kernel >= 6.6**.
 
+Non-IPv4/unparseable frames (ARP, IPv6, etc.) take only the egress default
+policy, exactly as on the ingress path, so an IPv4 egress rule can never drop
+them. Datapath cost under the common both-defaults-`allow` configuration:
+traffic that matches no rule triggers **no conntrack or policy-map operations**
+(empty maps cannot match and the state gates are skipped), but the hook is not
+free — every packet pays a fixed cost of two array-map reads
+(`rule_presence`, `egress_config`) plus the counter updates, and every accepted
+TCP packet additionally reads the ingress default once (`firewall_config`) to
+evaluate the conntrack gate. An attached egress hook therefore adds a small
+constant per-packet cost under allow/allow, never a policy or conntrack lookup.
+
 ### Stateful (conntrack)
 
 A TCP-only connection table lets matched/established traffic keep flowing under
@@ -126,6 +137,11 @@ Key properties:
   (`src, dst, sport, dport, protocol`); `cmd/firewall -ct-timeout` (default
   `5m`) runs a userspace reaper that ages idle flows out — more deterministic
   than an LRU (which would keep a dying map hot).
+- State is written only when a direction's default is `deny`, so under
+  ingress-`allow` + egress-`deny` an established flow refreshes `last_seen`
+  only on outbound traffic — replies pass (ingress is allow) but do not
+  refresh it, so an alive-but-egress-idle flow could be reaped. Under
+  default-deny ingress the replies refresh it too.
 - `firewallctl conntrack` lists live flows, and `clear` also clears the table.
 
 ```bash

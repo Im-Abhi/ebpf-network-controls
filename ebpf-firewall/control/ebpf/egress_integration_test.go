@@ -133,6 +133,56 @@ func TestEgressDatapath_HooksAreSeparate(t *testing.T) {
 	mustVerdict(t, fw, tcpPkt("192.168.0.1", "5.6.7.8", 12345, 80), testXDPPass)
 }
 
+// arpPkt builds a minimal Ethernet/ARP frame: an Ethernet II header with the
+// ARP ethertype followed by a 28-byte ARP payload. The datapath rejects it as
+// non-IPv4, so firewall_tc_egress must apply only the egress default policy.
+func arpPkt() []byte {
+	pkt := make([]byte, 14+28)
+	pkt[12] = 0x08 // h_proto = ETH_P_ARP (0x0806)
+	pkt[13] = 0x06
+	return pkt
+}
+
+func TestEgressDatapath_NonIPv4FollowsDefaultPolicy(t *testing.T) {
+	fw := loadTestFirewall(t)
+
+	// Prime the egress IP presence bit AND make the zeroed key used when
+	// parsing fails (0.0.0.0/32) resolve to an actual DROP rule. Before the
+	// non-IPv4 early return in firewall_tc_egress this exact setup dropped
+	// ARP/IPv6 frames even under an egress default of allow; the regression
+	// is that parse failures now take only the egress default policy, never
+	// the rule tables.
+	if err := fw.BlockEgressWithAction("0.0.0.0/0", "drop"); err != nil {
+		t.Fatalf("BlockEgressWithAction: %v", err)
+	}
+
+	// Guard: the egress IP presence bit must be active, otherwise the LPM
+	// lookups (and the divergence this test exercises) would never run and
+	// the assertions below could pass vacuously.
+	var flags uint32
+	if err := fw.prog.RulePresence().Lookup(presenceMapKey, &flags); err != nil {
+		t.Fatalf("reading rule_presence: %v", err)
+	}
+	if flags&rulePresenceEgressIP == 0 {
+		t.Fatalf("egress IP presence bit not set; the 0.0.0.0/0 rule would never be consulted")
+	}
+
+	// First prove the trap: an IPv4 packet to a destination inside 0.0.0.0/0
+	// IS dropped by the rule.
+	mustEgressVerdict(t, fw, tcpPkt("10.0.0.1", "5.6.7.8", 12345, 80), testTC_SHOT)
+
+	// Non-IPv4 frames ignore the rule and follow the egress default instead.
+	if err := fw.SetEgressDefault("allow"); err != nil {
+		t.Fatalf("SetEgressDefault: %v", err)
+	}
+	mustEgressVerdict(t, fw, arpPkt(), testTC_OK)
+
+	if err := fw.SetEgressDefault("deny"); err != nil {
+		t.Fatalf("SetEgressDefault: %v", err)
+	}
+	mustEgressVerdict(t, fw, arpPkt(), testTC_SHOT)
+}
+
 func TestEgressDatapath_Conntrack_ReverseEntryPassesInboundReplies(t *testing.T) {
 	fw := loadTestFirewall(t)
 	// Both hooks under default-deny make the conntrack gate active on egress

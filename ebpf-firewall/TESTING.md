@@ -114,15 +114,29 @@ scenarios mirror the ingress suite plus the hook-specific cases:
 
 | Test | Asserts |
 | --- | --- |
-| `TestEgress_DefaultAllow_Passes` | default allow + no egress rules → pass |
-| `TestEgress_DefaultDeny_Drops` | egress default deny + no rules → drop |
-| `TestEgress_BlockedDestination_Drops` | blocked dst in egress IP LPM → drop |
-| `TestEgress_CIDR_DropsByDestination` | CIDR block drops in-range dst |
-| `TestEgress_PortRule_DropsOnlyMatching` | only the exact dst+proto+port (remote dst) match drops; other dsts, UDP pass |
-| `TestEgress_HooksAreSeparate` | matching ingress vs egress maps: a packet passes if the *other* direction has the rule |
-| `TestEgress_Conntrack_ReverseEntryPassesInboundReplies` | a reverse ESTABLISHED entry lets the reply through under egress default deny |
-| `TestEgress_ClearEgress_LeavesIngress` | clearing egress maps leaves ingress rules intact |
-| `TestEgress_CountersSeparate` | egress drops/passes hit the egress counter slots and ingress counters do not move |
+| `TestEgressDatapath_DefaultAllow_Passes` | default allow + no egress rules → pass |
+| `TestEgressDatapath_DefaultDeny_Drops` | egress default deny + no rules → drop |
+| `TestEgressDatapath_BlockedDestination_Drops` | blocked dst in egress IP LPM → drop |
+| `TestEgressDatapath_CIDR_DropsByDestination` | CIDR block drops in-range dst |
+| `TestEgressDatapath_PortRule_DropsOnlyMatching` | only the exact dst+proto+port (remote dst) match drops; other dsts, UDP pass |
+| `TestEgressDatapath_HooksAreSeparate` | matching ingress vs egress maps: a packet passes if the *other* direction has the rule |
+| `TestEgressDatapath_Conntrack_ReverseEntryPassesInboundReplies` | a reverse ESTABLISHED entry lets the reply through under egress default deny |
+| `TestEgressDatapath_ClearEgress_LeavesIngress` | clearing egress maps leaves ingress rules intact |
+| `TestEgressDatapath_CountersSeparate` | egress drops/passes hit the egress counter slots and ingress counters do not move |
+| `TestEgressDatapath_NonIPv4FollowsDefaultPolicy` | with the egress IP presence bit primed by a `0.0.0.0/0` block, ARP/non-IPv4 frames still take only the egress default (pass under allow, drop under deny) — the IPv4 rule never catches them |
+
+Two shared-state notes specific to the egress hook:
+
+- **Entry age under ingress-allow + egress-deny:** an established flow refreshes
+  `last_seen` on outbound packets (egress write gate) but inbound replies refresh
+  it only when the *ingress* default is `deny` (ingress write gate). Under
+  ingress-allow a reply-only idle flow can therefore be reaped despite being
+  alive; replies still pass because ingress is allow.
+- **Reverse entries start ESTABLISHED:** the first accepted outbound packet
+  records its reply 5-tuple as ESTABLISHED (before the 3WHS completes) so the
+  unchanged ingress exact-tuple probe passes the reply under default-deny. The
+  spoofable window covers one fully-specified reply tuple that only the intended
+  server can legitimately transmit.
 
 ### Lifecycle + end-to-end
 - `firewall_integration_test.go` — `NewFirewall` load, attach on `lo`,

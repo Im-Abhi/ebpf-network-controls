@@ -58,9 +58,20 @@ func (f *Firewall) Start() error {
 	return f.prog.Start()
 }
 
-// Stop detaches the program and closes all kernel resources.
+// Stop detaches the TC egress hook (if attached) and then the XDP program,
+// closing all kernel resources. Detaching egress first is required so no
+// stale classifier link survives a Stop: a TCX link holds its own
+// reference to the loaded program, so closing the XDP objects alone would
+// leave the egress hook live.
 func (f *Firewall) Stop() error {
-	return f.prog.Close()
+	var firstErr error
+	if err := f.StopEgress(); err != nil {
+		firstErr = err
+	}
+	if err := f.prog.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }
 
 // Interface returns the interface name the firewall is bound to.

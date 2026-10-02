@@ -479,6 +479,9 @@ int firewall_prog(struct xdp_md *ctx) {
  *
  * The program reads only data/data_end from __sk_buff (never skb->len or any
  * other field) so BPF_PROG_TEST_RUN can drive it with synthesized packets.
+ * Non-IPv4/unparseable frames (ARP, IPv6, VLAN) take only the egress default
+ * policy, exactly like the ingress program, so an IPv4 rule can never catch
+ * them.
  */
 
 /* Build the reverse (reply) conntrack key: swap src/dst address and port so
@@ -678,6 +681,18 @@ int firewall_tc_egress(struct __sk_buff *skb) {
     /* 1. parse (shared with the XDP datapath). */
     nh.pos = data;
     struct packet_info info = parse_packet(&nh, data_end, &ok);
+
+    /* Unparseable or non-IPv4: apply the egress default policy only, exactly
+     * like firewall_prog does for ingress. Without this early return a zeroed
+     * packet_info would be fed to the IP / port rule lookups: an egress rule
+     * covering 0.0.0.0 (e.g. a block-everything 0.0.0.0/0) would then drop
+     * ARP, IPv6 and other non-IPv4 L2 frames even under an egress default
+     * ALLOW. */
+    if (!ok) {
+        verdict = egress_default_policy() == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
+        count_egress(verdict, pkt_len);
+        return tc_action(verdict);
+    }
 
     /* 2. egress policy, gated by the egress presence bits. */
     __u32 zero = 0;
