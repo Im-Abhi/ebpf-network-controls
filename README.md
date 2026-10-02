@@ -17,11 +17,12 @@ What works today (MTP1 core — XDP firewall):
 - **IPv4 exact IP / CIDR filtering** via an **LPM trie**
 - **Protocol + destination/src-port rules** (e.g. `block 1.2.3.4 --protocol tcp --dport 22`), verified end-to-end
 - **Priority-aware matching** (`--priority n`) — deterministic winner when rules overlap, including a **stateful TCP conntrack** fast-path (NEW / ESTABLISHED / CLOSED)
-- **Counters / telemetry** — total, drop and pass packet/byte counters (`firewallctl stats`)
+- **Direction-aware rules** — the same rule engine runs on **ingress (XDP)** and **egress (TC/TCX)**, selected per rule with `--dir in|out|both`; egress rules match the remote destination being contacted
+- **Counters / telemetry** — total, drop and pass packet/byte counters (`firewallctl stats`); ingress and egress counters kept separate
 - **CO-RE** (`vmlinux.h`) – portable across kernels without compile-time headers
 - **Go control plane** (`control/`)
 - **Unix socket API** (`control/server/`) for dynamic, runtime rule updates
-- **`firewallctl`** client for live `block` / `unblock` / `list` / `listports` / `status` / `stats` / `clear` / `default` / `conntrack`; `--protocol` / `--dport` / `--sport` / `--action` / `--priority` / `-sock` work in any position (before or after the command)
+- **`firewallctl`** client for live `block` / `unblock` / `list` / `listports` / `status` / `stats` / `clear` / `default` / `conntrack`; `--protocol` / `--dport` / `--sport` / `--action` / `--priority` / `--dir in|out|both` / `-sock` work in any position (before or after the command)
 - **Read-only HTTP stats API** (`control/api/`) — live `status`, `stats`, `rules` and `conntrack` over HTTP JSON, loopback by default (`-http-addr`, default `127.0.0.1:8080`); the CLI stays the only way to *change* policy
 - **Unit + integration tests** (`make test`, `make integration-test`)
 
@@ -62,8 +63,7 @@ sudo ./bin/firewallctl block 10.0.0.1 --protocol tcp --dport 22
 
 drops inbound TCP connections *to* `10.0.0.1` on port 22 (e.g. SSH attempts
 from other machines). A port rule is an exact match on **dst IP (host) +
-protocol + dst port + [src port]**; it does not filter egress packets (for that
-you would need TC egress, not yet implemented).
+protocol + dst port + [src port]**; it does not filter egress packets.
 
 A rule can also restrict the **source port** (`--sport n`), narrowing the rule
 to traffic whose sending port matches — e.g. a scan/detection tool that
@@ -77,6 +77,30 @@ e.g. `tcp/22 (sport 50000) -> 1.2.3.4 [drop] prio 0`.
 `clear` removes **both** the IP blocklist and all port rules in one call.
 Rule maps are anonymous kernel objects tied to the running daemon — they are
 reset when the daemon exits (no persistence across runs).
+
+### TC egress (outbound filtering)
+
+XDP is a **receive-side hook**, so outbound traffic needs a separate attach
+point. The same rule engine is additionally compiled as a **TC egress** program
+attached via TCX, giving the firewall a direction-aware policy surface:
+
+```bash
+sudo ./bin/firewall -i enp3s0 -dir both            # attach XDP ingress + TC egress
+sudo ./bin/firewallctl block 6.6.6.6 --dir out     # drop outbound to 6.6.6.6
+sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 443 --dir out
+sudo ./bin/firewallctl default deny --dir out      # drop all outbound by default
+```
+
+Egress rules operate on the remote endpoint being contacted: IP/CIDR rules are
+**dst-only**, and port rules match the **remote IP + remote port** of the
+outbound packet (the host's own ephemeral port is ignored — a rule that would
+have hit an outbound client port is not yet supported). Ingress rules still
+govern traffic *into* the host; each direction keeps its own IP, port, config
+and counter maps, and per-rule selection is done with `--dir in|out|both` on
+the `firewallctl` commands (`list`, `listports`, `block`, `unblock`, `default`,
+`clear`). Under egress default-deny, a reverse conntrack entry lets established
+replies back through the same way the ingress fast-path does. The TCX hook
+requires **kernel >= 6.6**.
 
 ### Stateful (conntrack)
 
@@ -124,9 +148,9 @@ control plane uses — GET-only, never mutating policy:
 | Endpoint   | Returns |
 | --- | --- |
 | `GET /health` | `{"ok":true}` |
-| `GET /status` | interface, attach mode, default policy, IP/port rule counts |
-| `GET /stats`  | total / drop / pass packet+byte counters |
-| `GET /rules`  | `{"blocked_rules":[…], "port_rules":[…]}` |
+| `GET /status` | interface, attach mode, ingress/egress default policies, IP/port rule counts |
+| `GET /stats`  | `{"ingress":{...},"egress":{...}}` total / drop / pass packet+byte counters |
+| `GET /rules`  | `{"blocked_rules":[…], "port_rules":[…], "egress_rules":[…], "egress_port_rules":[…], …}` |
 | `GET /conntrack` | `{"flows":[…]}` live TCP flow table |
 
 Bind it with `-http-addr` (default `127.0.0.1:8080`; `0` or empty disables it).
@@ -171,7 +195,7 @@ ebpf-firewall/
 │
 ├── control/
 │   ├── api/             # read-only HTTP stats API
-│   ├── ebpf/            # map manager, XDP lifecycle, generated bindings
+│   ├── ebpf/            # map managers, XDP + TC(TCX) lifecycle, generated bindings
 │   │   └── firewall_bpf.go   # GENERATED – do not edit
 │   ├── rules/           # rule/IP parsing
 │   └── server/          # Unix socket control API
@@ -191,7 +215,7 @@ ebpf-firewall/
 
 These are **planned**, not yet implemented:
 
-- **TC ingress / egress** (attach points beyond XDP)
+- **TC ingress** (attach points beyond XDP / TCX egress)
 - **Attack detection** (e.g. SYN floods)
 - **Quarantine & automated remediation**
 - **L7 / TLS traffic inspection**

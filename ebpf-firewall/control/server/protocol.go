@@ -17,14 +17,18 @@ const (
 )
 
 // Request is a single JSON command received over the control socket.
+// Direction selects which policy the command applies to: "in" (default, the
+// XDP ingress path), "out" (the TC egress path), or "both". An empty
+// Direction is normalized to "in" by the server.
 type Request struct {
-	Command  Command `json:"command"`
-	Value    string  `json:"value,omitempty"`
-	Protocol string  `json:"protocol,omitempty"`
-	Port     uint16  `json:"port,omitempty"`
-	SPort    uint16  `json:"sport,omitempty"`
-	Action   string  `json:"action,omitempty"`
-	Priority uint32  `json:"priority,omitempty"`
+	Command   Command `json:"command"`
+	Value     string  `json:"value,omitempty"`
+	Protocol  string  `json:"protocol,omitempty"`
+	Port      uint16  `json:"port,omitempty"`
+	SPort     uint16  `json:"sport,omitempty"`
+	Action    string  `json:"action,omitempty"`
+	Priority  uint32  `json:"priority,omitempty"`
+	Direction string  `json:"direction,omitempty"`
 }
 
 // PortRule is a protocol+port+destination rule as returned by the server.
@@ -71,18 +75,27 @@ type Stats struct {
 	PassBytes    uint64 `json:"pass_bytes"`
 }
 
-// Response is the JSON reply sent back to the client.
+// Response is the JSON reply sent back to the client. BlockedRules/PortRules
+// carry the ingress tables; EgressRules/EgressPortRules carry the egress
+// tables when the request asked for "out"/"both". Direction echoes the
+// normalized direction so multi-table replies are unambiguous for clients.
 type Response struct {
-	OK           bool          `json:"ok"`
-	Error        string        `json:"error,omitempty"`
-	Blocked      []string      `json:"blocked"`
-	BlockedRules []BlockedRule `json:"blocked_rules"`
-	Count        int           `json:"count,omitempty"`
-	Iface        string        `json:"interface,omitempty"`
-	Attached     bool          `json:"attached,omitempty"`
-	Stats        *Stats        `json:"stats,omitempty"`
-	PortRules    []PortRule       `json:"port_rules"`
-	Conntrack    []ConntrackEntry `json:"conntrack"`
-	Default      string           `json:"default_policy,omitempty"`
-	AttachMode   string           `json:"attach_mode,omitempty"`
+	OK            bool          `json:"ok"`
+	Error         string        `json:"error,omitempty"`
+	Blocked       []string      `json:"blocked"`
+	BlockedRules  []BlockedRule `json:"blocked_rules"`
+	Count         int           `json:"count,omitempty"`
+	Iface         string        `json:"interface,omitempty"`
+	Attached      bool          `json:"attached,omitempty"`
+	Stats         *Stats        `json:"stats,omitempty"`
+	PortRules     []PortRule       `json:"port_rules"`
+	Conntrack     []ConntrackEntry `json:"conntrack"`
+	Default       string           `json:"default_policy,omitempty"`
+	AttachMode    string           `json:"attach_mode,omitempty"`
+	Direction     string           `json:"direction,omitempty"`
+	EgressRules   []BlockedRule    `json:"egress_rules"`
+	EgressPortRules []PortRule     `json:"egress_port_rules"`
+	EgressDefault string           `json:"egress_default_policy,omitempty"`
+	EgressAttached bool           `json:"egress_attached,omitempty"`
+	EgressStats   *Stats           `json:"egress_stats,omitempty"`
 }

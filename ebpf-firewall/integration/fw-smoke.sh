@@ -38,6 +38,8 @@ ctl() { "$REPO/bin/firewallctl" -sock "$SOCK" "$@"; }
 
 drop_cnt() { ctl stats | sed -n 's/.*Dropped:[[:space:]]*\([0-9]*\).*/\1/p' | head -1; }
 pass_cnt() { ctl stats | sed -n 's/.*Passed:[[:space:]]*\([0-9]*\).*/\1/p' | head -1; }
+# egress drop counter = first "Dropped:" inside the trailing egress stats block
+edrop_cnt() { ctl stats | sed -n '/egress packets:/,$ {s/.*Dropped:[[:space:]]*\([0-9]*\).*/\1/p;}' | head -1; }
 
 ct_states() { ctl conntrack | grep -o '\[[a-z]*\]' | sort | uniq -c | sed 's/^ *//'; }
 ct_state_for() { # $1=srcport -> established/new/closed/none
@@ -237,6 +239,53 @@ $NS python3 "$SPY" raw "$HOST_IP" "$PORT" 39010 ACK
 sleep 0.2
 ck "$(( $(drop_cnt) - D0 ))" "1" "5e packet on reaped flow is denied (state gone)"
 kill "$KP" 2>/dev/null
+
+# ---- CHECK 6: egress direction (TCX; requires kernel >= 6.6) ----------------
+echo
+echo "===== CHECK 6: egress direction (TCX attach) ====="
+kill "$FW_PID" 2>/dev/null; wait "$FW_PID" 2>/dev/null
+FW_PID=
+rm -f "$SOCK"
+"$REPO/bin/firewall" -i "$V0" -sock "$SOCK" -dir both > "$LOG" 2>&1 &
+FW_PID=$!
+for _ in $(seq 1 20); do [ -S "$SOCK" ] && break; sleep 0.2; done
+if [ ! -S "$SOCK" ] || ! kill -0 "$FW_PID" 2>/dev/null; then
+    echo "SKIP: daemon with -dir both did not come up (kernel >= 6.6 required for TCX); log tail:"
+    tail -5 "$LOG"
+fi
+if [ -S "$SOCK" ] && kill -0 "$FW_PID" 2>/dev/null; then
+    ctl status | grep -q "egress: attached" && P "6a status shows egress attached" \
+        || F "6a status missing egress line"
+    # fresh daemon: egress defaults to allow, so outbound replies still pass
+    $NS python3 "$SPY" client "$HOST_IP" "$PORT" 41001 HELO > "$DIR/c.out" 2>&1
+    ck "$?" "0" "6b egress default allow: outbound reply passes"
+    # dst-only semantics: blocking an unrelated dst must not affect host->ns
+    ctl block 203.0.113.99 --dir out
+    $NS python3 "$SPY" client "$HOST_IP" "$PORT" 41002 HELO > "$DIR/c.out" 2>&1
+    ck "$?" "0" "6c irrelevant egress dst block leaves traffic alone"
+    ctl list --dir out | grep -q "203.0.113.99" && P "6d list --dir out shows the egress rule" \
+        || F "6d egress rule missing from list --dir out"
+    # blocking the ns IP on egress drops the host->ns replies so connect fails
+    E0=$(edrop_cnt)
+    ctl block "$NS_IP" --dir out
+    $NS python3 "$SPY" client "$HOST_IP" "$PORT" 41003 HELO > "$DIR/c.out" 2>&1
+    [ $? -eq 0 ] && F "6e egress block on the reply dst should fail the connection" \
+                  || P "6e egress block on destination drops outbound replies"
+    ED=$(($(edrop_cnt) - E0))
+    [ "$ED" -ge 1 ] && P "6f egress drop counter incremented ($ED drops)" \
+                    || F "6f no egress drop recorded"
+    ctl clear --dir out
+    $NS python3 "$SPY" client "$HOST_IP" "$PORT" 41004 HELO > "$DIR/c.out" 2>&1
+    ck "$?" "0" "6g clear --dir out restores connectivity"
+    # egress default deny blocks host->ns; restore allows again
+    ctl default deny --dir out
+    $NS python3 "$SPY" client "$HOST_IP" "$PORT" 41005 HELO > "$DIR/c.out" 2>&1
+    [ $? -eq 0 ] && F "6h egress default deny should drop outbound" \
+                  || P "6h egress default deny drops outbound"
+    ctl default allow --dir out
+    $NS python3 "$SPY" client "$HOST_IP" "$PORT" 41006 HELO > "$DIR/c.out" 2>&1
+    ck "$?" "0" "6i egress default allow restores outbound"
+fi
 
 # ---- summary ----------------------------------------------------------------
 echo

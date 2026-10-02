@@ -31,10 +31,13 @@ struct rule_value {
     __u32 priority;  /* higher wins; 0 = default */
 };
 
-/* ── Config map ─────────────────────────────────────────────────────── */
-/* Single-entry array holding the fallback (default) policy applied when no
- * rule matches. Entry 0 of the `default_policy` sub-field is an enum
- * (0 = ALLOW/PASS, 1 = DENY/DROP). Read once per packet by the datapath. */
+/* ── Config maps ────────────────────────────────────────────────────── */
+/* Single-entry arrays holding the fallback (default) policy applied when no
+ * rule matches. Ingress uses `firewall_config` entry 0; egress uses
+ * `egress_config` entry 0. Each sub-field is an enum default_policy
+ * (0 = ALLOW/PASS, 1 = DENY/DROP). Read once per packet by the datapath.
+ * The two are separate so ingress and egress can have independent defaults
+ * (see the TC egress milestone). */
 enum default_policy {
     DEFAULT_ALLOW = 0,
     DEFAULT_DENY  = 1,
@@ -47,7 +50,17 @@ struct {
     __uint(max_entries, 1);
 } firewall_config SEC(".maps");
 
-/* ── Policy map ─────────────────────────────────────────────────────── */
+/* Egress (TC) default policy. Key/layout identical to firewall_config so the
+ * same Go manager code can address either map. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1);
+} egress_config SEC(".maps");
+
+/* ── Policy maps ────────────────────────────────────────────────────── */
+/* Ingress policy (consumed by the XDP datapath). See ipv4_lpm_key below. */
 
 struct ipv4_lpm_key {
     __u32   prefixlen;
@@ -62,13 +75,31 @@ struct {
     __uint(max_entries, 65535);
 } blocked_ips SEC(".maps");
 
+/* Egress policy (consumed by the TC egress datapath). Semantics differ from
+ * the ingress maps: on egress the packet source is always the local host, so
+ * the IP blocklist matches the DESTINATION address only (never the local
+ * source, which would otherwise self-poison all outbound traffic when a rule
+ * covers the host's own address or subnet). Port rules likewise match the
+ * remote destination. Keeping separate maps (rather than a direction field in
+ * the existing keys) preserves the XDP datapath's semantics byte-for-byte. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, struct ipv4_lpm_key);
+    __type(value, struct rule_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __uint(max_entries, 65535);
+} egress_blocked_ips SEC(".maps");
+
 /* ── Global counters ────────────────────────────────────────────────── */
 
 enum counter_index {
-    COUNTER_TOTAL = 0,
-    COUNTER_DROP  = 1,
-    COUNTER_PASS  = 2,
-    COUNTER_MAX   = 3,
+    COUNTER_TOTAL        = 0,   /* ingress total */
+    COUNTER_DROP         = 1,   /* ingress drop  */
+    COUNTER_PASS         = 2,   /* ingress pass  */
+    COUNTER_EGRESS_TOTAL = 3,
+    COUNTER_EGRESS_DROP  = 4,
+    COUNTER_EGRESS_PASS  = 5,
+    COUNTER_MAX          = 6,
 };
 
 struct counter_value {
@@ -80,14 +111,16 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, __u32);
     __type(value, struct counter_value);
-    __uint(max_entries, 3);
+    __uint(max_entries, 6);
 } counters SEC(".maps");
 
 /* ── Rule-presence flags ─────────────────────────────────────────────── */
 /* Single-entry array the daemon uses to tell the datapath whether each
- * policy map currently holds at least one rule. Entry 0 packs two bits:
- *   bit 0 (RULE_IP_PRESENT)   -> blocked_ips has >= 1 entry
- *   bit 1 (RULE_PORT_PRESENT) -> port_policy has >= 1 entry
+ * policy map currently holds at least one rule. Entry 0 packs four bits:
+ *   bit 0 (RULE_IP_PRESENT)          -> blocked_ips has >= 1 entry
+ *   bit 1 (RULE_PORT_PRESENT)        -> port_policy has >= 1 entry
+ *   bit 2 (RULE_EGRESS_IP_PRESENT)   -> egress_blocked_ips has >= 1 entry
+ *   bit 3 (RULE_EGRESS_PORT_PRESENT) -> egress_port_policy has >= 1 entry
  * When a bit is clear the datapath skips the (LPM/hash) lookups for that
  * map entirely, since an empty map cannot match. This preserves the exact
  * same verdicts: a lookup against an empty map can only miss, and the
@@ -96,9 +129,15 @@ struct {
  * Ordering for correctness: the daemon SETS the relevant bit *before* the
  * first rule is inserted and CLEARS it only *after* the last entry has been
  * removed. A stale set bit costs a few lookups (all miss) but can never let
- * a live rule go unconsulted. */
-#define RULE_IP_PRESENT   (1U << 0)
-#define RULE_PORT_PRESENT (1U << 1)
+ * a live rule go unconsulted.
+ *
+ * Each datapath only tests the bits for maps it consumes: the XDP program
+ * reads flags but only acts on bits 0-1, the TC egress program only on
+ * bits 2-3, so both stay independent. */
+#define RULE_IP_PRESENT          (1U << 0)
+#define RULE_PORT_PRESENT        (1U << 1)
+#define RULE_EGRESS_IP_PRESENT   (1U << 2)
+#define RULE_EGRESS_PORT_PRESENT (1U << 3)
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -138,6 +177,20 @@ struct {
     __type(value, struct rule_value);
     __uint(max_entries, 65535);
 } port_policy SEC(".maps");
+
+/* ── Egress port policy map ─────────────────────────────────────────── */
+/* Same key/value layout as port_policy, consulted only by the TC egress
+ * datapath. On egress `dst`/`dport` refer to the REMOTE destination being
+ * reached by the local host (the packet's destination IP/port), so an egress
+ * rule expresses "this host may/may not reach remote dst:port". The
+ * wildcard semantics and four-way-probe precedence are identical to the
+ * ingress map; only the underlying map differs. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct port_rule_key);
+    __type(value, struct rule_value);
+    __uint(max_entries, 65535);
+} egress_port_policy SEC(".maps");
 
 /* ── Conntrack map ──────────────────────────────────────────────────── */
 /* TCP-only state table consulted only when the default policy is DENY, so

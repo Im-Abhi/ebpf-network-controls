@@ -40,7 +40,10 @@ MTP2+ are the thesis-level extensions built on top of it.
       ties: most-specific-first within the port table, IP-vs-port → DROP;
       `IP+priority` in `ldm_bindings.h`) — unit + integration tests green,
       full decision table covered live by `integration/fw-smoke.sh` (check 2)
-- [ ] Direction-aware rules (INGRESS / EGRESS)
+- [x] Direction-aware rules (INGRESS / EGRESS) — per-rule `--dir in|out|both`;
+      egress runs the same engine on outbound traffic via TCX (kernel >= 6.6),
+      with dst-only IP/CIDR + remote-dst port rules, separate maps/counters/
+      status/HTTP state, and live coverage in `integration/fw-smoke.sh` (check 6)
 
 ### MTP1-F: Fast-path optimization
 
@@ -128,7 +131,8 @@ MTP2+ are the thesis-level extensions built on top of it.
 ## MTP2 — Advanced Controls
 
 - [ ] TC ingress
-- [ ] TC egress
+- [x] TC egress — see MTP1-C "Direction-aware rules"; TCX hook requires
+      kernel >= 6.6 (cilium/ebpf v0.22.0)
 - [ ] SYN-flood detection
 - [ ] Quarantine
 - [ ] Automated remediation

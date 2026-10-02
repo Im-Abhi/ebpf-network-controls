@@ -120,6 +120,29 @@ func (x *XDPProgram) PortPolicy() *ebpf.Map {
 	return x.objs.PortPolicy
 }
 
+// EgressProgram returns the TC egress classifier program handle. It is loaded
+// in the same object as the XDP program but NOT attached by LoadXDP; wire it
+// up with TCProgram when the egress path is enabled.
+func (x *XDPProgram) EgressProgram() *ebpf.Program {
+	return x.objs.FirewallTcEgress
+}
+
+// EgressBlockedIps returns the eBPF map holding the egress destination
+// blocklist (consulted only by the TC egress datapath).
+func (x *XDPProgram) EgressBlockedIps() *ebpf.Map {
+	return x.objs.EgressBlockedIps
+}
+
+// EgressConfig returns the eBPF map holding the egress default policy.
+func (x *XDPProgram) EgressConfig() *ebpf.Map {
+	return x.objs.EgressConfig
+}
+
+// EgressPortPolicy returns the eBPF map holding egress protocol/port rules.
+func (x *XDPProgram) EgressPortPolicy() *ebpf.Map {
+	return x.objs.EgressPortPolicy
+}
+
 // Config returns the eBPF map holding the default policy configuration.
 func (x *XDPProgram) Config() *ebpf.Map {
 	return x.objs.FirewallConfig

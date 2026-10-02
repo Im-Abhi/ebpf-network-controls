@@ -6,7 +6,7 @@ import (
 )
 
 func TestExtractOptions_FlagsAfterCommand(t *testing.T) {
-	args, sock, proto, action, port, sport, priority, err := extractOptions(
+	args, sock, proto, action, dir, port, sport, priority, err := extractOptions(
 		[]string{"block", "10.153.245.175", "--protocol", "tcp", "--dport", "22", "--sport", "50000", "--action", "pass", "--priority", "100"},
 	)
 	if err != nil {
@@ -27,10 +27,13 @@ func TestExtractOptions_FlagsAfterCommand(t *testing.T) {
 	if priority != 100 {
 		t.Errorf("priority = %d, want 100", priority)
 	}
+	if dir != "" {
+		t.Errorf("dir = %q, want empty", dir)
+	}
 }
 
 func TestExtractOptions_FlagsBeforeCommand(t *testing.T) {
-	args, _, proto, action, port, sport, _, err := extractOptions(
+	args, _, proto, action, _, port, sport, _, err := extractOptions(
 		[]string{"-protocol", "udp", "-dport", "53", "-sport", "1234", "block", "1.2.3.4"},
 	)
 	if err != nil {
@@ -48,7 +51,7 @@ func TestExtractOptions_FlagsBeforeCommand(t *testing.T) {
 }
 
 func TestExtractOptions_EqualsForms(t *testing.T) {
-	args, sock, proto, action, port, sport, priority, err := extractOptions(
+	args, sock, proto, action, _, port, sport, priority, err := extractOptions(
 		[]string{"block", "1.2.3.4", "--protocol=tcp", "--dport=8080", "--sport=40000", "--action=drop", "-sock=/tmp/fw.sock", "--priority=42"},
 	)
 	if err != nil {
@@ -71,8 +74,39 @@ func TestExtractOptions_EqualsForms(t *testing.T) {
 	}
 }
 
+func TestExtractOptions_Direction(t *testing.T) {
+	for _, tc := range []struct {
+		raw  []string
+		want string
+	}{
+		{[]string{"block", "1.2.3.4", "--dir", "out"}, "out"},
+		{[]string{"block", "1.2.3.4", "-dir=both"}, "both"},
+		{[]string{"list", "--dir", "in"}, "in"},
+		{[]string{"clear", "-dir", "out"}, "out"},
+	} {
+		_, _, _, _, dir, _, _, _, err := extractOptions(tc.raw)
+		if err != nil {
+			t.Fatalf("extractOptions(%v): %v", tc.raw, err)
+		}
+		if dir != tc.want {
+			t.Errorf("extractOptions(%v) dir = %q, want %q", tc.raw, dir, tc.want)
+		}
+	}
+
+	// invalid direction values are rejected up front
+	for _, raw := range [][]string{
+		{"block", "1.2.3.4", "--dir", "sideways"},
+		{"block", "1.2.3.4", "--dir"},
+		{"block", "1.2.3.4", "--dir="},
+	} {
+		if _, _, _, _, _, _, _, _, err := extractOptions(raw); err == nil {
+			t.Errorf("extractOptions(%v): expected error, got nil", raw)
+		}
+	}
+}
+
 func TestExtractOptions_PlainCommand(t *testing.T) {
-	args, _, proto, action, port, sport, _, err := extractOptions([]string{"listports"})
+	args, _, proto, action, _, port, sport, _, err := extractOptions([]string{"listports"})
 	if err != nil {
 		t.Fatalf("extractOptions: %v", err)
 	}
@@ -99,7 +133,7 @@ func TestExtractOptions_Errors(t *testing.T) {
 		{"block", "1.2.3.4", "--bogus"},          // unknown option
 	}
 	for _, raw := range tests {
-		if _, _, _, _, _, _, _, err := extractOptions(raw); err == nil {
+		if _, _, _, _, _, _, _, _, err := extractOptions(raw); err == nil {
 			t.Errorf("extractOptions(%v): expected error, got nil", raw)
 		}
 	}

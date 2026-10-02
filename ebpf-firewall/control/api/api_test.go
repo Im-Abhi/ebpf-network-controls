@@ -15,16 +15,21 @@ import (
 // fakePolicy is a thread-safe in-memory server.Policy for unit tests (no
 // kernel), mirroring the fake in control/server/server_test.go.
 type fakePolicy struct {
-	mu       sync.Mutex
-	ips      []server.BlockedRule
-	ports    []server.PortRule
-	flows    []server.ConntrackEntry
-	def      string
-	statsErr bool
+	mu        sync.Mutex
+	ips       []server.BlockedRule
+	ports     []server.PortRule
+	flows     []server.ConntrackEntry
+	eips      []server.BlockedRule
+	epors     []server.PortRule
+	def       string
+	edef      string
+	attached  bool
+	statsErr  bool
+	egressErr bool
 }
 
 func newFakePolicy() *fakePolicy {
-	return &fakePolicy{def: "allow"}
+	return &fakePolicy{def: "allow", edef: "allow"}
 }
 
 func (f *fakePolicy) BlockIP(string) error { return errors.New("unexpected write") }
@@ -103,6 +108,73 @@ func (f *fakePolicy) DefaultPolicy() (string, error) {
 	defer f.mu.Unlock()
 	return f.def, nil
 }
+func (f *fakePolicy) BlockEgressWithAction(string, string) error {
+	return errors.New("unexpected write")
+}
+func (f *fakePolicy) BlockEgressWithActionPriority(string, string, uint32) error {
+	return errors.New("unexpected write")
+}
+func (f *fakePolicy) UnblockEgress(string) error { return errors.New("unexpected write") }
+func (f *fakePolicy) ListEgressRules() ([]server.BlockedRule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.egressErr {
+		return nil, errors.New("boom")
+	}
+	return append([]server.BlockedRule(nil), f.eips...), nil
+}
+func (f *fakePolicy) BlockEgressPortRule(string, string, uint16, uint16) error {
+	return errors.New("unexpected write")
+}
+func (f *fakePolicy) BlockEgressPortRuleWithAction(string, string, uint16, uint16, string) error {
+	return errors.New("unexpected write")
+}
+func (f *fakePolicy) BlockEgressPortRuleWithActionPriority(string, string, uint16, uint16, string, uint32) error {
+	return errors.New("unexpected write")
+}
+func (f *fakePolicy) UnblockEgressPortRule(string, string, uint16, uint16) error {
+	return errors.New("unexpected write")
+}
+func (f *fakePolicy) ListEgressPortRules() ([]server.PortRule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.egressErr {
+		return nil, errors.New("boom")
+	}
+	return append([]server.PortRule(nil), f.epors...), nil
+}
+func (f *fakePolicy) ClearEgress() error { return errors.New("unexpected write") }
+func (f *fakePolicy) SetEgressDefault(string) error {
+	return errors.New("unexpected write")
+}
+func (f *fakePolicy) EgressDefault() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.egressErr {
+		return "", errors.New("boom")
+	}
+	return f.edef, nil
+}
+func (f *fakePolicy) EgressStats() (server.Stats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.egressErr {
+		return server.Stats{}, errors.New("boom")
+	}
+	return server.Stats{
+		TotalPackets: 7,
+		TotalBytes:   77,
+		DropPackets:  3,
+		DropBytes:    33,
+		PassPackets:  4,
+		PassBytes:    44,
+	}, nil
+}
+func (f *fakePolicy) EgressAttached() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attached
+}
 
 // errPolicy fails on every read, exercising the 500 paths.
 type errPolicy struct{}
@@ -145,6 +217,42 @@ func (p *errPolicy) SetDefaultPolicy(string) error { return errors.New("boom") }
 func (p *errPolicy) DefaultPolicy() (string, error) {
 	return "", errors.New("boom")
 }
+func (p *errPolicy) BlockEgressWithAction(string, string) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) BlockEgressWithActionPriority(string, string, uint32) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) UnblockEgress(string) error { return errors.New("boom") }
+func (p *errPolicy) ListEgressRules() ([]server.BlockedRule, error) {
+	return nil, errors.New("boom")
+}
+func (p *errPolicy) BlockEgressPortRule(string, string, uint16, uint16) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) BlockEgressPortRuleWithAction(string, string, uint16, uint16, string) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) BlockEgressPortRuleWithActionPriority(string, string, uint16, uint16, string, uint32) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) UnblockEgressPortRule(string, string, uint16, uint16) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) ListEgressPortRules() ([]server.PortRule, error) {
+	return nil, errors.New("boom")
+}
+func (p *errPolicy) ClearEgress() error { return errors.New("boom") }
+func (p *errPolicy) SetEgressDefault(string) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) EgressDefault() (string, error) {
+	return "", errors.New("boom")
+}
+func (p *errPolicy) EgressStats() (server.Stats, error) {
+	return server.Stats{}, errors.New("boom")
+}
+func (p *errPolicy) EgressAttached() bool { return false }
 
 // doGET issues a GET (or other method) against the API and returns the recorder.
 func doRequest(t *testing.T, a *API, method, path string) *httptest.ResponseRecorder {
@@ -184,7 +292,11 @@ func TestStatus(t *testing.T) {
 	p.mu.Lock()
 	p.ips = []server.BlockedRule{{Cidr: "10.0.0.0/8", Action: "drop", Priority: 0}}
 	p.ports = []server.PortRule{{Protocol: "tcp", Port: 22, Dst: "1.2.3.4", Action: "pass", Priority: 5}}
+	p.eips = []server.BlockedRule{{Cidr: "8.8.8.8", Action: "drop", Priority: 0}}
+	p.epors = []server.PortRule{{Protocol: "tcp", Port: 443, Dst: "6.6.6.6", Action: "drop", Priority: 0}}
 	p.def = "deny"
+	p.edef = "deny"
+	p.attached = true
 	p.mu.Unlock()
 
 	rec := doRequest(t, New(p), http.MethodGet, "/status")
@@ -193,7 +305,17 @@ func TestStatus(t *testing.T) {
 	}
 	var s StatusResponse
 	decode(t, rec, &s)
-	want := StatusResponse{Interface: "lo0", AttachMode: "xdpDriver", DefaultPolicy: "deny", IPRuleCount: 1, PortRuleCount: 1}
+	want := StatusResponse{
+		Interface:           "lo0",
+		AttachMode:          "xdpDriver",
+		DefaultPolicy:       "deny",
+		IPRuleCount:         1,
+		PortRuleCount:       1,
+		EgressDefaultPolicy: "deny",
+		EgressIPRuleCount:   1,
+		EgressPortRuleCount: 1,
+		EgressAttached:      true,
+	}
 	if !reflect.DeepEqual(s, want) {
 		t.Errorf("status = %+v, want %+v", s, want)
 	}
@@ -204,10 +326,13 @@ func TestStats(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("stats code = %d, want 200", rec.Code)
 	}
-	var st server.Stats
+	var st StatsResponse
 	decode(t, rec, &st)
-	if st.TotalPackets != 100 || st.DropBytes != 600 || st.PassBytes != 4400 {
-		t.Errorf("stats = %+v, want totals/drops/passes populated", st)
+	if st.Ingress.TotalPackets != 100 || st.Ingress.DropBytes != 600 || st.Ingress.PassBytes != 4400 {
+		t.Errorf("ingress stats = %+v, want totals/drops/passes populated", st.Ingress)
+	}
+	if st.Egress.TotalPackets != 7 || st.Egress.DropPackets != 3 || st.Egress.PassPackets != 4 {
+		t.Errorf("egress stats = %+v, want totals/drops/passes populated", st.Egress)
 	}
 }
 
@@ -216,6 +341,8 @@ func TestRules(t *testing.T) {
 	p.mu.Lock()
 	p.ips = []server.BlockedRule{{Cidr: "1.2.3.4", Action: "drop", Priority: 3}}
 	p.ports = []server.PortRule{{Protocol: "udp", Port: 53, SPort: 0, Dst: "8.8.8.8", Action: "pass", Priority: 0}}
+	p.eips = []server.BlockedRule{{Cidr: "5.6.7.8", Action: "pass", Priority: 2}}
+	p.epors = []server.PortRule{{Protocol: "tcp", Port: 443, SPort: 0, Dst: "9.9.9.9", Action: "drop", Priority: 0}}
 	p.mu.Unlock()
 
 	rec := doRequest(t, New(p), http.MethodGet, "/rules")
@@ -230,14 +357,20 @@ func TestRules(t *testing.T) {
 	if len(r.PortRules) != 1 || r.PortRules[0].Protocol != "udp" || r.PortRules[0].Port != 53 {
 		t.Errorf("port_rules = %+v", r.PortRules)
 	}
+	if len(r.EgressRules) != 1 || r.EgressRules[0].Cidr != "5.6.7.8" || r.EgressRules[0].Action != "pass" {
+		t.Errorf("egress_rules = %+v", r.EgressRules)
+	}
+	if len(r.EgressPortRules) != 1 || r.EgressPortRules[0].Port != 443 || r.EgressPortRules[0].Dst != "9.9.9.9" {
+		t.Errorf("egress_port_rules = %+v", r.EgressPortRules)
+	}
 }
 
 func TestEmptyTablesRenderAsArrays(t *testing.T) {
 	rec := doRequest(t, New(newFakePolicy()), http.MethodGet, "/rules")
 	var r RulesResponse
 	decode(t, rec, &r)
-	if r.BlockedRules == nil || r.PortRules == nil {
-		t.Errorf("empty tables must render as [], got %+v", r)
+	if r.BlockedRules == nil || r.PortRules == nil || r.EgressRules == nil || r.EgressPortRules == nil {
+		t.Errorf("empty tables must render as non-nil arrays, got %+v", r)
 	}
 	rec = doRequest(t, New(newFakePolicy()), http.MethodGet, "/conntrack")
 	var c ConntrackResponse

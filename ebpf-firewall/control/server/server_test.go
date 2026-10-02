@@ -12,22 +12,29 @@ import (
 
 // fakePolicy is a thread-safe in-memory Policy for unit tests (no kernel).
 type fakePolicy struct {
-	mu     sync.Mutex
-	ips    map[string]BlockedRule
-	rules  map[string]PortRule
-	ct     map[string]ConntrackEntry
-	call   bool
-	stat   Stats
-	statOK bool
-	def    string
+	mu        sync.Mutex
+	ips       map[string]BlockedRule
+	rules     map[string]PortRule
+	ct        map[string]ConntrackEntry
+	eips      map[string]BlockedRule
+	erules    map[string]PortRule
+	call      bool
+	stat      Stats
+	statOK    bool
+	def       string
+	edef      string
+	eattached bool
 }
 
 func newFakePolicy() *fakePolicy {
 	return &fakePolicy{
-		ips:   make(map[string]BlockedRule),
-		rules: make(map[string]PortRule),
-		ct:    make(map[string]ConntrackEntry),
-		def:   "allow",
+		ips:    make(map[string]BlockedRule),
+		rules:  make(map[string]PortRule),
+		ct:     make(map[string]ConntrackEntry),
+		eips:   make(map[string]BlockedRule),
+		erules: make(map[string]PortRule),
+		def:    "allow",
+		edef:   "allow",
 	}
 }
 
@@ -155,6 +162,100 @@ func (f *fakePolicy) ListPortRules() ([]PortRule, error) {
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+func (f *fakePolicy) BlockEgressWithAction(cidr, action string) error {
+	return f.BlockEgressWithActionPriority(cidr, action, 0)
+}
+
+func (f *fakePolicy) BlockEgressWithActionPriority(cidr, action string, priority uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.eips[cidr] = BlockedRule{Cidr: cidr, Action: action, Priority: priority}
+	return nil
+}
+
+func (f *fakePolicy) UnblockEgress(cidr string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.eips, cidr)
+	return nil
+}
+
+func (f *fakePolicy) ListEgressRules() ([]BlockedRule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]BlockedRule, 0, len(f.eips))
+	for _, r := range f.eips {
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (f *fakePolicy) BlockEgressPortRule(dst, protocol string, dport, sport uint16) error {
+	return f.BlockEgressPortRuleWithActionPriority(dst, protocol, dport, sport, "drop", 0)
+}
+
+func (f *fakePolicy) BlockEgressPortRuleWithAction(dst, protocol string, dport, sport uint16, action string) error {
+	return f.BlockEgressPortRuleWithActionPriority(dst, protocol, dport, sport, action, 0)
+}
+
+func (f *fakePolicy) BlockEgressPortRuleWithActionPriority(dst, protocol string, dport, sport uint16, action string, priority uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.erules[portKey(dst, protocol, dport, sport)] = PortRule{Protocol: protocol, Port: dport, SPort: sport, Dst: dst, Action: action, Priority: priority}
+	return nil
+}
+
+func (f *fakePolicy) UnblockEgressPortRule(dst, protocol string, dport, sport uint16) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.erules, portKey(dst, protocol, dport, sport))
+	return nil
+}
+
+func (f *fakePolicy) ListEgressPortRules() ([]PortRule, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]PortRule, 0, len(f.erules))
+	for _, r := range f.erules {
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (f *fakePolicy) ClearEgress() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.eips = make(map[string]BlockedRule)
+	f.erules = make(map[string]PortRule)
+	return nil
+}
+
+func (f *fakePolicy) SetEgressDefault(s string) error {
+	if s != "allow" && s != "deny" {
+		return fmt.Errorf("invalid default policy %q", s)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.edef = s
+	return nil
+}
+
+func (f *fakePolicy) EgressDefault() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.edef, nil
+}
+
+func (f *fakePolicy) EgressStats() (Stats, error) {
+	return Stats{}, nil
+}
+
+func (f *fakePolicy) EgressAttached() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.eattached
 }
 
 func (f *fakePolicy) ClearPortRules() error {
@@ -400,6 +501,161 @@ func TestHandle_Stats(t *testing.T) {
 	}
 }
 
+func TestHandle_EgressDirection(t *testing.T) {
+	policy := newFakePolicy()
+	s := New("unused.sock", policy)
+
+	// plain block stays ingress-only
+	if resp := s.handle(Request{Command: CmdBlock, Value: "8.8.8.8"}); !resp.OK {
+		t.Fatalf("ingress block: %+v", resp)
+	}
+	// --dir out targets the egress IP map
+	if resp := s.handle(Request{Command: CmdBlock, Value: "8.8.4.4", Direction: dirOut}); !resp.OK {
+		t.Fatalf("egress block: %+v", resp)
+	}
+	// egress port rule
+	if resp := s.handle(Request{Command: CmdBlock, Value: "1.2.3.4", Protocol: "tcp", Port: 443, Direction: dirOut}); !resp.OK {
+		t.Fatalf("egress port block: %+v", resp)
+	}
+
+	// ingress list sees only the ingress rule
+	resp := s.handle(Request{Command: CmdList})
+	if !resp.OK || resp.Count != 1 || len(resp.EgressRules) != 0 {
+		t.Fatalf("ingress list: %+v", resp)
+	}
+	if !reflect.DeepEqual(resp.Blocked, []string{"8.8.8.8"}) {
+		t.Errorf("ingress blocked = %v", resp.Blocked)
+	}
+	if resp.Direction != "in" {
+		t.Errorf("ingress list direction = %q, want in", resp.Direction)
+	}
+
+	// --dir out list sees only the egress rule
+	resp = s.handle(Request{Command: CmdList, Direction: dirOut})
+	if !resp.OK || resp.Count != 1 || len(resp.BlockedRules) != 0 {
+		t.Fatalf("egress list: %+v", resp)
+	}
+	if len(resp.EgressRules) != 1 || resp.EgressRules[0].Cidr != "8.8.4.4" {
+		t.Errorf("egress rules = %+v", resp.EgressRules)
+	}
+	if resp.Direction != "out" {
+		t.Errorf("egress list direction = %q, want out", resp.Direction)
+	}
+
+	// both shows both tables
+	resp = s.handle(Request{Command: CmdList, Direction: dirBoth})
+	if !resp.OK || resp.Count != 2 {
+		t.Fatalf("both list: %+v", resp)
+	}
+	if resp.Direction != "both" {
+		t.Errorf("both list direction = %q", resp.Direction)
+	}
+
+	// port tables are separate too
+	resp = s.handle(Request{Command: CmdListPorts, Direction: dirBoth})
+	if !resp.OK || resp.Count != 1 || len(resp.EgressPortRules) != 1 {
+		t.Fatalf("both listports: %+v", resp)
+	}
+	if resp.EgressPortRules[0].Dst != "1.2.3.4" || resp.EgressPortRules[0].Port != 443 {
+		t.Errorf("egress port rules = %+v", resp.EgressPortRules)
+	}
+
+	// unblock --dir out removes only the egress entry
+	if resp := s.handle(Request{Command: CmdUnblock, Value: "8.8.4.4", Direction: dirOut}); !resp.OK {
+		t.Fatalf("egress unblock: %+v", resp)
+	}
+	resp = s.handle(Request{Command: CmdList, Direction: dirOut})
+	if !resp.OK || resp.Count != 0 {
+		t.Fatalf("egress list after unblock: %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdList}); resp.Count != 1 {
+		t.Errorf("ingress list after egress unblock = %+v, want 1 left", resp)
+	}
+}
+
+func TestHandle_EgressDefaultAndStatus(t *testing.T) {
+	policy := newFakePolicy()
+	policy.eattached = true
+	s := New("unused.sock", policy)
+
+	if resp := s.handle(Request{Command: CmdDefault, Value: "deny", Direction: dirOut}); !resp.OK {
+		t.Fatalf("egress set default: %+v", resp)
+	}
+	resp := s.handle(Request{Command: CmdStatus})
+	if !resp.OK {
+		t.Fatalf("status: %+v", resp)
+	} else if resp.EgressDefault != "deny" {
+		t.Errorf("status egress default = %q, want deny", resp.EgressDefault)
+	}
+	if !resp.EgressAttached {
+		t.Errorf("status egress attached should be true")
+	}
+	if resp.Default != "allow" {
+		t.Errorf("status ingress default should stay allow, got %q", resp.Default)
+	}
+}
+
+func TestHandle_InvalidDirection(t *testing.T) {
+	s := New("unused.sock", newFakePolicy())
+	if resp := s.handle(Request{Command: CmdBlock, Value: "8.8.8.8", Direction: "sideways"}); resp.OK {
+		t.Errorf("invalid direction should not be ok: %+v", resp)
+	}
+}
+
+func TestHandle_ClearDirectionScoped(t *testing.T) {
+	policy := newFakePolicy()
+	s := New("unused.sock", policy)
+
+	if resp := s.handle(Request{Command: CmdBlock, Value: "8.8.8.8"}); !resp.OK {
+		t.Fatalf("ingress block: %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdBlock, Value: "8.8.4.4", Direction: dirOut}); !resp.OK {
+		t.Fatalf("egress block: %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdBlock, Value: "1.2.3.4", Protocol: "tcp", Port: 443, Direction: dirOut}); !resp.OK {
+		t.Fatalf("egress port block: %+v", resp)
+	}
+
+	// clear --dir out must leave the ingress table alone
+	if resp := s.handle(Request{Command: CmdClear, Direction: dirOut}); !resp.OK {
+		t.Fatalf("egress clear: %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdList, Direction: dirOut}); resp.Count != 0 {
+		t.Errorf("egress list after clear = %+v, want empty", resp)
+	}
+	if resp := s.handle(Request{Command: CmdListPorts, Direction: dirOut}); resp.Count != 0 {
+		t.Errorf("egress listports after clear = %+v, want empty", resp)
+	}
+	if resp := s.handle(Request{Command: CmdList}); resp.Count != 1 {
+		t.Errorf("ingress list after egress clear = %+v, want 1 left", resp)
+	}
+
+	// plain clear resets both and the conntrack table
+	policy.mu.Lock()
+	policy.ct["flow"] = ConntrackEntry{Src: "10.0.0.1", Dst: "1.2.3.4", Sport: 50000, Dport: 22, Protocol: "tcp", State: "established", AgeSeconds: 1}
+	policy.mu.Unlock()
+	if resp := s.handle(Request{Command: CmdClear}); !resp.OK {
+		t.Fatalf("full clear: %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdList, Direction: dirBoth}); resp.Count != 0 {
+		t.Errorf("both list after clear = %+v", resp)
+	}
+	if resp := s.handle(Request{Command: CmdConntrack}); resp.Count != 0 {
+		t.Errorf("conntrack after clear = %+v", resp)
+	}
+}
+
+func TestHandle_StatsIncludesEgress(t *testing.T) {
+	s := New("unused.sock", newFakePolicy())
+	resp := s.handle(Request{Command: CmdStats})
+	if !resp.OK {
+		t.Fatalf("stats: %+v", resp)
+	}
+	if resp.EgressStats == nil {
+		t.Fatal("stats response has nil EgressStats")
+	}
+}
+
 // errPolicy returns an error from every blocked-side operation.
 type errPolicy struct{}
 
@@ -429,6 +685,30 @@ func (p *errPolicy) ListConntrack() ([]ConntrackEntry, error)              { ret
 func (p *errPolicy) ClearConntrack() error                                 { return errors.New("boom") }
 func (p *errPolicy) SetDefaultPolicy(string) error                         { return errors.New("boom") }
 func (p *errPolicy) DefaultPolicy() (string, error)                        { return "", errors.New("boom") }
+func (p *errPolicy) BlockEgressWithAction(string, string) error            { return errors.New("boom") }
+func (p *errPolicy) BlockEgressWithActionPriority(string, string, uint32) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) UnblockEgress(string) error             { return errors.New("boom") }
+func (p *errPolicy) ListEgressRules() ([]BlockedRule, error) { return nil, errors.New("boom") }
+func (p *errPolicy) BlockEgressPortRule(string, string, uint16, uint16) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) BlockEgressPortRuleWithAction(string, string, uint16, uint16, string) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) BlockEgressPortRuleWithActionPriority(string, string, uint16, uint16, string, uint32) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) UnblockEgressPortRule(string, string, uint16, uint16) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) ListEgressPortRules() ([]PortRule, error) { return nil, errors.New("boom") }
+func (p *errPolicy) ClearEgress() error                        { return errors.New("boom") }
+func (p *errPolicy) SetEgressDefault(string) error             { return errors.New("boom") }
+func (p *errPolicy) EgressDefault() (string, error)            { return "", errors.New("boom") }
+func (p *errPolicy) EgressStats() (Stats, error)               { return Stats{}, errors.New("boom") }
+func (p *errPolicy) EgressAttached() bool                      { return false }
 
 func TestHandle_PropagatesErrors(t *testing.T) {
 	s := New("unused.sock", &errPolicy{})

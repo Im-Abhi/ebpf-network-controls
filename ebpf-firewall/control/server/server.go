@@ -12,7 +12,8 @@ import (
 
 // Policy is the minimal firewall surface the control server drives. It is
 // satisfied by *ebpf.Firewall and lets the server be unit-tested against a
-// fake without a kernel.
+// fake without a kernel. Ingress methods (BlockIP, BlockPortRule, ...) manage
+// the XDP policy; Egress* methods manage the TC egress policy.
 type Policy interface {
 	BlockIP(cidr string) error
 	BlockIPWithAction(cidr, action string) error
@@ -34,6 +35,45 @@ type Policy interface {
 	ClearConntrack() error
 	SetDefaultPolicy(s string) error
 	DefaultPolicy() (string, error)
+
+	BlockEgressWithAction(cidr, action string) error
+	BlockEgressWithActionPriority(cidr, action string, priority uint32) error
+	UnblockEgress(cidr string) error
+	ListEgressRules() ([]BlockedRule, error)
+	BlockEgressPortRule(dst, protocol string, dport, sport uint16) error
+	BlockEgressPortRuleWithAction(dst, protocol string, dport, sport uint16, action string) error
+	BlockEgressPortRuleWithActionPriority(dst, protocol string, dport, sport uint16, action string, priority uint32) error
+	UnblockEgressPortRule(dst, protocol string, dport, sport uint16) error
+	ListEgressPortRules() ([]PortRule, error)
+	ClearEgress() error
+	SetEgressDefault(s string) error
+	EgressDefault() (string, error)
+	EgressStats() (Stats, error)
+	EgressAttached() bool
+}
+
+// Direction values accepted for Request.Direction. An empty string is
+// normalized to in by normalizeDirection so plain blocks stay ingress-only.
+const (
+	dirIn   = "in"
+	dirOut  = "out"
+	dirBoth = "both"
+)
+
+// normalizeDirection maps an empty/invalid direction to the set of concrete
+// policies it applies to. "" and "in" touch only the ingress maps; "out" only
+// the egress maps; "both" both.
+func normalizeDirection(d string) ([]string, error) {
+	switch d {
+	case "", dirIn:
+		return []string{dirIn}, nil
+	case dirOut:
+		return []string{dirOut}, nil
+	case dirBoth:
+		return []string{dirIn, dirOut}, nil
+	default:
+		return nil, fmt.Errorf("invalid direction %q (use in, out, or both)", d)
+	}
 }
 
 // Server exposes a newline-delimited JSON API over a Unix socket. Each command
@@ -172,56 +212,138 @@ func (s *Server) handle(req Request) Response {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	dirs, err := normalizeDirection(req.Direction)
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	// Echo back a canonical single direction (in/out/both) so multi-table
+	// replies are self-describing.
+	echoDir := dirs[0]
+	if len(dirs) == 2 {
+		echoDir = dirBoth
+	}
+
+	isPortRule := req.Protocol != "" || req.Port != 0 || req.SPort != 0
+
 	switch req.Command {
 	case CmdBlock:
-		if req.Protocol != "" || req.Port != 0 || req.SPort != 0 {
-			if req.Action != "" {
-				if err := s.policy.BlockPortRuleWithActionPriority(req.Value, req.Protocol, req.Port, req.SPort, req.Action, req.Priority); err != nil {
+		for _, d := range dirs {
+			if isPortRule {
+				if d == dirIn {
+					if req.Action != "" {
+						if err := s.policy.BlockPortRuleWithActionPriority(req.Value, req.Protocol, req.Port, req.SPort, req.Action, req.Priority); err != nil {
+							return Response{OK: false, Error: err.Error()}
+						}
+					} else if err := s.policy.BlockPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
+						return Response{OK: false, Error: err.Error()}
+					}
+				} else {
+					if req.Action != "" {
+						if err := s.policy.BlockEgressPortRuleWithActionPriority(req.Value, req.Protocol, req.Port, req.SPort, req.Action, req.Priority); err != nil {
+							return Response{OK: false, Error: err.Error()}
+						}
+					} else if err := s.policy.BlockEgressPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
+						return Response{OK: false, Error: err.Error()}
+					}
+				}
+				continue
+			}
+			if d == dirIn {
+				if req.Action != "" {
+					if err := s.policy.BlockIPWithActionPriority(req.Value, req.Action, req.Priority); err != nil {
+						return Response{OK: false, Error: err.Error()}
+					}
+				} else if err := s.policy.BlockIP(req.Value); err != nil {
 					return Response{OK: false, Error: err.Error()}
 				}
-			} else if err := s.policy.BlockPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
-				return Response{OK: false, Error: err.Error()}
+			} else {
+				if req.Action != "" {
+					if err := s.policy.BlockEgressWithActionPriority(req.Value, req.Action, req.Priority); err != nil {
+						return Response{OK: false, Error: err.Error()}
+					}
+				} else if err := s.policy.BlockEgressWithAction(req.Value, "drop"); err != nil {
+					return Response{OK: false, Error: err.Error()}
+				}
 			}
-			return Response{OK: true}
 		}
-		if req.Action != "" {
-			if err := s.policy.BlockIPWithActionPriority(req.Value, req.Action, req.Priority); err != nil {
-				return Response{OK: false, Error: err.Error()}
-			}
-		} else if err := s.policy.BlockIP(req.Value); err != nil {
-			return Response{OK: false, Error: err.Error()}
-		}
-		return Response{OK: true}
+		return Response{OK: true, Direction: echoDir}
 
 	case CmdUnblock:
-		if req.Protocol != "" || req.Port != 0 || req.SPort != 0 {
-			if err := s.policy.UnblockPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
+		for _, d := range dirs {
+			if isPortRule {
+				if d == dirIn {
+					if err := s.policy.UnblockPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
+						return Response{OK: false, Error: err.Error()}
+					}
+				} else if err := s.policy.UnblockEgressPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
+					return Response{OK: false, Error: err.Error()}
+				}
+				continue
+			}
+			if d == dirIn {
+				if err := s.policy.UnblockIP(req.Value); err != nil {
+					return Response{OK: false, Error: err.Error()}
+				}
+			} else if err := s.policy.UnblockEgress(req.Value); err != nil {
 				return Response{OK: false, Error: err.Error()}
 			}
-			return Response{OK: true}
 		}
-		if err := s.policy.UnblockIP(req.Value); err != nil {
-			return Response{OK: false, Error: err.Error()}
-		}
-		return Response{OK: true}
+		return Response{OK: true, Direction: echoDir}
 
 	case CmdList:
-		rules, err := s.policy.ListBlockedRules()
-		if err != nil {
-			return Response{OK: false, Error: err.Error()}
+		var blocked, egress []BlockedRule
+		for _, d := range dirs {
+			if d == dirIn {
+				rules, err := s.policy.ListBlockedRules()
+				if err != nil {
+					return Response{OK: false, Error: err.Error()}
+				}
+				blocked = append(blocked, rules...)
+			} else {
+				rules, err := s.policy.ListEgressRules()
+				if err != nil {
+					return Response{OK: false, Error: err.Error()}
+				}
+				egress = append(egress, rules...)
+			}
 		}
-		blocked := make([]string, 0, len(rules))
-		for _, r := range rules {
-			blocked = append(blocked, r.Cidr)
+		blockedCids := make([]string, 0, len(blocked))
+		for _, r := range blocked {
+			blockedCids = append(blockedCids, r.Cidr)
 		}
-		return Response{OK: true, Blocked: blocked, BlockedRules: rules, Count: len(blocked)}
+		return Response{
+			OK:          true,
+			Blocked:     blockedCids,
+			BlockedRules: blocked,
+			EgressRules: egress,
+			Count:       len(blocked) + len(egress),
+			Direction:   echoDir,
+		}
 
 	case CmdListPorts:
-		rules, err := s.policy.ListPortRules()
-		if err != nil {
-			return Response{OK: false, Error: err.Error()}
+		var ports, egressPorts []PortRule
+		for _, d := range dirs {
+			if d == dirIn {
+				rules, err := s.policy.ListPortRules()
+				if err != nil {
+					return Response{OK: false, Error: err.Error()}
+				}
+				ports = append(ports, rules...)
+			} else {
+				rules, err := s.policy.ListEgressPortRules()
+				if err != nil {
+					return Response{OK: false, Error: err.Error()}
+				}
+				egressPorts = append(egressPorts, rules...)
+			}
 		}
-		return Response{OK: true, PortRules: rules, Count: len(rules)}
+		return Response{
+			OK:              true,
+			PortRules:       ports,
+			EgressPortRules: egressPorts,
+			Count:           len(ports) + len(egressPorts),
+			Direction:       echoDir,
+		}
 
 	case CmdStatus:
 		blocked, err := s.policy.ListBlockedIPs()
@@ -232,41 +354,71 @@ func (s *Server) handle(req Request) Response {
 		if err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
-		return Response{OK: true, Iface: s.policy.Interface(), Attached: s.live, Count: len(blocked), Default: def, AttachMode: s.policy.AttachMode()}
+		egressDef, err := s.policy.EgressDefault()
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+		return Response{
+			OK:             true,
+			Iface:          s.policy.Interface(),
+			Attached:       s.live,
+			Count:          len(blocked),
+			Default:        def,
+			AttachMode:     s.policy.AttachMode(),
+			Direction:      "in",
+			EgressDefault:  egressDef,
+			EgressAttached: s.policy.EgressAttached(),
+		}
 
 	case CmdSetDefault, CmdDefault:
-		if err := s.policy.SetDefaultPolicy(req.Value); err != nil {
-			return Response{OK: false, Error: err.Error()}
+		for _, d := range dirs {
+			if d == dirIn {
+				if err := s.policy.SetDefaultPolicy(req.Value); err != nil {
+					return Response{OK: false, Error: err.Error()}
+				}
+			} else if err := s.policy.SetEgressDefault(req.Value); err != nil {
+				return Response{OK: false, Error: err.Error()}
+			}
 		}
-		return Response{OK: true}
+		return Response{OK: true, Direction: echoDir}
 
 	case CmdClear:
-		if err := s.policy.Clear(); err != nil {
-			return Response{OK: false, Error: err.Error()}
-		}
-		if err := s.policy.ClearPortRules(); err != nil {
-			return Response{OK: false, Error: err.Error()}
+		for _, d := range dirs {
+			if d == dirIn {
+				if err := s.policy.Clear(); err != nil {
+					return Response{OK: false, Error: err.Error()}
+				}
+				if err := s.policy.ClearPortRules(); err != nil {
+					return Response{OK: false, Error: err.Error()}
+				}
+			} else if err := s.policy.ClearEgress(); err != nil {
+				return Response{OK: false, Error: err.Error()}
+			}
 		}
 		// Rule changes can invalidate established flows, so clear the tracked
 		// state too.
 		if err := s.policy.ClearConntrack(); err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
-		return Response{OK: true}
+		return Response{OK: true, Direction: echoDir}
 
 	case CmdConntrack:
 		entries, err := s.policy.ListConntrack()
 		if err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
-		return Response{OK: true, Conntrack: entries, Count: len(entries)}
+		return Response{OK: true, Conntrack: entries, Count: len(entries), Direction: "in"}
 
 	case CmdStats:
 		stats, err := s.policy.Stats()
 		if err != nil {
 			return Response{OK: false, Error: err.Error()}
 		}
-		return Response{OK: true, Stats: &stats}
+		egressStats, err := s.policy.EgressStats()
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+		return Response{OK: true, Stats: &stats, EgressStats: &egressStats}
 
 	default:
 		return Response{OK: false, Error: "unknown command: " + string(req.Command)}

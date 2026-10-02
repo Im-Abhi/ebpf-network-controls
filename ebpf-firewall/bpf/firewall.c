@@ -69,6 +69,15 @@
 #define TCP_ACK 0x10
 #endif
 
+/* TC classifier action codes (linux/pkt_cls.h UAPI macros, not in vmlinux.h).
+ * The egress program maps XDP verdicts onto these: DROP -> SHOT, PASS -> OK. */
+#ifndef TC_ACT_OK
+#define TC_ACT_OK 0
+#endif
+#ifndef TC_ACT_SHOT
+#define TC_ACT_SHOT 2
+#endif
+
 /* Minimal parsed view of an IPv4 packet, sufficient for the current
  * IP/CIDR policy plus protocol/port rules. Extended later with direction
  * for richer rules without touching the datapath control flow. */
@@ -440,6 +449,276 @@ int firewall_prog(struct xdp_md *ctx) {
     incr_counter(COUNTER_TOTAL, pkt_len);
     incr_counter(COUNTER_PASS, pkt_len);
     return XDP_PASS;
+}
+
+/* ══ TC egress datapath ────────────────────────────────────────────────
+ * Second hook: a SCHED_CLS classifier attached to the tc egress (clsact)
+ * direction, filtering host-generated outbound traffic. The XDP program
+ * (firewall_prog) is receive-side only and stays byte-for-byte unchanged;
+ * this program is a separate SEC("classifier") section in the same object so
+ * both directions share the policy and conntrack maps.
+ *
+ * Direction semantics (deliberately different from ingress):
+ *   - egress_blocked_ips  -> matches the packet DESTINATION only; the source
+ *     is always the local host, so matching it would self-poison traffic.
+ *   - egress_port_policy  -> key.dst is the remote destination being reached.
+ *   - egress_config       -> independent egress default policy.
+ *   - counters 3-5        -> egress total/drop/pass (ingress keeps 0-2).
+ *   - rule_presence 2-3   -> egress IP/port presence (bits 0-1 are XDP's).
+ *
+ * Stateful fast path: the single `conntrack` map is shared with the ingress
+ * program and is consulted/updated only when the gate holds (EGRESS default
+ * DENY OR ingress default DENY) - i.e. only when a state change could flip a
+ * future verdict. The probe looks up both the exact (outbound) tuple and its
+ * reverse. New outbound flows create the REVERSE (reply) entry as ESTABLISHED
+ * so that the unchanged ingress datapath - which only ever does an
+ * exact-tuple lookup - passes the reply under a default-deny ingress.
+ * Documented tradeoff: a reply tuple is "established" before the 3WHS ends,
+ * but that window covers exactly one fully-specified reply tuple that only
+ * the intended server can legitimately transmit.
+ *
+ * The program reads only data/data_end from __sk_buff (never skb->len or any
+ * other field) so BPF_PROG_TEST_RUN can drive it with synthesized packets.
+ */
+
+/* Build the reverse (reply) conntrack key: swap src/dst address and port so
+ * an outbound packet can find the entry created for its reply direction.
+ * Zeroes padding exactly like ct_build_key. */
+static __always_inline void ct_build_reverse_key(struct ct_key *key,
+                                                 const struct packet_info *info) {
+    __builtin_memset(key, 0, sizeof(*key));
+    key->saddr = info->daddr;
+    key->daddr = info->saddr;
+    key->sport = info->dport;
+    key->dport = info->sport;
+    key->protocol = info->protocol;
+}
+
+static __always_inline int tc_action(int verdict) {
+    return verdict == XDP_DROP ? TC_ACT_SHOT : TC_ACT_OK;
+}
+
+static __always_inline enum default_policy egress_default_policy(void) {
+    __u32 key = 0;
+    __u32 *policy = bpf_map_lookup_elem(&egress_config, &key);
+    if (!policy) {
+        return DEFAULT_ALLOW;
+    }
+    return (enum default_policy)*policy;
+}
+
+/* Egress IP blocklist: destination-only LPM lookup on egress_blocked_ips. */
+static __always_inline int egress_ip_block_action(const struct packet_info *info,
+                                                  struct rule_value *out) {
+    struct ipv4_lpm_key key = {
+        .prefixlen = 32,
+        .data = info->daddr,
+    };
+
+    struct rule_value *elem = bpf_map_lookup_elem(&egress_blocked_ips, &key);
+    if (!elem) {
+        return 0;
+    }
+
+    *out = *elem;
+    return 1;
+}
+
+/* Egress port-policy lookup: same most-specific-first precedence and
+ * priority tie-break as the ingress engine, but against egress_port_policy.
+ * The probe macro is duplicated (renamed) rather than parameterized so that
+ * firewall_prog's codegen is untouched. */
+static __always_inline int egress_port_rule_action(const struct packet_info *info,
+                                                   struct rule_value *out) {
+    struct port_rule_key key;
+    struct rule_value *elem;
+    struct rule_value best = {};
+    int matched = 0;
+
+    __builtin_memset(&key, 0, sizeof(key));
+    key.protocol = info->protocol;
+    key.dport = info->dport;
+    key.sport = info->sport;
+    key.dst = info->daddr;
+
+#define TRY_EGRESS_LOOKUP(d, s)                                         \
+    do {                                                                \
+        key.dport = (d);                                                \
+        key.sport = (s);                                                \
+        elem = bpf_map_lookup_elem(&egress_port_policy, &key);          \
+        if (elem && (!matched || elem->priority > best.priority)) {     \
+            best = *elem;                                               \
+            matched = 1;                                                \
+        }                                                               \
+    } while (0)
+
+    TRY_EGRESS_LOOKUP(info->dport, info->sport);
+    TRY_EGRESS_LOOKUP(info->dport, 0);
+    TRY_EGRESS_LOOKUP(0,          info->sport);
+    TRY_EGRESS_LOOKUP(0,          0);
+
+#undef TRY_EGRESS_LOOKUP
+
+    if (!matched) {
+        return 0;
+    }
+
+    *out = best;
+    return 1;
+}
+
+/* Shared state probe for egress: ESTABLISHED on the exact (outbound) tuple
+ * or its reverse. */
+static __always_inline int ct_is_established_egress(const struct packet_info *info) {
+    struct ct_key key;
+    struct ct_value *v;
+
+    ct_build_key(&key, info);
+    v = bpf_map_lookup_elem(&conntrack, &key);
+    if (v && v->state == CT_ESTABLISHED) {
+        return 1;
+    }
+
+    ct_build_reverse_key(&key, info);
+    v = bpf_map_lookup_elem(&conntrack, &key);
+    return v && v->state == CT_ESTABLISHED;
+}
+
+/* Gate: decide whether egress may consult/write conntrack for this packet.
+ * True only for TCP when EITHER direction's default is DENY - a state change
+ * could then flip some future verdict. With both defaults ALLOW no state can
+ * matter and the datapath stays off the state reads/writes (mirrors the XDP
+ * datapath's default-allow gate). */
+static __always_inline int ct_active_egress(const struct packet_info *info,
+                                            enum default_policy def_egress) {
+    if (info.protocol != IPPROTO_TCP) {
+        return 0;
+    }
+    if (def_egress == DEFAULT_DENY) {
+        return 1;
+    }
+
+    __u32 key = 0;
+    __u32 *policy = bpf_map_lookup_elem(&firewall_config, &key);
+    return policy && *policy == DEFAULT_DENY;
+}
+
+/* Record an accepted outbound TCP packet in the shared conntrack map.
+ * Orientation resolution, exact then reverse - each refreshed with the same
+ * transitions as the ingress side (FIN/RST -> CLOSED, ACK on NEW ->
+ * ESTABLISHED). A brand-new outbound flow is stored under its REVERSE (reply)
+ * tuple as ESTABLISHED so the unchanged ingress path passes the reply under
+ * default-deny (see the section note). */
+static __always_inline void ct_update_egress(const struct packet_info *info) {
+    struct ct_key exact;
+    struct ct_key rev;
+    struct ct_value *v;
+    struct ct_value nv = {};
+    __u64 now = bpf_ktime_get_ns();
+    __u32 close = info->tcp_flags & (TCP_FIN | TCP_RST);
+
+    ct_build_key(&exact, info);
+    ct_build_reverse_key(&rev, info);
+
+    v = bpf_map_lookup_elem(&conntrack, &exact);
+    if (v) {
+        v->last_seen = now;
+        if (close) {
+            v->state = CT_CLOSED;
+        } else if (v->state == CT_NEW && (info->tcp_flags & TCP_ACK)) {
+            v->state = CT_ESTABLISHED;
+        }
+        return;
+    }
+
+    v = bpf_map_lookup_elem(&conntrack, &rev);
+    if (v) {
+        v->last_seen = now;
+        if (close) {
+            v->state = CT_CLOSED;
+        } else if (v->state == CT_NEW && (info->tcp_flags & TCP_ACK)) {
+            v->state = CT_ESTABLISHED;
+        }
+        return;
+    }
+
+    nv.last_seen = now;
+    nv.state = close ? CT_CLOSED : CT_ESTABLISHED;
+    bpf_map_update_elem(&conntrack, &rev, &nv, BPF_ANY);
+}
+
+/* Egress counter increment (indices 3-5; ingress keeps 0-2). */
+static __always_inline void incr_egress_counter(__u32 idx, __u64 bytes) {
+    struct counter_value *val = bpf_map_lookup_elem(&counters, &idx);
+    if (val) {
+        __sync_fetch_and_add(&val->packets, 1);
+        __sync_fetch_and_add(&val->bytes, bytes);
+    }
+}
+
+static __always_inline void count_egress(int verdict, __u64 bytes) {
+    if (verdict == XDP_DROP) {
+        incr_egress_counter(COUNTER_EGRESS_TOTAL, bytes);
+        incr_egress_counter(COUNTER_EGRESS_DROP, bytes);
+    } else {
+        incr_egress_counter(COUNTER_EGRESS_TOTAL, bytes);
+        incr_egress_counter(COUNTER_EGRESS_PASS, bytes);
+    }
+}
+
+SEC("classifier")
+int firewall_tc_egress(struct __sk_buff *skb) {
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    __u64 pkt_len = (__u64)(data_end - data);
+    struct hdr_cursor nh;
+    int ok;
+    int verdict;
+
+    /* 1. parse (shared with the XDP datapath). */
+    nh.pos = data;
+    struct packet_info info = parse_packet(&nh, data_end, &ok);
+
+    /* 2. egress policy, gated by the egress presence bits. */
+    __u32 zero = 0;
+    __u32 *presence = bpf_map_lookup_elem(&rule_presence, &zero);
+    __u32 flags = presence ? *presence : 0;
+
+    struct rule_value ip_rule = {}, port_rule = {};
+    int ip_matched = 0, port_matched = 0;
+    if (flags & RULE_EGRESS_IP_PRESENT) {
+        ip_matched = egress_ip_block_action(&info, &ip_rule);
+    }
+    if (flags & RULE_EGRESS_PORT_PRESENT) {
+        port_matched = egress_port_rule_action(&info, &port_rule);
+    }
+
+    /* 3. decision: same priority table as ingress; on no rule match the
+     * shared stateful fast path is consulted when this hook's default is
+     * DENY, then the egress default applies. */
+    enum default_policy def_egress = egress_default_policy();
+    if (ip_matched || port_matched) {
+        verdict = decide(ip_matched, &ip_rule, port_matched, &port_rule);
+    } else if (def_egress == DEFAULT_DENY && info.protocol == IPPROTO_TCP &&
+               ct_is_established_egress(&info)) {
+        verdict = XDP_PASS;
+    } else {
+        verdict = def_egress == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
+    }
+
+    if (verdict == XDP_DROP) {
+        count_egress(XDP_DROP, pkt_len);
+        return tc_action(XDP_DROP);
+    }
+
+    /* 4. accepted: record/refresh TCP state when a direction could need it. */
+    if (ct_active_egress(&info, def_egress)) {
+        ct_update_egress(&info);
+    }
+
+    /* 5. passed. */
+    count_egress(XDP_PASS, pkt_len);
+    return tc_action(XDP_PASS);
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";

@@ -96,8 +96,10 @@ func wireToPort(w uint16) uint16 {
 	return binary.BigEndian.Uint16(b[:])
 }
 
-// newPortKey builds the map key for a (dst, protocol, dport, sport) rule.
-func (pm *PortPolicyManager) newPortKey(dst string, proto uint8, dport, sport uint16) (firewallPortRuleKey, error) {
+// buildPortRuleKey builds the map key for a (dst, protocol, dport, sport)
+// rule. It is shared by the ingress PortPolicyManager and the egress
+// EgressPolicyManager so both directions encode the identical key layout.
+func buildPortRuleKey(dst string, proto uint8, dport, sport uint16) (firewallPortRuleKey, error) {
 	var key firewallPortRuleKey
 
 	ip := net.ParseIP(strings.TrimSpace(dst)).To4()
@@ -116,6 +118,11 @@ func (pm *PortPolicyManager) newPortKey(dst string, proto uint8, dport, sport ui
 	key.Sport = portToWire(sport)
 
 	return key, nil
+}
+
+// newPortKey builds the map key for a (dst, protocol, dport, sport) rule.
+func (pm *PortPolicyManager) newPortKey(dst string, proto uint8, dport, sport uint16) (firewallPortRuleKey, error) {
+	return buildPortRuleKey(dst, proto, dport, sport)
 }
 
 // portToWire converts a logical port to its network-byte-order wire encoding

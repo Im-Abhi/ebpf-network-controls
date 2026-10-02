@@ -42,9 +42,9 @@ These use in-memory fakes and never touch the kernel:
 | Package | What is covered |
 | --- | --- |
 | `control/rules` | CIDR/IP parsing and validation |
-| `control/ebpf` | map managers with stubbed maps: blocklist (exact + LPM + overlap + clear), port rules, action/config parsing |
-| `control/server` | socket protocol + command dispatch against a fake `Policy`: `block`/`unblock`/`list`/`clear`/`stats`/`default`/`conntrack`/`--action`/`--priority`, conntrack listing, error propagation, socket lifecycle |
-| `cmd/firewallctl` | option parsing anywhere in the argument list (`-sock`, `--protocol`, `--dport`, `--sport`, `--action`, `--priority`, `key=value` forms) and port/priority validation |
+| `control/ebpf` | map managers with stubbed maps: blocklist (exact + LPM + overlap + clear), port rules, egress managers (IP + port + default, presence-bit disjointness, htons port encoding), action/config parsing |
+| `control/server` | socket protocol + command dispatch against a fake `Policy`: `block`/`unblock`/`list`/`clear`/`stats`/`default`/`conntrack`/`--action`/`--priority`/`--dir` (in/out/both), conntrack listing, error propagation, socket lifecycle |
+| `cmd/firewallctl` | option parsing anywhere in the argument list (`-sock`, `-dir in|out|both`, `--protocol`, `--dport`, `--sport`, `--action`, `--priority`, `key=value` forms) and port/priority/direction validation |
 
 ---
 
@@ -105,6 +105,25 @@ Run one group without the whole suite:
 sudo go test -tags integration ./control/ebpf/ -run TestDatapath -v -count=1
 ```
 
+### Egress datapath tests — `egress_integration_test.go`
+
+The same raw-frame injection through `BPF_PROG_TEST_RUN`, but against the **TC
+(TCX) egress program** (loaded, not attached, on `lo`). Frames are family-swapped
+so `(10.0.0.1 → 1.2.3.4)` reads as an outbound packet at the egress hook. The
+scenarios mirror the ingress suite plus the hook-specific cases:
+
+| Test | Asserts |
+| --- | --- |
+| `TestEgress_DefaultAllow_Passes` | default allow + no egress rules → pass |
+| `TestEgress_DefaultDeny_Drops` | egress default deny + no rules → drop |
+| `TestEgress_BlockedDestination_Drops` | blocked dst in egress IP LPM → drop |
+| `TestEgress_CIDR_DropsByDestination` | CIDR block drops in-range dst |
+| `TestEgress_PortRule_DropsOnlyMatching` | only the exact dst+proto+port (remote dst) match drops; other dsts, UDP pass |
+| `TestEgress_HooksAreSeparate` | matching ingress vs egress maps: a packet passes if the *other* direction has the rule |
+| `TestEgress_Conntrack_ReverseEntryPassesInboundReplies` | a reverse ESTABLISHED entry lets the reply through under egress default deny |
+| `TestEgress_ClearEgress_LeavesIngress` | clearing egress maps leaves ingress rules intact |
+| `TestEgress_CountersSeparate` | egress drops/passes hit the egress counter slots and ingress counters do not move |
+
 ### Lifecycle + end-to-end
 - `firewall_integration_test.go` — `NewFirewall` load, attach on `lo`,
   idempotent `Start`, and `Stop` detaching the XDP program.
@@ -120,12 +139,13 @@ Start the daemon on an interface, then drive it with `firewallctl`:
 ```bash
 sudo ./bin/firewall -i wlp0s20f3        # your interface; default is wlp0s20f3
 sudo ./bin/firewall -i wlp0s20f3 -http-addr 127.0.0.1:8081  # HTTP API on a non-default port
+sudo ./bin/firewall -i wlp0s20f3 -dir both   # also attach the TC egress hook (kernel >= 6.6)
 ```
 
 In another terminal:
 
 ```bash
-sudo ./bin/firewallctl status                  # interface + live default policy
+sudo ./bin/firewallctl status                  # interface + live default policy (ingress and egress)
 sudo ./bin/firewallctl listports               # port rules with [pass]/[drop]
 sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 22
 sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 22 --action pass
@@ -135,16 +155,28 @@ sudo ./bin/firewallctl listports               # shows tcp/22 (sport 50000) -> 1
 sudo ./bin/firewallctl default deny            # fallback policy on no match
 sudo ./bin/firewallctl conntrack               # live TCP flow table (NEW/ESTABLISHED/CLOSED)
 sudo ./bin/firewallctl clear                   # wipes IP blocklist + port rules + conntrack
-sudo ./bin/firewallctl stats                   # total / drop / pass counters
+sudo ./bin/firewallctl stats                   # total / drop / pass counters (ingress and egress)
+```
+
+The daemon's **egress hook** (`-dir out` / `-dir both`) runs the same rule
+engine on outbound traffic via TCX — egress `block` rules match the **remote
+destination** being contacted (dst-only for IP/CIDR, remote dst for port
+rules):
+
+```bash
+sudo ./bin/firewallctl block 6.6.6.6 --dir out          # drop outbound to 6.6.6.6
+sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 443 --dir out
+sudo ./bin/firewallctl list --dir both                  # ingress + egress IP rules
+sudo ./bin/firewallctl default deny --dir out           # drop all outbound by default
 ```
 
 The read-only HTTP API (default `127.0.0.1:8080`) mirrors the same state:
 
 ```bash
 curl -s localhost:8080/health                  # {"ok":true}
-curl -s localhost:8080/status                  # interface, attach mode, default policy, rule counts
-curl -s localhost:8080/stats                   # total / drop / pass counters
-curl -s localhost:8080/rules                   # {"blocked_rules":[...], "port_rules":[...]}
+curl -s localhost:8080/status                  # interface, attach mode, ingress/egress default policy + rule counts
+curl -s localhost:8080/stats                   # {"ingress":{...},"egress":{...}} packet/byte counters
+curl -s localhost:8080/rules                   # {"blocked_rules":[...],"port_rules":[...],"egress_rules":[...],...}
 curl -s localhost:8080/conntrack               # {"flows":[...]}
 ```
 
@@ -175,7 +207,7 @@ make generate && make build
 sudo bash integration/fw-smoke.sh
 ```
 
-Golden run: **29/29 checks**. Coverage:
+Golden run: **38/38 checks**. Coverage:
 
 | Check | What is asserted |
 | --- | --- |
@@ -187,6 +219,11 @@ Golden run: **29/29 checks**. Coverage:
 | 3k–3l | FIN→CLOSED; packet on a CLOSED flow denied again |
 | 4a–4d | `clear` empties blocklist + port rules + conntrack; then a fresh SYN is denied |
 | 5a–5e | `-ct-timeout 5s` reaper: flow reaped, daemon logs it, later packet denied |
+| 6a–6i | egress (`-dir both`, TCX): status shows attached; default allow passes; dst-only block semantics (`block <unrelated-ip> --dir out` doesn't affect traffic; `block <dst> --dir out` fails the connection and bumps the egress drop counter); `list`/`clear --dir out` round-trip; egress `default deny` blocks outbound and `default allow` restores it. Requires kernel >= 6.6 |
+
+The egress checks restart the daemon with `-dir both` (XDP + TCX) at the end of
+the run; if the kernel lacks TCX support the daemon fails to start and CHECK 6
+reports itself skipped.
 
 Client sockets are `SO_REUSEADDR` + RST-close (`SO_LINGER=0`) so the teardown of
 each connection cannot leave a TIME_WAIT port that a later check reuses, and

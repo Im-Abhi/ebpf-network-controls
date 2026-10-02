@@ -9,9 +9,9 @@ import (
 
 // Firewall is a thin facade coordinating the XDP program lifecycle (XDPProgram)
 // with policy map operations (MapManager), counter reads (CounterManager), the
-// config/default-policy state (ConfigManager), and the conntrack table
-// (ConntrackManager). It is the single handle used by cmd/firewall and the
-// runtime control plane.
+// config/default-policy state (ConfigManager), the conntrack table
+// (ConntrackManager), and the TC egress hook (TCProgram + EgressPolicyManager).
+// It is the single handle used by cmd/firewall and the runtime control plane.
 type Firewall struct {
 	prog          *XDPProgram
 	mgr           *MapManager
@@ -19,6 +19,9 @@ type Firewall struct {
 	portPolicyMgr *PortPolicyManager
 	configMgr     *ConfigManager
 	ctMgr         *ConntrackManager
+	egressMgr     *EgressPolicyManager
+	egressCfgMgr  *ConfigManager
+	tc            *TCProgram
 }
 
 // NewFirewall loads the XDP program and its maps for the given interface but
@@ -34,6 +37,8 @@ func NewFirewall(ifaceName string) (*Firewall, error) {
 	mgr.SetPresence(presence)
 	portPolicyMgr := NewPortPolicyManager(prog.PortPolicy())
 	portPolicyMgr.SetPresence(presence)
+	egressMgr := NewEgressPolicyManager(prog.EgressBlockedIps(), prog.EgressPortPolicy())
+	egressMgr.SetPresence(presence)
 
 	return &Firewall{
 		prog:          prog,
@@ -42,6 +47,9 @@ func NewFirewall(ifaceName string) (*Firewall, error) {
 		portPolicyMgr: portPolicyMgr,
 		configMgr:     NewConfigManager(prog.Config()),
 		ctMgr:         NewConntrackManager(prog.Conntrack()),
+		egressMgr:     egressMgr,
+		egressCfgMgr:  NewConfigManager(prog.EgressConfig()),
+		tc:            NewTCProgram(prog.EgressProgram(), prog.ifaceIndex),
 	}, nil
 }
 
@@ -208,4 +216,131 @@ func (f *Firewall) DefaultPolicy() (string, error) {
 		return "", err
 	}
 	return p.String(), nil
+}
+
+// ── TC egress (direction-aware) ────────────────────────────────────────
+// The egress hook filters host-generated outbound traffic with its own maps;
+// see EgressPolicyManager for the destination-based semantics.
+
+// StartEgress attaches the TC egress classifier to the interface's egress
+// path. It is a no-op when already attached. Requires kernel >= 6.6 (TCX).
+func (f *Firewall) StartEgress() error {
+	return f.tc.Start()
+}
+
+// StopEgress detaches the TC egress classifier, leaving the XDP program (and
+// policy state) untouched.
+func (f *Firewall) StopEgress() error {
+	return f.tc.Close()
+}
+
+// EgressAttached reports whether the TC egress classifier is attached.
+func (f *Firewall) EgressAttached() bool {
+	return f.tc.Attached()
+}
+
+// BlockEgressWithActionPriority adds a destination IP/CIDR rule to the egress
+// policy with an explicit action and priority.
+func (f *Firewall) BlockEgressWithActionPriority(cidr, actionStr string, priority uint32) error {
+	action, err := ParseAction(actionStr)
+	if err != nil {
+		return err
+	}
+	if err := f.egressMgr.BlockIP(cidr, action, priority); err != nil {
+		return fmt.Errorf("adding egress rule %q with action %s priority %d: %w", cidr, action, priority, err)
+	}
+	return nil
+}
+
+// BlockEgressWithAction adds a destination IP/CIDR egress rule with an
+// explicit action at the default priority.
+func (f *Firewall) BlockEgressWithAction(cidr, actionStr string) error {
+	return f.BlockEgressWithActionPriority(cidr, actionStr, 0)
+}
+
+// UnblockEgress removes a destination IP/CIDR rule from the egress policy.
+func (f *Firewall) UnblockEgress(cidr string) error {
+	if err := f.egressMgr.UnblockIP(cidr); err != nil {
+		return fmt.Errorf("removing egress rule %q: %w", cidr, err)
+	}
+	return nil
+}
+
+// ListEgressRules returns the current egress IP rules.
+func (f *Firewall) ListEgressRules() ([]server.BlockedRule, error) {
+	return f.egressMgr.ListIPs()
+}
+
+// BlockEgressPortRule adds an egress port rule with an explicit action and
+// priority for remote (dst, proto, dport, sport).
+func (f *Firewall) BlockEgressPortRuleWithActionPriority(dst, protocol string, dport, sport uint16, actionStr string, priority uint32) error {
+	action, err := ParseAction(actionStr)
+	if err != nil {
+		return err
+	}
+	if err := f.egressMgr.BlockPort(dst, protocol, dport, sport, action, priority); err != nil {
+		return fmt.Errorf("adding egress port rule %s/%d (sport %d) to %s with action %s priority %d: %w", protocol, dport, sport, dst, action, priority, err)
+	}
+	return nil
+}
+
+// BlockEgressPortRuleWithAction adds an egress port rule with an explicit
+// action at the default priority.
+func (f *Firewall) BlockEgressPortRuleWithAction(dst, protocol string, dport, sport uint16, actionStr string) error {
+	return f.BlockEgressPortRuleWithActionPriority(dst, protocol, dport, sport, actionStr, 0)
+}
+
+// BlockEgressPortRule adds a DROP egress port rule (dport 0 = any port).
+func (f *Firewall) BlockEgressPortRule(dst, protocol string, dport, sport uint16) error {
+	return f.BlockEgressPortRuleWithAction(dst, protocol, dport, sport, "drop")
+}
+
+// UnblockEgressPortRule removes an egress port rule.
+func (f *Firewall) UnblockEgressPortRule(dst, protocol string, dport, sport uint16) error {
+	if err := f.egressMgr.UnblockPort(dst, protocol, dport, sport); err != nil {
+		return fmt.Errorf("removing egress port rule %s/%d (sport %d) to %s: %w", protocol, dport, sport, dst, err)
+	}
+	return nil
+}
+
+// ListEgressPortRules returns the current egress port rules.
+func (f *Firewall) ListEgressPortRules() ([]server.PortRule, error) {
+	return f.egressMgr.ListPorts()
+}
+
+// ClearEgress removes every egress IP rule and egress port rule.
+func (f *Firewall) ClearEgress() error {
+	if err := f.egressMgr.Clear(); err != nil {
+		return fmt.Errorf("clearing egress policy: %w", err)
+	}
+	return nil
+}
+
+// SetEgressDefault sets the egress fallback policy ("allow" or "deny") applied
+// when no egress rule matches. Independent of the ingress default in
+// firewall_config so the two directions can have different postures.
+func (f *Firewall) SetEgressDefault(s string) error {
+	policy, err := ParseDefaultPolicy(s)
+	if err != nil {
+		return err
+	}
+	if err := f.egressCfgMgr.SetDefaultPolicy(policy); err != nil {
+		return fmt.Errorf("setting egress default policy to %s: %w", policy, err)
+	}
+	return nil
+}
+
+// EgressDefault returns the current egress fallback policy ("allow" or "deny").
+func (f *Firewall) EgressDefault() (string, error) {
+	p, err := f.egressCfgMgr.DefaultPolicy()
+	if err != nil {
+		return "", err
+	}
+	return p.String(), nil
+}
+
+// EgressStats returns the egress packet/byte counters (indices 3-5 of the
+// counters map), separate from the ingress Stats.
+func (f *Firewall) EgressStats() (server.Stats, error) {
+	return f.counterMgr.GetEgressCounters()
 }

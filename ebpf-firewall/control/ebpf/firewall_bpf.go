@@ -61,13 +61,17 @@ type firewallRuleValue struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	firewallMapBlockedIps     = "blocked_ips"
-	firewallMapConntrack      = "conntrack"
-	firewallMapCounters       = "counters"
-	firewallMapFirewallConfig = "firewall_config"
-	firewallMapPortPolicy     = "port_policy"
-	firewallMapRulePresence   = "rule_presence"
-	firewallProgFirewallProg  = "firewall_prog"
+	firewallMapBlockedIps        = "blocked_ips"
+	firewallMapConntrack         = "conntrack"
+	firewallMapCounters          = "counters"
+	firewallMapEgressBlockedIps  = "egress_blocked_ips"
+	firewallMapEgressConfig      = "egress_config"
+	firewallMapEgressPortPolicy  = "egress_port_policy"
+	firewallMapFirewallConfig    = "firewall_config"
+	firewallMapPortPolicy        = "port_policy"
+	firewallMapRulePresence      = "rule_presence"
+	firewallProgFirewallProg     = "firewall_prog"
+	firewallProgFirewallTcEgress = "firewall_tc_egress"
 )
 
 // loadFirewall returns the embedded CollectionSpec for firewall.
@@ -112,19 +116,23 @@ type firewallSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type firewallProgramSpecs struct {
-	FirewallProg *ebpf.ProgramSpec `ebpf:"firewall_prog"`
+	FirewallProg     *ebpf.ProgramSpec `ebpf:"firewall_prog"`
+	FirewallTcEgress *ebpf.ProgramSpec `ebpf:"firewall_tc_egress"`
 }
 
 // firewallMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type firewallMapSpecs struct {
-	BlockedIps     *ebpf.MapSpec `ebpf:"blocked_ips"`
-	Conntrack      *ebpf.MapSpec `ebpf:"conntrack"`
-	Counters       *ebpf.MapSpec `ebpf:"counters"`
-	FirewallConfig *ebpf.MapSpec `ebpf:"firewall_config"`
-	PortPolicy     *ebpf.MapSpec `ebpf:"port_policy"`
-	RulePresence   *ebpf.MapSpec `ebpf:"rule_presence"`
+	BlockedIps        *ebpf.MapSpec `ebpf:"blocked_ips"`
+	Conntrack         *ebpf.MapSpec `ebpf:"conntrack"`
+	Counters          *ebpf.MapSpec `ebpf:"counters"`
+	EgressBlockedIps  *ebpf.MapSpec `ebpf:"egress_blocked_ips"`
+	EgressConfig      *ebpf.MapSpec `ebpf:"egress_config"`
+	EgressPortPolicy  *ebpf.MapSpec `ebpf:"egress_port_policy"`
+	FirewallConfig    *ebpf.MapSpec `ebpf:"firewall_config"`
+	PortPolicy        *ebpf.MapSpec `ebpf:"port_policy"`
+	RulePresence      *ebpf.MapSpec `ebpf:"rule_presence"`
 }
 
 // firewallVariableSpecs contains global variables before they are loaded into the kernel.
@@ -153,12 +161,15 @@ func (o *firewallObjects) Close() error {
 //
 // It can be passed to loadFirewallObjects or ebpf.CollectionSpec.LoadAndAssign.
 type firewallMaps struct {
-	BlockedIps     *ebpf.Map `ebpf:"blocked_ips"`
-	Conntrack      *ebpf.Map `ebpf:"conntrack"`
-	Counters       *ebpf.Map `ebpf:"counters"`
-	FirewallConfig *ebpf.Map `ebpf:"firewall_config"`
-	PortPolicy     *ebpf.Map `ebpf:"port_policy"`
-	RulePresence   *ebpf.Map `ebpf:"rule_presence"`
+	BlockedIps       *ebpf.Map `ebpf:"blocked_ips"`
+	Conntrack        *ebpf.Map `ebpf:"conntrack"`
+	Counters         *ebpf.Map `ebpf:"counters"`
+	EgressBlockedIps *ebpf.Map `ebpf:"egress_blocked_ips"`
+	EgressConfig     *ebpf.Map `ebpf:"egress_config"`
+	EgressPortPolicy *ebpf.Map `ebpf:"egress_port_policy"`
+	FirewallConfig   *ebpf.Map `ebpf:"firewall_config"`
+	PortPolicy       *ebpf.Map `ebpf:"port_policy"`
+	RulePresence     *ebpf.Map `ebpf:"rule_presence"`
 }
 
 func (m *firewallMaps) Close() error {
@@ -166,6 +177,9 @@ func (m *firewallMaps) Close() error {
 		m.BlockedIps,
 		m.Conntrack,
 		m.Counters,
+		m.EgressBlockedIps,
+		m.EgressConfig,
+		m.EgressPortPolicy,
 		m.FirewallConfig,
 		m.PortPolicy,
 		m.RulePresence,
@@ -182,12 +196,14 @@ type firewallVariables struct {
 //
 // It can be passed to loadFirewallObjects or ebpf.CollectionSpec.LoadAndAssign.
 type firewallPrograms struct {
-	FirewallProg *ebpf.Program `ebpf:"firewall_prog"`
+	FirewallProg     *ebpf.Program `ebpf:"firewall_prog"`
+	FirewallTcEgress *ebpf.Program `ebpf:"firewall_tc_egress"`
 }
 
 func (p *firewallPrograms) Close() error {
 	return _FirewallClose(
 		p.FirewallProg,
+		p.FirewallTcEgress,
 	)
 }
 

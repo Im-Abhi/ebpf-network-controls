@@ -25,19 +25,33 @@ import (
 )
 
 // StatusResponse is the body of GET /status. AttachMode is empty until the
-// program is attached, which doubles as the attached indicator.
+// program is attached, which doubles as the attached indicator. The egress
+// fields report the TC egress posture (0/nil when egress is not in use).
 type StatusResponse struct {
-	Interface     string `json:"interface"`
-	AttachMode    string `json:"attach_mode"`
-	DefaultPolicy string `json:"default_policy"`
-	IPRuleCount   int    `json:"ip_rule_count"`
-	PortRuleCount int    `json:"port_rule_count"`
+	Interface           string `json:"interface"`
+	AttachMode          string `json:"attach_mode"`
+	DefaultPolicy       string `json:"default_policy"`
+	IPRuleCount         int    `json:"ip_rule_count"`
+	PortRuleCount       int    `json:"port_rule_count"`
+	EgressDefaultPolicy string `json:"egress_default_policy,omitempty"`
+	EgressIPRuleCount   int    `json:"egress_ip_rule_count,omitempty"`
+	EgressPortRuleCount int    `json:"egress_port_rule_count,omitempty"`
+	EgressAttached      bool   `json:"egress_attached,omitempty"`
 }
 
 // RulesResponse is the body of GET /rules.
 type RulesResponse struct {
-	BlockedRules []server.BlockedRule `json:"blocked_rules"`
-	PortRules    []server.PortRule    `json:"port_rules"`
+	BlockedRules    []server.BlockedRule `json:"blocked_rules"`
+	PortRules       []server.PortRule    `json:"port_rules"`
+	EgressRules     []server.BlockedRule `json:"egress_rules"`
+	EgressPortRules []server.PortRule    `json:"egress_port_rules"`
+}
+
+// StatsResponse is the body of GET /stats. The counters are grouped by
+// direction: Ingress from the XDP datapath, Egress from the TC hook.
+type StatsResponse struct {
+	Ingress server.Stats `json:"ingress"`
+	Egress  server.Stats `json:"egress"`
 }
 
 // ConntrackResponse is the body of GET /conntrack. The flow table is wrapped
@@ -108,12 +122,31 @@ func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	egressDef, err := a.policy.EgressDefault()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	egressIPs, err := a.policy.ListEgressRules()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	egressPorts, err := a.policy.ListEgressPortRules()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, StatusResponse{
-		Interface:     a.policy.Interface(),
-		AttachMode:    a.policy.AttachMode(),
-		DefaultPolicy: def,
-		IPRuleCount:   len(blocked),
-		PortRuleCount: len(ports),
+		Interface:           a.policy.Interface(),
+		AttachMode:          a.policy.AttachMode(),
+		DefaultPolicy:       def,
+		IPRuleCount:         len(blocked),
+		PortRuleCount:       len(ports),
+		EgressDefaultPolicy: egressDef,
+		EgressIPRuleCount:   len(egressIPs),
+		EgressPortRuleCount: len(egressPorts),
+		EgressAttached:      a.policy.EgressAttached(),
 	})
 }
 
@@ -123,7 +156,12 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, stats)
+	egressStats, err := a.policy.EgressStats()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, StatsResponse{Ingress: stats, Egress: egressStats})
 }
 
 func (a *API) handleRules(w http.ResponseWriter, r *http.Request) {
@@ -137,9 +175,21 @@ func (a *API) handleRules(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	egressIPs, err := a.policy.ListEgressRules()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	egressPorts, err := a.policy.ListEgressPortRules()
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, RulesResponse{
-		BlockedRules: nonNil(blocked),
-		PortRules:    nonNil(ports),
+		BlockedRules:    nonNil(blocked),
+		PortRules:       nonNil(ports),
+		EgressRules:     nonNil(egressIPs),
+		EgressPortRules: nonNil(egressPorts),
 	})
 }
 
