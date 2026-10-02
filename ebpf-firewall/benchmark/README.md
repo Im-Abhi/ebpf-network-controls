@@ -332,6 +332,82 @@ Caveats on this capture:
   `udp_lost` there is sender-side saturation, not a firewall defect. The
   controlled `udp2_*` pass and TCP numbers are the datapath signal.
 
+## Post-change revalidation — `20261002-142801`
+
+Rerun of the **locked harness unchanged** on the same physical host, after the
+priority + stateful (conntrack) datapath features landed on master. Purpose:
+verify the added features introduce no per-packet cost in the cells this
+harness measures, and that the mechanistic claims survive. All values are
+medians across 5 iterations (n=5); raw per-iteration data is in
+`results/20261002-142801/` (gitignored, on the benchmark host). Kernel,
+XDP attach mode and toolchain versions are in that run's `meta.txt` — quote
+them alongside this section. XDP is generic (SKB) mode on veth, same topology
+caveat as the baseline.
+
+### Why the features are expected to be costless in these cells
+
+`run-bench.sh` starts the daemon with `default allow` (`fw_start`). Under
+default-allow the conntrack fast-path is neither read nor written (see
+`bpf/maps.h`), so the stateful feature contributes zero per-packet work here;
+priority adds only integer compares in the decision table when a rule matches;
+and the userspace reaper never runs in the 10 s measurement window. The
+genuine added-cost paths (a conntrack read+write per accepted TCP packet
+under default-deny) are outside this harness by construction. This capture
+therefore re-validates the pre-change datapath properties, not a feature
+cost — and none is expected.
+
+### Re-confirmed (mechanistic claims)
+
+- **Drop-path counter parity, both backends, 1.000:**
+
+  | Backend | offered `flood_sent` (10 s) | `drop_pps` (hook-side) | ratio |
+  | --- | --- | --- | --- |
+  | XDP | 6,348,082 | 634,808 | 1.000 |
+  | nft | 4,664,578 | 466,457 | 1.000 |
+
+- **`many` still discriminates:** XDP stays flat at 1,000 rules — UDP
+  4,111 vs 4,049 at `none`, TCP 8,828 vs 8,949, per-packet CPU 1,258 vs 1,381
+  jif/Mpkts — while nft collapses (UDP 454 vs 4,882, ~-91%; TCP 12,137 vs
+  66,284, ~-82%; per-packet CPU 4,925 vs 1,022, ~4.8×). The LPM-trie scaling
+  claim survives this capture.
+- **Rule updates stay flat and low:** XDP add/del 2.0/2.0 ms across all five
+  scenarios including the 1,000-rule `many` (stdev 0.0); nft add 3 ms, del
+  9-11 ms.
+- **Controlled-UDP pass is genuinely controlled now:** `udp2` sustains its
+  1500 M target with median loss ≤1,598 packets (≤0.12%) across XDP cells —
+  at the baseline the sender ceiling could not reach 1500 M. A cleaner
+  reference pass than the baseline capture had.
+
+### Environment drift vs the baseline — do not cite as feature cost
+
+Most absolute values in this capture differ materially from the locked
+baseline, and both backends moved in the **same direction**, which is the
+signature of host/sender state rather than datapath change:
+
+| | baseline `234855` | `20261002-142801` |
+| --- | --- | --- |
+| XDP UDP `none` (Mbit/s) | 1,664 | 4,049 |
+| nft UDP `none` (Mbit/s) | 2,495 | 4,882 |
+| XDP TCP `none` (Mbit/s) | 2,284 | 8,949 |
+| nft TCP `none` (Mbit/s) | 25,576 | 66,284 |
+| XDP offered flood (pps) | 412,581 | 634,808 |
+
+Throughput rose 2-4× on both backends and offered load rose ~54% — a systemic
+host shift, consistent with the README's standing caveat ("always compare
+`drop_pps` against the run's own `flood_sent`, never across runs"). Two
+specific non-attributions, explicitly: the apparent drop-path efficiency gain
+(XDP `cpu_per_m_pkts` `drop` 915 → 170) and rule-update speedup (8-11 → 2 ms)
+cannot come from the priority/conntrack changes, which only add work — treat
+them as environment/kernel level (confirm `meta.txt`, e.g. the kernel and
+cilium/ebpf versions, before quoting either).
+
+### Use as the pre-TC reference
+
+This capture also serves as the **pre-TC `firewall_prog` codegen-identity
+reference**: the TC egress milestone must keep `firewall_prog` codegen
+unchanged, and the same harness (with the future `-tc` flag not altering XDP
+cells) is re-run to confirm the XDP medians above reproduce within noise.
+
 ## Baselines and superseded runs
 
 The **locked baseline** is `benchmark/results/20260914-234855/` — the first
@@ -380,5 +456,6 @@ be quoted either.
   default-allow and adds only a read+write of one hash entry per accepted TCP
   packet under default-deny; the userspace reaper never runs in the iperf3
   measurement window (5 min timeout ≫ 10 s passes), so benchmark cells are
-  unaffected by aging.
+  unaffected by aging. Completed — see "Post-change revalidation —
+  `20261002-142801`" above.
 - Prefer a CPU-pinned machine or idle host for low-jitter numbers.

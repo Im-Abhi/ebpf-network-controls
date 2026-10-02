@@ -101,8 +101,11 @@ MTP2+ are the thesis-level extensions built on top of it.
       `20260914-151138` and the TCP-invalid `20260914-230211`). Includes a
       derived CPU-cost-per-million-packets metric in `plot.py`.
 - [ ] IS_UPLOAD ⇄ future `-R` / download comparisons documented in `benchmark/README.md`
-- [ ] Rerun unchanged after the priority + stateful changes; document feature
-      cost in `benchmark/README.md`
+- [x] Rerun unchanged after the priority + stateful changes — capture
+      `20261002-142801` (same physical host). No measurable per-packet cost:
+      the harness runs `default allow`, so the conntrack fast-path is gated
+      and priority adds only decision compares; documented in
+      `benchmark/README.md` "Post-change revalidation"
 - [x] Results documentation — `benchmark/README.md` "Benchmark results" section
       (capture `20260914-234855`; medians + drop-path counter parity + derived
       CPU-per-M-pkts table)
