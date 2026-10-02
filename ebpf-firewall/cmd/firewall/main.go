@@ -4,12 +4,15 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"ebpf-firewall/control/api"
 	"ebpf-firewall/control/ebpf"
 	"ebpf-firewall/control/server"
 
@@ -21,10 +24,12 @@ func main() {
 	var blockList string
 	var sockPath string
 	var ctTimeout time.Duration
+	var httpAddr string
 	flag.StringVar(&ifname, "i", "wlp0s20f3", "Network interface name where the eBPF programs will be attached")
 	flag.StringVar(&blockList, "block", "", "Comma-separated list of IPs/CIDRs to block (e.g. '192.168.1.5, 10.0.0.0/8')")
 	flag.StringVar(&sockPath, "sock", "/var/run/ebpf-firewall.sock", "unix socket path for control")
 	flag.DurationVar(&ctTimeout, "ct-timeout", 5*time.Minute, "idle timeout for conntrack entries (0 disables the reaper)")
+	flag.StringVar(&httpAddr, "http-addr", "127.0.0.1:8080", "read-only HTTP stats API listen address (0 or empty disables)")
 	flag.Parse()
 
 	log := log.New(os.Stdout, "[firewall] ", log.LstdFlags)
@@ -99,6 +104,30 @@ func main() {
 		log.Fatalf("failed to start control server: %v", err)
 	}
 	log.Printf("control socket listening on %s", sockPath)
+
+	// Read-only HTTP stats API. Binding is loopback by default; warn when the
+	// caller pins it to a non-local address, since /rules and /conntrack expose
+	// security-relevant state even though the API never mutates policy.
+	if httpAddr != "" && httpAddr != "0" {
+		if host, _, err := net.SplitHostPort(httpAddr); err == nil &&
+			(host == "" || host == "0.0.0.0" || host == "::") {
+			log.Printf("WARNING: HTTP API bound to %s (not loopback); rule and conntrack state is exposed read-only", httpAddr)
+		}
+		httpSrv := &http.Server{Addr: httpAddr, Handler: api.New(fw)}
+		go func() {
+			if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("http api: %v", err)
+			}
+		}()
+		defer func() {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := httpSrv.Shutdown(shutCtx); err != nil {
+				log.Printf("http api shutdown: %v", err)
+			}
+		}()
+		log.Printf("HTTP API listening on %s (read-only)", httpAddr)
+	}
 
 	defer fw.Stop()   // runs LAST (LIFO): XDP detaches after socket closes
 	defer srv.Close() // runs FIRST: socket closes before XDP detaches

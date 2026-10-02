@@ -119,6 +119,7 @@ Start the daemon on an interface, then drive it with `firewallctl`:
 
 ```bash
 sudo ./bin/firewall -i wlp0s20f3        # your interface; default is wlp0s20f3
+sudo ./bin/firewall -i wlp0s20f3 -http-addr 127.0.0.1:8081  # HTTP API on a non-default port
 ```
 
 In another terminal:
@@ -136,6 +137,19 @@ sudo ./bin/firewallctl conntrack               # live TCP flow table (NEW/ESTABL
 sudo ./bin/firewallctl clear                   # wipes IP blocklist + port rules + conntrack
 sudo ./bin/firewallctl stats                   # total / drop / pass counters
 ```
+
+The read-only HTTP API (default `127.0.0.1:8080`) mirrors the same state:
+
+```bash
+curl -s localhost:8080/health                  # {"ok":true}
+curl -s localhost:8080/status                  # interface, attach mode, default policy, rule counts
+curl -s localhost:8080/stats                   # total / drop / pass counters
+curl -s localhost:8080/rules                   # {"blocked_rules":[...], "port_rules":[...]}
+curl -s localhost:8080/conntrack               # {"flows":[...]}
+```
+
+The API is GET-only and never mutates policy — keep it loopback-bound
+(`-http-addr 127.0.0.1:8080`), or disable it with `-http-addr 0`.
 
 A daemon reaper ages idle conntrack entries out by default (`-ct-timeout 5m` in
 `bin/firewall`; `-ct-timeout 0` disables it). To watch the stateful path live,

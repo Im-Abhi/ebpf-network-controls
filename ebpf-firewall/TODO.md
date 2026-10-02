@@ -107,6 +107,19 @@ MTP2+ are the thesis-level extensions built on top of it.
       (capture `20260914-234855`; medians + drop-path counter parity + derived
       CPU-per-M-pkts table)
 
+### MTP1-G: Read-only HTTP observability API
+
+- [x] `control/api` package — GET-only HTTP handlers over the `server.Policy`
+      interface (same seam the Unix-socket control plane uses, fake-testable
+      without a kernel)
+- [x] Endpoints: `/health`, `/status`, `/stats`, `/rules`, `/conntrack`
+      (`{flows:[...]}`); empty tables render as `[]`; non-GET → 405; policy
+      error → 500
+- [x] Daemon flag `-http-addr` (default `127.0.0.1:8080`; `0`/empty disables);
+      loopback warning when bound to a non-local address
+- [x] CLI stays the only write path (the API never mutates policy)
+- [x] Unit tests + README/TESTING documentation
+
 ---
 
 ## MTP2 — Advanced Controls

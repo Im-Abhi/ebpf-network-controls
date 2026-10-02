@@ -64,7 +64,7 @@ build:
 ## test: Run unit tests (no kernel required; requires generated bindings)
 test: generate
 	@echo "==> Running unit tests..."
-	$(GO) test ./control/rules/ ./control/server/ ./control/ebpf/ -count=1
+	$(GO) test ./control/rules/ ./control/server/ ./control/ebpf/ ./control/api/ -count=1
 
 ## integration-test: Run integration tests (require Linux + eBPF/root privileges)
 integration-test: generate

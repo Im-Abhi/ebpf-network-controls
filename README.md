@@ -22,6 +22,7 @@ What works today (MTP1 core — XDP firewall):
 - **Go control plane** (`control/`)
 - **Unix socket API** (`control/server/`) for dynamic, runtime rule updates
 - **`firewallctl`** client for live `block` / `unblock` / `list` / `listports` / `status` / `stats` / `clear` / `default` / `conntrack`; `--protocol` / `--dport` / `--sport` / `--action` / `--priority` / `-sock` work in any position (before or after the command)
+- **Read-only HTTP stats API** (`control/api/`) — live `status`, `stats`, `rules` and `conntrack` over HTTP JSON, loopback by default (`-http-addr`, default `127.0.0.1:8080`); the CLI stays the only way to *change* policy
 - **Unit + integration tests** (`make test`, `make integration-test`)
 
 ### Default policy, per-rule actions & priority
@@ -114,6 +115,31 @@ Limitations: tracking is IPv4 + TCP only, and state is inferred from the
 (the reverse direction never transits the hook) has no entry, so it stays
 subject to the rule table and default policy.
 
+### Read-only HTTP stats API
+
+The daemon can expose a read-only HTTP view of the live firewall state
+(`control/api/`), served over the same `server.Policy` surface the Unix-socket
+control plane uses — GET-only, never mutating policy:
+
+| Endpoint   | Returns |
+| --- | --- |
+| `GET /health` | `{"ok":true}` |
+| `GET /status` | interface, attach mode, default policy, IP/port rule counts |
+| `GET /stats`  | total / drop / pass packet+byte counters |
+| `GET /rules`  | `{"blocked_rules":[…], "port_rules":[…]}` |
+| `GET /conntrack` | `{"flows":[…]}` live TCP flow table |
+
+Bind it with `-http-addr` (default `127.0.0.1:8080`; `0` or empty disables it).
+It is intentionally loopback-bound by default and should stay that way:
+`/rules` and `/conntrack` reveal security-relevant state, and the API provides
+no authentication. Example:
+
+```bash
+sudo ./bin/firewall -i wlp0s20f3 -http-addr 127.0.0.1:8080
+curl -s localhost:8080/stats
+curl -s localhost:8080/conntrack
+```
+
 ### Architecture (current)
 
 ```text
@@ -144,6 +170,7 @@ ebpf-firewall/
 │   └── vmlinux.h        # GENERATED – do not edit
 │
 ├── control/
+│   ├── api/             # read-only HTTP stats API
 │   ├── ebpf/            # map manager, XDP lifecycle, generated bindings
 │   │   └── firewall_bpf.go   # GENERATED – do not edit
 │   ├── rules/           # rule/IP parsing
