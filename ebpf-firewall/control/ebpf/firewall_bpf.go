@@ -124,15 +124,15 @@ type firewallProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type firewallMapSpecs struct {
-	BlockedIps        *ebpf.MapSpec `ebpf:"blocked_ips"`
-	Conntrack         *ebpf.MapSpec `ebpf:"conntrack"`
-	Counters          *ebpf.MapSpec `ebpf:"counters"`
-	EgressBlockedIps  *ebpf.MapSpec `ebpf:"egress_blocked_ips"`
-	EgressConfig      *ebpf.MapSpec `ebpf:"egress_config"`
-	EgressPortPolicy  *ebpf.MapSpec `ebpf:"egress_port_policy"`
-	FirewallConfig    *ebpf.MapSpec `ebpf:"firewall_config"`
-	PortPolicy        *ebpf.MapSpec `ebpf:"port_policy"`
-	RulePresence      *ebpf.MapSpec `ebpf:"rule_presence"`
+	BlockedIps       *ebpf.MapSpec `ebpf:"blocked_ips"`
+	Conntrack        *ebpf.MapSpec `ebpf:"conntrack"`
+	Counters         *ebpf.MapSpec `ebpf:"counters"`
+	EgressBlockedIps *ebpf.MapSpec `ebpf:"egress_blocked_ips"`
+	EgressConfig     *ebpf.MapSpec `ebpf:"egress_config"`
+	EgressPortPolicy *ebpf.MapSpec `ebpf:"egress_port_policy"`
+	FirewallConfig   *ebpf.MapSpec `ebpf:"firewall_config"`
+	PortPolicy       *ebpf.MapSpec `ebpf:"port_policy"`
+	RulePresence     *ebpf.MapSpec `ebpf:"rule_presence"`
 }
 
 // firewallVariableSpecs contains global variables before they are loaded into the kernel.

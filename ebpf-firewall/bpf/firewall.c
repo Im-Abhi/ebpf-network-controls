@@ -594,7 +594,7 @@ static __always_inline int ct_is_established_egress(const struct packet_info *in
  * datapath's default-allow gate). */
 static __always_inline int ct_active_egress(const struct packet_info *info,
                                             enum default_policy def_egress) {
-    if (info.protocol != IPPROTO_TCP) {
+    if (info->protocol != IPPROTO_TCP) {
         return 0;
     }
     if (def_egress == DEFAULT_DENY) {
