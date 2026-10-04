@@ -291,7 +291,10 @@ func (s *Server) handle(req Request) Response {
 		return Response{OK: true, Direction: echoDir}
 
 	case CmdList:
-		var blocked, egress []BlockedRule
+		// Non-nil empty slices so an empty table serializes as [] (not null)
+		// for the same client-detection reason as CmdListPorts.
+		blocked := make([]BlockedRule, 0)
+		egress := make([]BlockedRule, 0)
 		for _, d := range dirs {
 			if d == dirIn {
 				rules, err := s.policy.ListBlockedRules()
@@ -312,16 +315,20 @@ func (s *Server) handle(req Request) Response {
 			blockedCids = append(blockedCids, r.Cidr)
 		}
 		return Response{
-			OK:          true,
-			Blocked:     blockedCids,
+			OK:           true,
+			Blocked:      blockedCids,
 			BlockedRules: blocked,
-			EgressRules: egress,
-			Count:       len(blocked) + len(egress),
-			Direction:   echoDir,
+			EgressRules:  egress,
+			Count:        len(blocked) + len(egress),
+			Direction:    echoDir,
 		}
 
 	case CmdListPorts:
-		var ports, egressPorts []PortRule
+		// Non-nil empty slices: an empty table must serialize as [] (not null)
+		// so the client can distinguish "listed, nothing here" from "field
+		// absent" and print "no port rules".
+		ports := make([]PortRule, 0)
+		egressPorts := make([]PortRule, 0)
 		for _, d := range dirs {
 			if d == dirIn {
 				rules, err := s.policy.ListPortRules()

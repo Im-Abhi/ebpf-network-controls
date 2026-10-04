@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -343,6 +345,35 @@ func TestHandle_BlockPortRule(t *testing.T) {
 	}
 }
 
+func TestHandle_ListPortsEmptySerializesAsArray(t *testing.T) {
+	policy := newFakePolicy()
+	s := New("unused.sock", policy)
+
+	resp := s.handle(Request{Command: CmdListPorts})
+	if !resp.OK {
+		t.Fatalf("listports on empty tables: %+v", resp)
+	}
+	if resp.PortRules == nil {
+		t.Fatalf("PortRules is nil on empty table; client can't print 'no port rules'")
+	}
+
+	// The wire form must be [] (an empty array), never null: the firewallctl
+	// client relies on the JSON field being present to distinguish "empty"
+	// from "field absent" (which json unmarshals back to a nil slice). A null
+	// PortRules made `ctl listports` (CHECK 4b of the smoke) print "ok"
+	// instead of "no port rules".
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal listports response: %v", err)
+	}
+	if !strings.Contains(string(data), `"port_rules":[]`) {
+		t.Errorf("port_rules serialized non-empty-array: %s", data)
+	}
+	if !strings.Contains(string(data), `"egress_port_rules":[]`) {
+		t.Errorf("egress_port_rules serialized non-empty-array: %s", data)
+	}
+}
+
 func TestHandle_BlockPlainIPStillWorks(t *testing.T) {
 	policy := newFakePolicy()
 	s := New("unused.sock", policy)
@@ -659,18 +690,18 @@ func TestHandle_StatsIncludesEgress(t *testing.T) {
 // errPolicy returns an error from every blocked-side operation.
 type errPolicy struct{}
 
-func (p *errPolicy) BlockIP(string) error                           { return errors.New("boom") }
-func (p *errPolicy) BlockIPWithAction(string, string) error         { return errors.New("boom") }
+func (p *errPolicy) BlockIP(string) error                   { return errors.New("boom") }
+func (p *errPolicy) BlockIPWithAction(string, string) error { return errors.New("boom") }
 func (p *errPolicy) BlockIPWithActionPriority(string, string, uint32) error {
 	return errors.New("boom")
 }
-func (p *errPolicy) UnblockIP(string) error                  { return errors.New("boom") }
-func (p *errPolicy) ListBlockedIPs() ([]string, error)       { return nil, errors.New("boom") }
-func (p *errPolicy) ListBlockedRules() ([]BlockedRule, error) { return nil, errors.New("boom") }
-func (p *errPolicy) Clear() error                            { return errors.New("boom") }
-func (p *errPolicy) Interface() string                       { return "" }
-func (p *errPolicy) AttachMode() string                      { return "" }
-func (p *errPolicy) Stats() (Stats, error)                   { return Stats{}, errors.New("boom") }
+func (p *errPolicy) UnblockIP(string) error                             { return errors.New("boom") }
+func (p *errPolicy) ListBlockedIPs() ([]string, error)                  { return nil, errors.New("boom") }
+func (p *errPolicy) ListBlockedRules() ([]BlockedRule, error)           { return nil, errors.New("boom") }
+func (p *errPolicy) Clear() error                                       { return errors.New("boom") }
+func (p *errPolicy) Interface() string                                  { return "" }
+func (p *errPolicy) AttachMode() string                                 { return "" }
+func (p *errPolicy) Stats() (Stats, error)                              { return Stats{}, errors.New("boom") }
 func (p *errPolicy) BlockPortRule(string, string, uint16, uint16) error { return errors.New("boom") }
 func (p *errPolicy) BlockPortRuleWithAction(string, string, uint16, uint16, string) error {
 	return errors.New("boom")
@@ -679,17 +710,17 @@ func (p *errPolicy) BlockPortRuleWithActionPriority(string, string, uint16, uint
 	return errors.New("boom")
 }
 func (p *errPolicy) UnblockPortRule(string, string, uint16, uint16) error { return errors.New("boom") }
-func (p *errPolicy) ListPortRules() ([]PortRule, error)                    { return nil, errors.New("boom") }
-func (p *errPolicy) ClearPortRules() error                                 { return errors.New("boom") }
-func (p *errPolicy) ListConntrack() ([]ConntrackEntry, error)              { return nil, errors.New("boom") }
-func (p *errPolicy) ClearConntrack() error                                 { return errors.New("boom") }
-func (p *errPolicy) SetDefaultPolicy(string) error                         { return errors.New("boom") }
-func (p *errPolicy) DefaultPolicy() (string, error)                        { return "", errors.New("boom") }
-func (p *errPolicy) BlockEgressWithAction(string, string) error            { return errors.New("boom") }
+func (p *errPolicy) ListPortRules() ([]PortRule, error)                   { return nil, errors.New("boom") }
+func (p *errPolicy) ClearPortRules() error                                { return errors.New("boom") }
+func (p *errPolicy) ListConntrack() ([]ConntrackEntry, error)             { return nil, errors.New("boom") }
+func (p *errPolicy) ClearConntrack() error                                { return errors.New("boom") }
+func (p *errPolicy) SetDefaultPolicy(string) error                        { return errors.New("boom") }
+func (p *errPolicy) DefaultPolicy() (string, error)                       { return "", errors.New("boom") }
+func (p *errPolicy) BlockEgressWithAction(string, string) error           { return errors.New("boom") }
 func (p *errPolicy) BlockEgressWithActionPriority(string, string, uint32) error {
 	return errors.New("boom")
 }
-func (p *errPolicy) UnblockEgress(string) error             { return errors.New("boom") }
+func (p *errPolicy) UnblockEgress(string) error              { return errors.New("boom") }
 func (p *errPolicy) ListEgressRules() ([]BlockedRule, error) { return nil, errors.New("boom") }
 func (p *errPolicy) BlockEgressPortRule(string, string, uint16, uint16) error {
 	return errors.New("boom")
@@ -704,11 +735,11 @@ func (p *errPolicy) UnblockEgressPortRule(string, string, uint16, uint16) error 
 	return errors.New("boom")
 }
 func (p *errPolicy) ListEgressPortRules() ([]PortRule, error) { return nil, errors.New("boom") }
-func (p *errPolicy) ClearEgress() error                        { return errors.New("boom") }
-func (p *errPolicy) SetEgressDefault(string) error             { return errors.New("boom") }
-func (p *errPolicy) EgressDefault() (string, error)            { return "", errors.New("boom") }
-func (p *errPolicy) EgressStats() (Stats, error)               { return Stats{}, errors.New("boom") }
-func (p *errPolicy) EgressAttached() bool                      { return false }
+func (p *errPolicy) ClearEgress() error                       { return errors.New("boom") }
+func (p *errPolicy) SetEgressDefault(string) error            { return errors.New("boom") }
+func (p *errPolicy) EgressDefault() (string, error)           { return "", errors.New("boom") }
+func (p *errPolicy) EgressStats() (Stats, error)              { return Stats{}, errors.New("boom") }
+func (p *errPolicy) EgressAttached() bool                     { return false }
 
 func TestHandle_PropagatesErrors(t *testing.T) {
 	s := New("unused.sock", &errPolicy{})

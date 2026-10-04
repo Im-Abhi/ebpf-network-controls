@@ -1,8 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
 	"reflect"
+	"strings"
 	"testing"
+
+	"ebpf-firewall/control/server"
 )
 
 func TestExtractOptions_FlagsAfterCommand(t *testing.T) {
@@ -120,17 +127,17 @@ func TestExtractOptions_PlainCommand(t *testing.T) {
 
 func TestExtractOptions_Errors(t *testing.T) {
 	tests := [][]string{
-		{"block", "1.2.3.4", "--protocol"},       // missing value
-		{"block", "1.2.3.4", "--dport"},          // missing value
-		{"block", "1.2.3.4", "--sport"},          // missing value
-		{"block", "1.2.3.4", "--dport", "70000"}, // > 65535
-		{"block", "1.2.3.4", "--dport", "oops"},  // not a number
-		{"block", "1.2.3.4", "--sport", "70000"}, // > 65535
-		{"block", "1.2.3.4", "--action"},         // missing value
-		{"block", "1.2.3.4", "--priority"},       // missing value
-		{"block", "1.2.3.4", "--priority", "x"},  // not a number
+		{"block", "1.2.3.4", "--protocol"},               // missing value
+		{"block", "1.2.3.4", "--dport"},                  // missing value
+		{"block", "1.2.3.4", "--sport"},                  // missing value
+		{"block", "1.2.3.4", "--dport", "70000"},         // > 65535
+		{"block", "1.2.3.4", "--dport", "oops"},          // not a number
+		{"block", "1.2.3.4", "--sport", "70000"},         // > 65535
+		{"block", "1.2.3.4", "--action"},                 // missing value
+		{"block", "1.2.3.4", "--priority"},               // missing value
+		{"block", "1.2.3.4", "--priority", "x"},          // not a number
 		{"block", "1.2.3.4", "--priority", "4294967296"}, // > uint32
-		{"block", "1.2.3.4", "--bogus"},          // unknown option
+		{"block", "1.2.3.4", "--bogus"},                  // unknown option
 	}
 	for _, raw := range tests {
 		if _, _, _, _, _, _, _, _, err := extractOptions(raw); err == nil {
@@ -172,5 +179,40 @@ func TestParsePort(t *testing.T) {
 				t.Errorf("parsePort(%q, %s): expected error, got nil", bad, flag)
 			}
 		}
+	}
+}
+
+func TestPrintResponse_EmptyListPortsPrintsNoPortRules(t *testing.T) {
+	// Regression for smoke CHECK 4b: an empty port table must render as
+	// "no port rules". The bug was the server serializing a nil slice as
+	// null; the client's `resp.PortRules != nil` guard then fell through to
+	// the generic "ok" line. Decode a non-nil empty array (what the fixed
+	// server sends) and assert the output.
+	raw := []byte(`{"ok":true,"port_rules":[],"egress_port_rules":[]}`)
+	var resp server.Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.PortRules == nil {
+		t.Fatalf("decoded PortRules is nil; realistic empty server reply must decode to non-nil []")
+	}
+
+	var buf bytes.Buffer
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+	done := make(chan string, 1)
+	go func() {
+		io.Copy(&buf, r)
+		done <- "copied"
+	}()
+	printResponse(resp)
+	w.Close()
+	os.Stdout = old
+	<-done
+	out := buf.String()
+	if !strings.Contains(out, "no port rules") {
+		t.Errorf("printResponse output = %q, want it to contain %q", out, "no port rules")
 	}
 }
