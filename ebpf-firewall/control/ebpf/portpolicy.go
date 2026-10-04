@@ -216,19 +216,29 @@ func (pm *PortPolicyManager) List() ([]server.PortRule, error) {
 }
 
 // Clear removes every port rule from the map.
+//
+// Keys are snapshotted before deletion: iterating a hash map while deleting
+// from it is not safe (cilium/ebpf: "you may see the same key multiple
+// times; iteration may also abort with an error") and on a real kernel the
+// iterator can silently skip entries, leaving rules behind with no error.
+// This matches the snapshot-first idiom used by ConntrackManager.
 func (pm *PortPolicyManager) Clear() error {
 	var (
+		keys  []firewallPortRuleKey
 		key   firewallPortRuleKey
 		value ruleValue
 	)
 	iter := pm.portPolicy.Iterate()
 	for iter.Next(&key, &value) {
-		if err := pm.portPolicy.Delete(key); err != nil {
-			return err
-		}
+		keys = append(keys, key)
 	}
 	if err := iter.Err(); err != nil {
 		return err
+	}
+	for _, k := range keys {
+		if err := pm.portPolicy.Delete(k); err != nil {
+			return err
+		}
 	}
 	return pm.syncPresence()
 }

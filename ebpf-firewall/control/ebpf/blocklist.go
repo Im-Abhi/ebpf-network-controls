@@ -209,20 +209,29 @@ func (pm *MapManager) ListBlockedIPs() ([]string, error) {
 }
 
 // Clear removes every blocked prefix from the map.
+//
+// Keys are snapshotted before deletion: deleting keys from a map while
+// iterating it is not safe (cilium/ebpf) and can silently skip entries on a
+// real kernel. This matches the snapshot-first idiom used by the other
+// managers.
 func (pm *MapManager) Clear() error {
 	var (
+		keys  []firewallIpv4LpmKey
 		key   firewallIpv4LpmKey
 		value ruleValue
 	)
 
 	iter := pm.blockedIps.Iterate()
 	for iter.Next(&key, &value) {
-		if err := pm.blockedIps.Delete(key); err != nil {
-			return err
-		}
+		keys = append(keys, key)
 	}
 	if err := iter.Err(); err != nil {
 		return err
+	}
+	for _, k := range keys {
+		if err := pm.blockedIps.Delete(k); err != nil {
+			return err
+		}
 	}
 	return pm.syncPresence()
 }

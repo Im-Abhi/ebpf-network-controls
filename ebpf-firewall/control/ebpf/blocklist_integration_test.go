@@ -119,13 +119,16 @@ func TestMapManager_ListAndClear(t *testing.T) {
 	if err := pm.BlockIP("10.0.0.0/8"); err != nil {
 		t.Fatalf("BlockIP: %v", err)
 	}
+	if err := pm.BlockIP("192.168.0.0/16"); err != nil {
+		t.Fatalf("BlockIP: %v", err)
+	}
 
 	list, err := pm.ListBlockedIPs()
 	if err != nil {
 		t.Fatalf("ListBlockedIPs: %v", err)
 	}
-	if len(list) != 2 {
-		t.Fatalf("ListBlockedIPs len = %d, want 2 (got %v)", len(list), list)
+	if len(list) != 3 {
+		t.Fatalf("ListBlockedIPs len = %d, want 3 (got %v)", len(list), list)
 	}
 
 	if err := pm.Clear(); err != nil {

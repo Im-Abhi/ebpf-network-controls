@@ -213,6 +213,64 @@ func TestEgressDatapath_Conntrack_ReverseEntryPassesInboundReplies(t *testing.T)
 	mustVerdict(t, fw, tcpPktFlags("1.2.3.4", "10.0.0.1", 22, 60000, tcpFlagACK), testXDPDrop)
 }
 
+// TestEgressPolicyManager_ClearRemovesAll guards the Clear() contract for both
+// egress maps. It inserts at least three rules per map so a delete-
+// during-iteration hazard (which can silently skip entries on a real kernel)
+// has enough state to trip on, and asserts both lists are empty afterwards.
+func TestEgressPolicyManager_ClearRemovesAll(t *testing.T) {
+	em := NewEgressPolicyManager(newTestLpmMap(t), newTestPortPolicyMap(t))
+
+	for _, cidr := range []string{"1.2.3.4", "10.0.0.0/8", "192.168.0.0/16"} {
+		if err := em.BlockIP(cidr, ActionDrop, 0); err != nil {
+			t.Fatalf("BlockIP(%s): %v", cidr, err)
+		}
+	}
+
+	if err := em.BlockPort("8.8.8.8", "tcp", 443, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("BlockPort: %v", err)
+	}
+	if err := em.BlockPort("8.8.8.8", "udp", 53, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("BlockPort: %v", err)
+	}
+	if err := em.BlockPort("1.1.1.1", "tcp", 22, 0, ActionPass, 100); err != nil {
+		t.Fatalf("BlockPort: %v", err)
+	}
+
+	ips, err := em.ListIPs()
+	if err != nil {
+		t.Fatalf("ListIPs before clear: %v", err)
+	}
+	if len(ips) != 3 {
+		t.Fatalf("ListIPs before clear len = %d, want 3", len(ips))
+	}
+	ports, err := em.ListPorts()
+	if err != nil {
+		t.Fatalf("ListPorts before clear: %v", err)
+	}
+	if len(ports) != 3 {
+		t.Fatalf("ListPorts before clear len = %d, want 3", len(ports))
+	}
+
+	if err := em.Clear(); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+
+	ips, err = em.ListIPs()
+	if err != nil {
+		t.Fatalf("ListIPs after clear: %v", err)
+	}
+	if len(ips) != 0 {
+		t.Fatalf("ListIPs after clear len = %d, want 0; left over: %+v", len(ips), ips)
+	}
+	ports, err = em.ListPorts()
+	if err != nil {
+		t.Fatalf("ListPorts after clear: %v", err)
+	}
+	if len(ports) != 0 {
+		t.Fatalf("ListPorts after clear len = %d, want 0; left over: %+v", len(ports), ports)
+	}
+}
+
 func TestEgressDatapath_ClearEgress_LeavesIngress(t *testing.T) {
 	fw := loadTestFirewall(t)
 

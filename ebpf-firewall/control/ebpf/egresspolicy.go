@@ -207,36 +207,48 @@ func (em *EgressPolicyManager) ListPorts() ([]server.PortRule, error) {
 }
 
 // Clear removes every rule from both egress maps and syncs both presence bits.
+//
+// Each map's keys are snapshotted before deletion: deleting keys while
+// iterating is not safe (cilium/ebpf) and can silently skip entries on a real
+// kernel. This matches the snapshot-first idiom used by the other managers.
 func (em *EgressPolicyManager) Clear() error {
 	var (
-		key   firewallIpv4LpmKey
+		ikeys []firewallIpv4LpmKey
+		ikey  firewallIpv4LpmKey
 		value ruleValue
 	)
 	iter := em.blockedIps.Iterate()
-	for iter.Next(&key, &value) {
-		if err := em.blockedIps.Delete(key); err != nil {
-			return err
-		}
+	for iter.Next(&ikey, &value) {
+		ikeys = append(ikeys, ikey)
 	}
 	if err := iter.Err(); err != nil {
 		return err
+	}
+	for _, k := range ikeys {
+		if err := em.blockedIps.Delete(k); err != nil {
+			return err
+		}
 	}
 	if err := em.syncIPPresence(); err != nil {
 		return err
 	}
 
 	var (
-		pkey   firewallPortRuleKey
-		pvalue ruleValue
+		pkeys []firewallPortRuleKey
+		pkey  firewallPortRuleKey
+		pval  ruleValue
 	)
 	piter := em.portPolicy.Iterate()
-	for piter.Next(&pkey, &pvalue) {
-		if err := em.portPolicy.Delete(pkey); err != nil {
-			return err
-		}
+	for piter.Next(&pkey, &pval) {
+		pkeys = append(pkeys, pkey)
 	}
 	if err := piter.Err(); err != nil {
 		return err
+	}
+	for _, k := range pkeys {
+		if err := em.portPolicy.Delete(k); err != nil {
+			return err
+		}
 	}
 	return em.syncPortPresence()
 }
