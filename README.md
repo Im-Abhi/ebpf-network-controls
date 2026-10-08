@@ -31,11 +31,17 @@ What works today (MTP1 core — XDP firewall):
 ```
 Default policy: ALLOW  (runtime-configurable)
 
-Matching rule:          the rule with the highest --priority wins
-                        (PASS or DROP action as configured)
-No matching rule:       default policy (allow => PASS, deny => DROP;
-                        default-deny additionally lets ESTABLISHED
-                        TCP flows pass — see "Stateful (conntrack)")
+IP-table match:        kernel LPM longest-prefix match — the single most-
+                       specific prefix wins; `--priority` does NOT override
+                       within the IP table (least specific -> most specific)
+Matching rule:         the rule with the highest --priority wins across the
+                       selected IP rule and the selected port rule (PASS or
+                       DROP action as configured); equal-priority ties keep
+                       the port table's most-specific match, and an IP-vs-
+                       port tie resolves to DROP
+No matching rule:      default policy (allow => PASS, deny => DROP;
+                       default-deny additionally lets ESTABLISHED
+                       TCP flows pass — see "Stateful (conntrack)")
 ```
 
 The firewall is **default-allow** by default and can be flipped live with
@@ -49,6 +55,16 @@ the **most-specific** rule within the port table (an exact
 `(protocol, dport, sport)` match beats partial matches) and to **DROP** in the
 IP-vs-port cross table. Non-IPv4 / unparseable packets (e.g. ARP) follow the
 default policy.
+
+One deliberate contract boundary: within the **IP table itself** the kernel's
+LPM trie performs a **longest-prefix match** and returns a single winning rule,
+so priority is *not* compared between overlapping CIDRs — a `/32` rule always
+beats a `/8` rule for the addresses it covers, regardless of their priorities.
+`--priority` only arbitrates between that one IP match and the selected port
+rule, and across the port table's four specificity keys. This mirrors how the
+maps descend from the original most-specific-first design; see
+`bpf/firewall.c` (`ip_block_action` / `port_rule_action` / `decide`) for the
+exact decision table.
 
 ### Port rules (ingress only)
 

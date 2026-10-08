@@ -372,6 +372,31 @@ func TestDatapath_Priority_OverridesPortSpecificity(t *testing.T) {
 	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 80), testXDPDrop)
 }
 
+func TestDatapath_Priority_OverlappingCIDR_LongestPrefixWins(t *testing.T) {
+	fw := loadTestFirewall(t)
+
+	// The IP table is an LPM trie, so the most-specific prefix is the single
+	// match and priority is NOT consulted among overlapping CIDRs: a /24 PASS
+	// at the maximum priority cannot beat a /32 DROP at priority 0 for a
+	// source it both cover.
+	if err := fw.BlockIPWithActionPriority("10.0.0.0/24", "pass", 4294967295); err != nil {
+		t.Fatalf("BlockIPWithActionPriority(/24 pass): %v", err)
+	}
+	if err := fw.BlockIPWithActionPriority("10.0.0.8/32", "drop", 0); err != nil {
+		t.Fatalf("BlockIPWithActionPriority(/32 drop): %v", err)
+	}
+
+	// Source inside the /32: the longest-prefix /32 DROP wins despite being
+	// priority 0. (The datapath checks source first, then destination.)
+	mustVerdict(t, fw, tcpPkt("10.0.0.8", "1.2.3.4", 12345, 80), testXDPDrop)
+	// Same via the destination lookup path.
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "10.0.0.8", 12345, 80), testXDPDrop)
+	// Elsewhere in the /24 only the PASS rule matches.
+	mustVerdict(t, fw, tcpPkt("10.0.0.9", "1.2.3.4", 12345, 80), testXDPPass)
+	// Outside the /24: no rule, default allow.
+	mustVerdict(t, fw, tcpPkt("10.1.0.1", "1.2.3.4", 12345, 80), testXDPPass)
+}
+
 func TestDatapath_PortRule_EqualPriorityKeepsSpecificity(t *testing.T) {
 	fw := loadTestFirewall(t)
 	if err := fw.SetDefaultPolicy("deny"); err != nil {

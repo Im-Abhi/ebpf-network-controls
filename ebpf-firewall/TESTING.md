@@ -71,7 +71,7 @@ datapath** — not just Go map writes. Groups:
 Builds **raw Ethernet/IPv4/TCP/UDP frames** and injects them through
 `BPF_PROG_TEST_RUN` (`prog.Run`), asserting the returned XDP verdict and counter
 deltas. The program is loaded on `lo` but **not attached** — no real traffic,
-fully deterministic. The 23 scenarios:
+fully deterministic. The 24 scenarios:
 
 | Test | Asserts |
 | --- | --- |
@@ -88,6 +88,7 @@ fully deterministic. The 23 scenarios:
 | `TestDatapath_Priority_HigherDropBeatsLowerPass` | higher-priority DROP beats a broader PASS |
 | `TestDatapath_Priority_TieResolvesToDrop` | equal-priority IP vs port overlap → DROP |
 | `TestDatapath_Priority_OverridesPortSpecificity` | higher priority beats a more-specific lower-priority rule |
+| `TestDatapath_Priority_OverlappingCIDR_LongestPrefixWins` | within the IP table the LPM longest-prefix match wins: a `/32` DROP (prio 0) beats a covering `/24` PASS (prio max); priority is not compared between overlapping CIDRs |
 | `TestDatapath_PortRule_EqualPriorityKeepsSpecificity` | equal-priority port overlap keeps most-specific-first matching |
 | `TestDatapath_Conntrack_SpoofedAckCreatesNoState` | a dropped SYN writes no state; spoofed ACK still denied and untracked |
 | `TestDatapath_Conntrack_EstablishedFlowPassesAfterRuleRemoved` | SYN→NEW, ACK→ESTABLISHED, rule removed, flow still passes via state; other flows denied |
