@@ -140,6 +140,8 @@ ACK accepted on a NEW     -> ESTABLISHED
 FIN or RST accepted       -> CLOSED
 any accepted packet       -> refresh last_seen
 no matching rule + default-deny + ESTABLISHED flow -> PASS
+no matching rule + default-deny + CLOSED flow -> PASS (teardown tail); the
+                         entry stays CLOSED — never re-armed or refreshed
 ```
 
 Key properties:
@@ -149,6 +151,9 @@ Key properties:
 - The table is consulted **only under default-deny** (under default-allow it
   would add cost without changing any verdict).
 - Rules always win: state only matters when **no** rule matches.
+- Closing is graceful: a CLOSED flow keeps passing the closing ACKs of its
+  teardown (the peer never has to retransmit its FIN), but the entry is never
+  re-armed or refreshed — it drains until the reaper ages it out.
 - Entries live in a plain hash map keyed by the 5-tuple
   (`src, dst, sport, dport, protocol`); `cmd/firewall -ct-timeout` (default
   `5m`) runs a userspace reaper that ages idle flows out — more deterministic

@@ -77,12 +77,15 @@ MTP2+ are the thesis-level extensions built on top of it.
       (incl. the new datapath conntrack scenarios + manager tests) — plus live
       coverage in `integration/fw-smoke.sh` (checks 3–5: spoofed ACK, stateful
       fast-path after rule removal, FIN→CLOSED, clear, reaper)
-- [ ] Open design note: the datapath DROPs the final teardown ACK of a flow it
-      has already marked CLOSED (FIN/RST). A peer that closes cleanly therefore
-      retransmits its FIN until TCP retries are exhausted, because it never
-      sees an ACK for it. Verdicts are correct; the behaviour is a product
-      decision to revisit (e.g. treat the ACK closing a CLOSED flow as PASS) —
-      `integration/fw-smoke.sh` works around it by RST-closing clients
+- [x] Teardown tail: a flow already marked CLOSED (FIN/RST) still passes the
+      closing ACKs of its teardown instead of dropping them, and is never
+      re-armed or refreshed — the entry drains until the reaper ages it out.
+      Implemented as the `ct_is_passable` / `ct_is_passable_egress` fast-path
+      gates plus CLOSED-skips inside `ct_update` / `ct_update_egress` in
+      `bpf/firewall.c` (both ingress and egress hooks; SHARED conntrack map).
+      Covered by `TestDatapath_Conntrack_FinClosesFlow` and smoke 3k–3l; a peer
+      that closes cleanly no longer retransmits its FIN (previously the final
+      ACK was dropped, see the old workaround of RST-closing smoke clients)
 
 ### MTP1-E: Benchmarking module (separate from firewall)
 

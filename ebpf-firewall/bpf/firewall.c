@@ -276,20 +276,27 @@ static __always_inline void ct_build_key(struct ct_key *key,
     key->protocol = info->protocol;
 }
 
-/* Read-only conntrack probe. Returns 1 when an ESTABLISHED flow matches the
- * packet's 5-tuple, 0 otherwise (including NEW/CLOSED and no entry). */
-static __always_inline int ct_is_established(const struct packet_info *info) {
+/* Read-only conntrack probe for the stateful fast-path gate. Returns 1 when
+ * the packet's 5-tuple is in a passable state: ESTABLISHED (an ongoing flow
+ * keeps flowing once its rule is removed) or CLOSED (the tail of a teardown —
+ * the peer's closing replies and final ACKs — must not be dropped). A CLOSED
+ * entry is never re-armed: it passes, but ct_update refuses to refresh it, so
+ * it drains until the reaper ages it out.
+ * Returns 0 for NEW, empty and never-seen tuples (a bare spoofed ACK cannot
+ * fabricate a flow through this gate). */
+static __always_inline int ct_is_passable(const struct packet_info *info) {
     struct ct_key key;
     ct_build_key(&key, info);
     struct ct_value *v = bpf_map_lookup_elem(&conntrack, &key);
-    return v && v->state == CT_ESTABLISHED;
+    return v && (v->state == CT_ESTABLISHED || v->state == CT_CLOSED);
 }
 
 /* Records an accepted TCP packet. Called only after a PASS decision, so a
  * dropped SYN never creates state (and a subsequent spoofed ACK cannot
  * fabricate an ESTABLISHED flow). Transitions: SYN -> NEW, ACK on NEW ->
- * ESTABLISHED, FIN/RST -> CLOSED, every accepted packet refreshes
- * last_seen. */
+ * ESTABLISHED, FIN/RST -> CLOSED, every accepted packet refreshes last_seen.
+ * A CLOSED entry is left completely untouched: the flow is draining (see the
+ * ct_is_passable gate) and must not be re-armed or kept alive indefinitely. */
 static __always_inline void ct_update(const struct packet_info *info) {
     struct ct_key key;
     ct_build_key(&key, info);
@@ -297,6 +304,9 @@ static __always_inline void ct_update(const struct packet_info *info) {
 
     struct ct_value *v = bpf_map_lookup_elem(&conntrack, &key);
     if (v) {
+        if (v->state == CT_CLOSED) {
+            return;
+        }
         v->last_seen = now;
         if (info->tcp_flags & (TCP_FIN | TCP_RST)) {
             v->state = CT_CLOSED;
@@ -415,15 +425,16 @@ int firewall_prog(struct xdp_md *ctx) {
     }
 
     /* 3. decision (data-driven; highest priority wins, tie -> DROP, else
-     * default). Under default-deny a TCP packet belonging to an already
-     * ESTABLISHED flow is also let through when no rule matches; the stateful
-     * fast-path is meaningless (and skipped) under default-allow. */
+     * default). Under default-deny a TCP packet belonging to a passable flow
+     * (ESTABLISHED, or a CLOSED flow draining out) is also let through when no
+     * rule matches; the stateful fast-path is meaningless (and skipped) under
+     * default-allow. */
     enum default_policy def = default_policy();
     int verdict;
     if (ip_matched || port_matched) {
         verdict = decide(ip_matched, &ip_rule, port_matched, &port_rule);
     } else if (def == DEFAULT_DENY && info.protocol == IPPROTO_TCP &&
-               ct_is_established(&info)) {
+               ct_is_passable(&info)) {
         verdict = XDP_PASS;
     } else {
         verdict = def == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
@@ -437,7 +448,8 @@ int firewall_prog(struct xdp_md *ctx) {
 
     /* 4. accepted: record/refresh TCP state. Must run only on PASS, never on
      * DROP, so a dropped SYN leaves no state behind. Only tracked under
-     * default-deny, where the state actually changes future verdicts. */
+     * default-deny, where the state actually changes future verdicts; a
+     * CLOSED flow is skipped (draining, never re-armed). */
     if (def == DEFAULT_DENY && info.protocol == IPPROTO_TCP) {
         ct_update(&info);
     }
@@ -570,21 +582,22 @@ static __always_inline int egress_port_rule_action(const struct packet_info *inf
     return 1;
 }
 
-/* Shared state probe for egress: ESTABLISHED on the exact (outbound) tuple
- * or its reverse. */
-static __always_inline int ct_is_established_egress(const struct packet_info *info) {
+/* Shared state probe for egress: a passable state — ESTABLISHED, or CLOSED
+ * draining out — on the exact (outbound) tuple or its reverse, so the tail of
+ * a teardown in either direction is not dropped (see the ingress gate). */
+static __always_inline int ct_is_passable_egress(const struct packet_info *info) {
     struct ct_key key;
     struct ct_value *v;
 
     ct_build_key(&key, info);
     v = bpf_map_lookup_elem(&conntrack, &key);
-    if (v && v->state == CT_ESTABLISHED) {
+    if (v && (v->state == CT_ESTABLISHED || v->state == CT_CLOSED)) {
         return 1;
     }
 
     ct_build_reverse_key(&key, info);
     v = bpf_map_lookup_elem(&conntrack, &key);
-    return v && v->state == CT_ESTABLISHED;
+    return v && (v->state == CT_ESTABLISHED || v->state == CT_CLOSED);
 }
 
 /* Gate: decide whether egress may consult/write conntrack for this packet.
@@ -609,9 +622,10 @@ static __always_inline int ct_active_egress(const struct packet_info *info,
 /* Record an accepted outbound TCP packet in the shared conntrack map.
  * Orientation resolution, exact then reverse - each refreshed with the same
  * transitions as the ingress side (FIN/RST -> CLOSED, ACK on NEW ->
- * ESTABLISHED). A brand-new outbound flow is stored under its REVERSE (reply)
- * tuple as ESTABLISHED so the unchanged ingress path passes the reply under
- * default-deny (see the section note). */
+ * ESTABLISHED). A CLOSED entry in either orientation is left completely
+ * untouched (draining flow, never re-armed). A brand-new outbound flow is
+ * stored under its REVERSE (reply) tuple as ESTABLISHED so the unchanged
+ * ingress path passes the reply under default-deny (see the section note). */
 static __always_inline void ct_update_egress(const struct packet_info *info) {
     struct ct_key exact;
     struct ct_key rev;
@@ -625,6 +639,9 @@ static __always_inline void ct_update_egress(const struct packet_info *info) {
 
     v = bpf_map_lookup_elem(&conntrack, &exact);
     if (v) {
+        if (v->state == CT_CLOSED) {
+            return;
+        }
         v->last_seen = now;
         if (close) {
             v->state = CT_CLOSED;
@@ -636,6 +653,9 @@ static __always_inline void ct_update_egress(const struct packet_info *info) {
 
     v = bpf_map_lookup_elem(&conntrack, &rev);
     if (v) {
+        if (v->state == CT_CLOSED) {
+            return;
+        }
         v->last_seen = now;
         if (close) {
             v->state = CT_CLOSED;
@@ -709,13 +729,14 @@ int firewall_tc_egress(struct __sk_buff *skb) {
     }
 
     /* 3. decision: same priority table as ingress; on no rule match the
-     * shared stateful fast path is consulted when this hook's default is
-     * DENY, then the egress default applies. */
+     * shared stateful fast path (ESTABLISHED, or a CLOSED flow draining out)
+     * is consulted when this hook's default is DENY, then the egress default
+     * applies. */
     enum default_policy def_egress = egress_default_policy();
     if (ip_matched || port_matched) {
         verdict = decide(ip_matched, &ip_rule, port_matched, &port_rule);
     } else if (def_egress == DEFAULT_DENY && info.protocol == IPPROTO_TCP &&
-               ct_is_established_egress(&info)) {
+               ct_is_passable_egress(&info)) {
         verdict = XDP_PASS;
     } else {
         verdict = def_egress == DEFAULT_DENY ? XDP_DROP : XDP_PASS;

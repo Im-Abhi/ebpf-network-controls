@@ -92,7 +92,7 @@ fully deterministic. The 24 scenarios:
 | `TestDatapath_PortRule_EqualPriorityKeepsSpecificity` | equal-priority port overlap keeps most-specific-first matching |
 | `TestDatapath_Conntrack_SpoofedAckCreatesNoState` | a dropped SYN writes no state; spoofed ACK still denied and untracked |
 | `TestDatapath_Conntrack_EstablishedFlowPassesAfterRuleRemoved` | SYN→NEW, ACK→ESTABLISHED, rule removed, flow still passes via state; other flows denied |
-| `TestDatapath_Conntrack_FinClosesFlow` | FIN→CLOSED; a later packet on the closed flow is denied |
+| `TestDatapath_Conntrack_FinClosesFlow` | FIN→CLOSED; the teardown tail (a later packet on the closed flow) passes but the entry is not re-armed — it stays CLOSED |
 | `TestDatapath_Conntrack_MidStreamRuleAcceptMarksEstablished` | mid-stream ACK accepted by a rule is recorded as ESTABLISHED |
 | `TestDatapath_Conntrack_NotTrackedUnderDefaultAllow` | default-allow consults/never writes the conntrack map |
 | `TestDatapath_Conntrack_TcpOnlyUnderDefaultDeny` | denied UDP traffic leaves no state (TCP-only) |
@@ -231,7 +231,7 @@ Golden run: **38/38 checks**. Coverage:
 | 3a–3c | default-deny: bare ACK denied, creates no state |
 | 3d–3g | `--action pass` admits a flow; ESTABLISHED survives rule removal (stateful fast-path) |
 | 3i–3j | raw SYN denied, no conntrack state |
-| 3k–3l | FIN→CLOSED; packet on a CLOSED flow denied again |
+| 3k–3l | FIN→CLOSED; the teardown tail (ACK on the CLOSED flow) passes without being dropped and without re-arming the entry (stays CLOSED) |
 | 4a–4d | `clear` empties blocklist + port rules + conntrack; then a fresh SYN is denied |
 | 5a–5e | `-ct-timeout 5s` reaper: flow reaped, daemon logs it, later packet denied |
 | 6a–6i | egress (`-dir both`, TCX): status shows attached; default allow passes; dst-only block semantics (`block <unrelated-ip> --dir out` doesn't affect traffic; `block <dst> --dir out` fails the connection and bumps the egress drop counter); `list`/`clear --dir out` round-trip; egress `default deny` blocks outbound and `default allow` restores it. Requires kernel >= 6.6 |
@@ -241,8 +241,11 @@ the run; if the kernel lacks TCX support the daemon fails to start and CHECK 6
 reports itself skipped.
 
 Client sockets are `SO_REUSEADDR` + RST-close (`SO_LINGER=0`) so the teardown of
-each connection cannot leave a TIME_WAIT port that a later check reuses, and
-cannot retrigger the host-side FIN retransmits described in the MTP1-D note.
+each connection cannot leave a TIME_WAIT port that a later check reuses. A clean
+FIN teardown would also work — the datapath lets a CLOSED flow's tail pass
+without re-arming it (see `ct_is_passable` / `ct_update` in `bpf/firewall.c`) —
+but that keeps the negotiated 5-tuple in CLOSED until the reaper ages it out,
+which could collide with a later check's ports. Hence the deliberate RST-close.
 
 ---
 

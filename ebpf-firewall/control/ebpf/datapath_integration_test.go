@@ -520,8 +520,13 @@ func TestDatapath_Conntrack_FinClosesFlow(t *testing.T) {
 		t.Fatalf("flow state = %q, want closed", s)
 	}
 
-	// After close, a stray packet no longer has the established fast-path.
-	mustVerdict(t, fw, tcpPktFlags("10.0.0.1", "1.2.3.4", 50000, 22, tcpFlagACK), testXDPDrop)
+	// After close, the tail of the teardown still passes (the peer's closing
+	// ACKs must not be dropped), but the entry is not re-armed: a passing
+	// packet leaves the flow CLOSED rather than promoting it again.
+	mustVerdict(t, fw, tcpPktFlags("10.0.0.1", "1.2.3.4", 50000, 22, tcpFlagACK), testXDPPass)
+	if s := ctStates(t, fw)["50000:22"]; s != "closed" {
+		t.Fatalf("flow state = %q, want closed (passing teardown tail must not re-arm it)", s)
+	}
 }
 
 func TestDatapath_Conntrack_MidStreamRuleAcceptMarksEstablished(t *testing.T) {

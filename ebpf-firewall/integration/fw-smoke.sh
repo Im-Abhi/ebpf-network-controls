@@ -197,7 +197,7 @@ ck "$(ct_state_for 39002)" "closed" "3k FIN transitions flow to CLOSED"
 D0=$(drop_cnt)
 $NS python3 "$SPY" raw "$HOST_IP" "$PORT" 39002 ACK
 sleep 0.2
-ck "$(( $(drop_cnt) - D0 ))" "1" "3l packet on CLOSED flow is denied again"
+ck "$(( $(drop_cnt) - D0 )):$(ct_state_for 39002)" "0:closed" "3l teardown tail (ACK on CLOSED flow) passes, not dropped or re-armed (drop delta 0, state still closed)"
 
 # ---- CHECK 4: clear wipes rules + conntrack together -----------------------
 echo
