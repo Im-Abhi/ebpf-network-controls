@@ -32,9 +32,15 @@ sudo ./benchmark/run-bench.sh --backend xdp --scenario single --iterations 5 --d
 | Option | Values | Default |
 | --- | --- | --- |
 | `--backend` | `all`, `xdp`, `nft` | `all` |
-| `--scenario` | `all`, `none`, `single`, `forward`, `many`, `drop` | `all` |
+| `--scenario` | `all`, `none`, `single`, `forward`, `many`, `drop`, `stateful` | `all` |
 | `--iterations` | positive int | 5 |
 | `--duration` | seconds per iperf3 pass | 10 |
+| `--tc` / `--dir out` | (flag; no value) | ingress (`--dir in`) |
+
+`--tc` (alias `--dir out`) switches the harness to the **egress datapath**
+(TC egress hook / nft OUTPUT chain) instead of the default ingress (XDP /
+INPUT chain). Directions and the extra `stateful` scenario are documented in
+[Egress mode](#egress-mode-tc).
 
 Environment knobs (no flag equivalent): `ITERS` iterations, `DURATION`
 seconds per pass, `UDP_BW` iperf3 UDP rate for the saturated pass (`0` default =
@@ -56,6 +62,16 @@ identical for both backends.
 | `forward` | 1 (one `/24`, `198.51.100.0/24`) | 2 (`saddr` + `daddr`) | rule that never matches the workload |
 | `many` | 1,000 (1000 `/30` prefixes) | 2,000 (`saddr` + `daddr` each) | scaling: LPM trie vs linear nft chain |
 | `drop` | 1 (the sandbox LAN `/24`) | 1 (`saddr ... counter drop`) | the workload itself is blocked: exercises the DROP decision path end-to-end; `flood_sent` offered → `drop_pps` hook-side drop rate (iperf/UDP/RTT columns void by design) |
+| `stateful` | default-deny + 2 pass rules (`HOST_IP/32`, `NS_IP/32`) | default-deny OUTPUT chain + 2 accept rules | egress only (`--tc`): default-deny is asserted and the sandbox LAN whitelisted, so the workload runs through the firewall's pass + conntrack-fast-path datapath (nft mirror: plain OUTPUT accepts) rather than a block; measures the pass + state-tracking cost |
+
+`stateful` requires `--tc`/`--dir out`: it asserts a default-deny egress policy
+and whitelists the sandbox LAN (`HOST_IP`/`NS_IP`) so a real flow is traced by
+conntrack instead of being blocked. For the XDP backend the firewall daemon
+runs `-dir out` (TC egress) with `default deny --dir out` and two
+`--action pass` rules; for nftables the mirror is an OUTPUT chain with policy
+`drop` plus the two `accept` rules. The measured rows are the usual UDP/TCP/RTT
+metrics under a stateful pass path (no `flood_sent`/`drop_pps` — nothing is
+dropped). `stateful` is not part of `--scenario all`; pass it explicitly.
 
 Fairness: the C datapath matches a network on **source, then destination**, so
 the nftables backend installs both `ip saddr <net> drop` and `ip daddr <net> drop`
@@ -95,6 +111,12 @@ client → host and is filtered by the XDP program / nft INPUT chain on
 populates on the sending client too (`sum_received` carries the send statistics
 while `sender=true`), giving the true forwarding datapath — not the ACK-echo
 path that a `server → client` (`-R`) test would measure.
+
+With `--tc` the roles swap: the iperf3 server runs inside `benchns` and the
+client on the host, so bulk DATA flows **host → netns** and is filtered by the
+TC egress hook (firewall `-dir out`) or the nft OUTPUT chain. `tcp_bps`/`udp_bps`
+then measure the egress forwarding datapath; the row's `dir` column (`in`/`out`)
+records which direction each run measured.
 
 **The UDP load is dual.** The saturated pass (`UDP_BW`, default `-b 0`
 unthrottled) stresses the receive path, while a controlled pass (`UDP_CTL_BW`,
@@ -161,6 +183,39 @@ any current NIC. Adding it would gain a documented capability ladder (offload �
 driver → generic cascade) but no measurable effect on the benchmark until an
 offload-capable NIC is available.
 
+## Egress mode (`--tc`)
+
+`--tc` (alias `--dir out`) re-runs the same scenario matrix against the
+**egress datapath**, producing an egress-vs-egress comparison instead of the
+default ingress one:
+
+- the firewall daemon starts with `-dir out`, attaching the TCX egress
+  classifier on `bench-v0` (requires kernel ≥ 6.6; `-dir out` also attaches the
+  XDP program, which is why the daemon accepts both in one process);
+- `firewallctl block`/`default`/`clear` are issued with `--dir out` so rules
+  and the default policy target the egress tables;
+- nftables mirrors the egress path with an **OUTPUT** chain
+  (`type filter hook output priority 0`), same rule forms as the INPUT mirror;
+- iperf3 server listens inside `benchns`, the client runs on the host, so bulk
+  DATA flows host → netns across the TC egress hook / OUTPUT chain;
+- hook-side counters come from the daemon's `egress_stats` (same keys as the
+  ingress `fc_stats`, so `xdp_drop_delta`/`log_xdp_delta` apply unchanged);
+- every summary row gains a trailing `dir` column (`in` or `out`) and
+  `meta.txt` records `direction: out`, keeping ingress and egress runs
+  disambiguable.
+
+```
+sudo ./benchmark/run-bench.sh --tc --backend all                       # full egress matrix
+sudo ./benchmark/run-bench.sh --tc --scenario stateful --iterations 3  # stateful pass-path rows
+sudo ./benchmark/run-bench.sh --dir out --backend xdp --scenario drop  # egress drop, XDP backend only
+```
+
+The `stateful` scenario (see [Scenarios](#scenarios)) only exists in egress
+mode: it asserts default-deny and whitelists the sandbox LAN, so the workload
+runs through the firewall's conntrack fast path (or the nft OUTPUT chain's
+default-deny + accept mirror) and the pass + state-tracking cost is what gets
+measured.
+
 ## Output
 
 Each run creates `benchmark/results/<YYYYmmdd-HHMMSS>/`, with one directory per
@@ -168,8 +223,13 @@ Each run creates `benchmark/results/<YYYYmmdd-HHMMSS>/`, with one directory per
 `ping.txt`, and a `summary.tsv` with one TSV row per measurement:
 
 ```
-run  backend  scenario  iter  udp_bps  udp_pps  udp_lost  udp_jitter_ms  tcp_bps  rtt_avg_ms  cpu_jif  rss_kb  add_ms  del_ms  drop_pps  udp2_bps  udp2_pps  udp2_lost  udp2_jitter_ms  flood_sent
+run  backend  scenario  iter  udp_bps  udp_pps  udp_lost  udp_jitter_ms  tcp_bps  rtt_avg_ms  cpu_jif  rss_kb  add_ms  del_ms  drop_pps  udp2_bps  udp2_pps  udp2_lost  udp2_jitter_ms  flood_sent  dir
 ```
+
+The trailing `dir` column (`in`/`out`) tags the row's datapath direction;
+ingress runs (default) write `in`, `--tc`/`--dir out` runs write `out`. Both
+directions share the remaining columns and metric formats, so the same
+plot/table tooling renders them.
 
 `benchmark/results/` is gitignored; `git add -f` only the runs you want to keep.
 
@@ -405,8 +465,8 @@ cilium/ebpf versions, before quoting either).
 
 This capture also serves as the **pre-TC `firewall_prog` codegen-identity
 reference**: the TC egress milestone must keep `firewall_prog` codegen
-unchanged, and the same harness (with the future `-tc` flag not altering XDP
-cells) is re-run to confirm the XDP medians above reproduce within noise.
+unchanged, and the same harness (`-tc` implemented without altering XDP cells)
+was re-run to confirm the XDP medians above reproduce within noise.
 
 ## Baselines and superseded runs
 

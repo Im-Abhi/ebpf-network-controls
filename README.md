@@ -316,6 +316,12 @@ The benchmarking module (`MTP1-E`) compares the eBPF/XDP firewall against
 Traffic is generated with `iperf3` / `pktgen`. Results are documented in
 `benchmark/results/`.
 
+The firewall is evaluated on both datapaths: **ingress** (`XDP` hook vs
+nftables `INPUT` chain, the default `run-bench.sh` matrix) and **egress**
+(`TC` hook vs nftables `OUTPUT` chain, via `run-bench.sh --tc`). See
+[`ebpf-firewall/benchmark/README.md`](ebpf-firewall/benchmark/README.md) for
+usage, the scenario matrix, and the metrics.
+
 ---
 
 ## Tools & Technologies

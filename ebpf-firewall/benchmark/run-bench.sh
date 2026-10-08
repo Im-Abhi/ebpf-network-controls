@@ -13,9 +13,9 @@
 #
 # Usage:
 #   sudo ./benchmark/run-bench.sh [--backend all|xdp|nft]
-#                                [--scenario all|none|single|forward|many|drop]
+#                                [--scenario all|none|single|forward|many|drop|stateful]
 #                                [--iterations N] [--duration S]
-#                                [--help]
+#                                [--tc | --dir out] [--help]
 # Defaults: backend=all scenario=all iterations=5 duration=10.
 # Environment knobs: ITERS (iterations), DURATION (seconds per iperf3 pass),
 # UDP_BW (iperf3 -b for the saturated UDP pass; 0 = unthrottled),
@@ -29,6 +29,11 @@
 # default, so bulk DATA always flows client -> server through the host-side XDP
 # hook and the nft INPUT chain. tcp_bps and udp_bps measure the firewalls'
 # real forwarding datapath (not the ACK echo path).
+#
+# --tc / --dir out measure the egress datapath instead: traffic flows HOST ->
+# netns across the TC egress hook (firewall `-dir out`, kernel >= 6.6) or an
+# nft OUTPUT chain, with the same scenario matrix and metrics. Results rows are
+# identical; meta.txt records `direction: out`.
 
 set -euo pipefail
 
@@ -44,13 +49,14 @@ BACKENDS=(xdp nft)
 SCENARIOS=("${all_scenarios[@]}")
 ITERATIONS="${ITERS:-5}"
 DURATION=10
+DIR="in"
 RUN_TS="$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="${RESULTS_ROOT}/${RUN_TS}"
 SUMMARY="${RUN_DIR}/summary.tsv"
 IPERF_PID=""
 
 usage() {
-    sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# //'
+    sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# //'
     exit 0
 }
 
@@ -66,12 +72,19 @@ while [ "$#" -gt 0 ]; do
     --scenario)
         case "$2" in
         all) SCENARIOS=("${all_scenarios[@]}") ;;
-        none|single|forward|many|drop) SCENARIOS=("$2") ;;
+        none|single|forward|many|drop|stateful) SCENARIOS=("$2") ;;
         *) echo "bench: bad scenario '$2'" >&2; usage ;;
         esac
         shift 2 ;;
     --iterations) ITERATIONS="$2"; shift 2 ;;
     --duration)   DURATION="$2";   shift 2 ;;
+    --tc) DIR="out"; shift ;;
+    --dir)
+        case "$2" in
+        in|out) DIR="$2" ;;
+        *) echo "bench: bad --dir '$2' (use in or out)" >&2; usage ;;
+        esac
+        shift 2 ;;
     --help|-h) usage ;;
     *) echo "bench: unknown option '$1'" >&2; usage ;;
     esac
@@ -82,6 +95,18 @@ require_cmds ip nft iperf3 ping date python3 || exit 1
 if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
     echo "bench: iperf3 JSON parsing needs jq or python3 (neither found)" >&2
     exit 1
+fi
+
+# The `stateful` scenario needs the TC egress datapath (pass rules + conntrack
+# tracing are egress-side); reject it for an ingress run rather than silently
+# measuring nothing.
+if [ "${DIR}" = in ] && [ "${#SCENARIOS[@]}" -gt 0 ]; then
+    for s in "${SCENARIOS[@]}"; do
+        if [ "${s}" = stateful ]; then
+            echo "bench: scenario 'stateful' requires --tc / --dir out (egress datapath)" >&2
+            exit 1
+        fi
+    done
 fi
 
 if pgrep -f "/bin/firewall " >/dev/null 2>&1; then
@@ -108,6 +133,7 @@ mkdir -p "${RUN_DIR}"
 {
     echo "run: ${RUN_TS}"
     date -u '+started_utc: %Y-%m-%d %H:%M:%S'
+    echo "direction: ${DIR}"
     echo "kernel:   $(uname -srm 2>/dev/null || true)"
     echo "uname_r:  $(uname -r 2>/dev/null || true)"
     echo "bpf_jit:  $(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || echo n/a)"
@@ -129,7 +155,11 @@ reset_results_owner() {
 
 cleanup() {
     [ -n "${IPERF_PID}" ] && kill "${IPERF_PID}" 2>/dev/null || true
-    clear_xdp_rules 2>/dev/null || true
+    if [ "${DIR}" = out ]; then
+        clear_xdp_egress_rules 2>/dev/null || true
+    else
+        clear_xdp_rules 2>/dev/null || true
+    fi
     [ -n "${FW_PID:-}" ] && kill "${FW_PID}" 2>/dev/null || true
     host_firewall_close
     nft_rules_down
@@ -149,7 +179,11 @@ record_attach_mode() {
 }
 
 fw_start() {  # start daemon attached to ${VETH0}, default allow
-    "${FIREWALLD}" -i "${VETH0}" > /dev/null 2>&1 &
+    if [ "${DIR}" = out ]; then
+        "${FIREWALLD}" -i "${VETH0}" -dir out > /dev/null 2>&1 &
+    else
+        "${FIREWALLD}" -i "${VETH0}" > /dev/null 2>&1 &
+    fi
     FW_PID=$!
     local i
     for i in $(seq 1 50); do
@@ -157,23 +191,69 @@ fw_start() {  # start daemon attached to ${VETH0}, default allow
         sleep 0.1
     done
     sleep 0.2
-    "${CTL}" default allow
+    if [ "${DIR}" = out ]; then
+        "${CTL}" default allow --dir out
+    else
+        "${CTL}" default allow
+    fi
     record_attach_mode
 }
 
-fw_stop() { clear_xdp_rules; kill "${FW_PID}" 2>/dev/null || true; wait "${FW_PID}" 2>/dev/null || true; FW_PID=""; }
+fw_stop() {
+    if [ "${DIR}" = out ]; then
+        clear_xdp_egress_rules
+    else
+        clear_xdp_rules
+    fi
+    kill "${FW_PID}" 2>/dev/null || true
+    wait "${FW_PID}" 2>/dev/null || true
+    FW_PID=""
+}
 
 backend_up() {   # $1 = xdp|nft
     case "$1" in
     xdp) fw_start ;;
-    nft) nft_rules_up ;;
+    nft)
+        if [ "${DIR}" = out ]; then
+            nft_egress_rules_up
+        else
+            nft_rules_up
+        fi
+        ;;
     esac
 }
 
 backend_apply() { # $1 = backend, $2 = scenario
     case "$1" in
-    xdp) clear_xdp_rules && apply_xdp_rules "$2" ;;
-    nft) nft_rules_flush && apply_nft_rules "$2" ;;
+    xdp)
+        if [ "${DIR}" = out ]; then
+            clear_xdp_egress_rules
+            case "$2" in
+            stateful) apply_xdp_stateful ;;
+            *)
+                # Re-assert the allow default: a preceding stateful scenario
+                # left egress default-deny, and the block rules alone must not
+                # inherit it.
+                "${CTL}" default allow --dir out || return 1
+                apply_xdp_egress_rules "$2"
+                ;;
+            esac
+        else
+            clear_xdp_rules
+            apply_xdp_rules "$2"
+        fi
+        ;;
+    nft)
+        nft_rules_flush
+        if [ "${DIR}" = out ]; then
+            case "$2" in
+            stateful) apply_nft_stateful ;;
+            *) apply_nft_egress_rules "$2" ;;
+            esac
+        else
+            apply_nft_rules "$2"
+        fi
+        ;;
     esac
 }
 
@@ -196,18 +276,28 @@ update_timing() { # $1 = backend -> prints rule_add_ms rule_del_ms
     case "$1" in
     xdp)
         local add del
-        time_ms add "${CTL}" block "${FORWARD_CIDR}"
-        time_ms del "${CTL}" unblock "${FORWARD_CIDR}"
+        if [ "${DIR}" = out ]; then
+            time_ms add "${CTL}" block "${FORWARD_CIDR}" --dir out
+            time_ms del "${CTL}" unblock "${FORWARD_CIDR}" --dir out
+        else
+            time_ms add "${CTL}" block "${FORWARD_CIDR}"
+            time_ms del "${CTL}" unblock "${FORWARD_CIDR}"
+        fi
         echo "${add} ${del}"
         ;;
     nft)
-        local add del handle
-        time_ms add nft add rule inet "${NFT_TABLE}" input ip saddr "${FORWARD_CIDR}" drop \
+        local add del handle chain
+        if [ "${DIR}" = out ]; then
+            chain="output"
+        else
+            chain="input"
+        fi
+        time_ms add nft add rule inet "${NFT_TABLE}" "${chain}" ip saddr "${FORWARD_CIDR}" drop \
             || add=0
-        handle="$(nft -a list chain inet "${NFT_TABLE}" input 2>/dev/null \
+        handle="$(nft -a list chain inet "${NFT_TABLE}" "${chain}" 2>/dev/null \
                     | grep "${FORWARD_CIDR}" | tail -1 | awk '{print $NF}')"
         if [ -n "${handle}" ]; then
-            time_ms del nft delete rule inet "${NFT_TABLE}" input handle "${handle}" \
+            time_ms del nft delete rule inet "${NFT_TABLE}" "${chain}" handle "${handle}" \
                 || del=0
         else
             del=0
@@ -225,21 +315,36 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     mkdir -p "${rundir}"
     log "measuring backend=${backend} scenario=${scenario} iteration=${iter} duration=${DURATION}s"
 
-    # Reap any stale iperf3 server (e.g. from an interrupted run) that would
-    # otherwise keep holding :5201 and silently starve the TCP pass of a
-    # listener -- the observable symptom is an all-zero tcp_bps column.
+    # Start the iperf3 server on the side that does NOT send the workload. For
+    # the ingress pass the client is inside the netns (data ns -> host across
+    # the XDP hook / INPUT chain), so the server binds ${HOST_IP} on the host.
+    # For the egress pass the client is on the host (data host -> ns across the
+    # TC egress hook / OUTPUT chain), so the server listens inside the netns on
+    # ${NS_IP}.
     pkill -f 'iperf3 -s' 2>/dev/null || true
     sleep 0.3
-    iperf3 -s -B "${HOST_IP}" -p 5201 > "${rundir}/iperf-server.err" 2>&1 &
+    if [ "${DIR}" = out ]; then
+        ns_exec iperf3 -s -B "${NS_IP}" -p 5201 > "${rundir}/iperf-server.err" 2>&1 &
+    else
+        iperf3 -s -B "${HOST_IP}" -p 5201 > "${rundir}/iperf-server.err" 2>&1 &
+    fi
     IPERF_PID=$!
 
     # Wait until the server is actually LISTENing (port 5201 == hex 0x1451 in
-    # /proc/net/tcp) and surface a bind failure instead of zeroed TCP rows.
+    # /proc/net/tcp, read on the host for the ingress server or inside the
+    # netns for the egress one) and surface a bind failure instead of zeroed
+    # TCP rows.
+    local probe_cmd
+    if [ "${DIR}" = out ]; then
+        probe_cmd=(ns_exec awk 'NR>1{print $2}' /proc/net/tcp)
+    else
+        probe_cmd=(awk 'NR>1{print $2}' /proc/net/tcp)
+    fi
     for _ in $(seq 1 20); do
-        awk 'NR>1{print $2}' /proc/net/tcp 2>/dev/null | grep -q ':1451' && break
+        "${probe_cmd[@]}" 2>/dev/null | grep -q ':1451' && break
         sleep 0.1
     done
-    if ! awk 'NR>1{print $2}' /proc/net/tcp 2>/dev/null | grep -q ':1451'; then
+    if ! "${probe_cmd[@]}" 2>/dev/null | grep -q ':1451'; then
         log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: iperf3 server not listening on :5201 (see ${rundir}/iperf-server.err)"
     fi
 
@@ -247,7 +352,11 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     sample_cpu cpu0
 
     if [ "${backend}" = xdp ]; then
-        snap_xdp_stats "${rundir}/stats-before.json"
+        if [ "${DIR}" = out ]; then
+            snap_egress_stats "${rundir}/stats-before.json"
+        else
+            snap_xdp_stats "${rundir}/stats-before.json"
+        fi
     else
         snap_nft_counters "${rundir}/nft-before.json"
     fi
@@ -257,35 +366,68 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
         # iperf3 cannot drive `drop`: its TCP control channel is dropped with
         # the workload, so no DATA would ever flow. Use a raw-UDP flood for the
         # offered load; the hook-side DROP rate below is the ground truth.
-        if run_flood "${DURATION}" > "${rundir}/flood.kv" 2>>"${rundir}/flood.err"; then
-            flood_kv="${rundir}/flood.kv"
+        if [ "${DIR}" = out ]; then
+            if run_flood_egress "${DURATION}" > "${rundir}/flood.kv" 2>>"${rundir}/flood.err"; then
+                flood_kv="${rundir}/flood.kv"
+            fi
+        else
+            if run_flood "${DURATION}" > "${rundir}/flood.kv" 2>>"${rundir}/flood.err"; then
+                flood_kv="${rundir}/flood.kv"
+            fi
         fi
     else
-        if run_iperf udp "${DURATION}" "${rundir}/iperf-udp.json" \
-            > "${rundir}/udp.kv" 2>>"${rundir}/udp.err"; then
-            udp_kv="${rundir}/udp.kv"
+        if [ "${DIR}" = out ]; then
+            if run_iperf_egress udp "${DURATION}" "${rundir}/iperf-udp.json" \
+                > "${rundir}/udp.kv" 2>>"${rundir}/udp.err"; then
+                udp_kv="${rundir}/udp.kv"
+            else
+                udp_kv="/dev/null"
+            fi
+            if [ "${UDP_CTL_BW:-1500M}" != 0 ] \
+                && run_iperf_egress udp "${DURATION}" "${rundir}/iperf-udp-ctl.json" "${UDP_CTL_BW:-1500M}" \
+                > "${rundir}/udp2.kv" 2>>"${rundir}/udp2.err"; then
+                udp2_kv="${rundir}/udp2.kv"
+            else
+                udp2_kv="/dev/null"
+            fi
+            if run_iperf_egress tcp "${DURATION}" "${rundir}/iperf-tcp.json" \
+                > "${rundir}/tcp.kv" 2>>"${rundir}/tcp.err"; then
+                tcp_kv="${rundir}/tcp.kv"
+            else
+                tcp_kv="/dev/null"
+            fi
+            run_ping_egress 20 "${rundir}/ping.txt" > "${rundir}/rtt.kv" 2>/dev/null || true
         else
-            udp_kv="/dev/null"
+            if run_iperf udp "${DURATION}" "${rundir}/iperf-udp.json" \
+                > "${rundir}/udp.kv" 2>>"${rundir}/udp.err"; then
+                udp_kv="${rundir}/udp.kv"
+            else
+                udp_kv="/dev/null"
+            fi
+            if [ "${UDP_CTL_BW:-1500M}" != 0 ] \
+                && run_iperf udp "${DURATION}" "${rundir}/iperf-udp-ctl.json" "${UDP_CTL_BW:-1500M}" \
+                > "${rundir}/udp2.kv" 2>>"${rundir}/udp2.err"; then
+                udp2_kv="${rundir}/udp2.kv"
+            else
+                udp2_kv="/dev/null"
+            fi
+            if run_iperf tcp "${DURATION}" "${rundir}/iperf-tcp.json" \
+                > "${rundir}/tcp.kv" 2>>"${rundir}/tcp.err"; then
+                tcp_kv="${rundir}/tcp.kv"
+            else
+                tcp_kv="/dev/null"
+            fi
+            run_ping 20 "${rundir}/ping.txt" > "${rundir}/rtt.kv" 2>/dev/null || true
         fi
-        if [ "${UDP_CTL_BW:-1500M}" != 0 ] \
-            && run_iperf udp "${DURATION}" "${rundir}/iperf-udp-ctl.json" "${UDP_CTL_BW:-1500M}" \
-            > "${rundir}/udp2.kv" 2>>"${rundir}/udp2.err"; then
-            udp2_kv="${rundir}/udp2.kv"
-        else
-            udp2_kv="/dev/null"
-        fi
-        if run_iperf tcp "${DURATION}" "${rundir}/iperf-tcp.json" \
-            > "${rundir}/tcp.kv" 2>>"${rundir}/tcp.err"; then
-            tcp_kv="${rundir}/tcp.kv"
-        else
-            tcp_kv="/dev/null"
-        fi
-        run_ping 20 "${rundir}/ping.txt" > "${rundir}/rtt.kv" 2>/dev/null || true
     fi
     sample_cpu cpu1
 
     if [ "${backend}" = xdp ]; then
-        snap_xdp_stats "${rundir}/stats-after.json"
+        if [ "${DIR}" = out ]; then
+            snap_egress_stats "${rundir}/stats-after.json"
+        else
+            snap_xdp_stats "${rundir}/stats-after.json"
+        fi
     else
         snap_nft_counters "${rundir}/nft-after.json"
     fi
@@ -305,6 +447,8 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
     read -r addr del <<< "$(update_timing "${backend}")"
 
     # Hook-side DROP rate: XDP from fc_stats deltas, nft from rule counters.
+    # The XDP delta helpers read drop_packets/pass_packets, keys shared by the
+    # ingress and egress stats snapshots, so they work for both directions.
     if [ "${backend}" = xdp ]; then
         drop_pps="$(xdp_drop_delta "${rundir}")"
     else
@@ -337,12 +481,12 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
 
     [ "${backend}" = xdp ] && log_xdp_delta "${rundir}"
 
-    printf '%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%d\n' \
+    printf '%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%d\t%s\n' \
         "${RUN_TS}" "${backend}" "${scenario}" "${iter}" \
         "${bps}" "${pps}" "${loss}" "${jitter}" "${tcp_bps}" "${rtt}" \
         "$(cpu_delta "${cpu0}" "${cpu1}")" "${mem}" "${addr}" "${del}" \
         "${drop_pps}" "${udp2_bps}" "${udp2_pps}" "${udp2_loss}" "${udp2_jitter}" \
-        "${flood_sent}" \
+        "${flood_sent}" "${DIR}" \
         >> "${SUMMARY}"
     log "  udp_bps=${bps} pps=${pps} loss=${loss} tcp_bps=${tcp_bps} rtt=${rtt} mem=${mem} add=${addr}ms del=${del}ms udp2_bps=${udp2_bps} drop_pps=${drop_pps} flood_sent=${flood_sent}"
 }
@@ -352,7 +496,7 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
 sandbox_up
 host_firewall_open
 
-printf 'run\tbackend\tscenario\titer\tudp_bps\tudp_pps\tudp_lost\tudp_jitter_ms\ttcp_bps\trtt_avg_ms\tcpu_jif\trss_kb\tadd_ms\tdel_ms\tdrop_pps\tudp2_bps\tudp2_pps\tudp2_lost\tudp2_jitter_ms\tflood_sent\n' \
+printf 'run\tbackend\tscenario\titer\tudp_bps\tudp_pps\tudp_lost\tudp_jitter_ms\ttcp_bps\trtt_avg_ms\tcpu_jif\trss_kb\tadd_ms\tdel_ms\tdrop_pps\tudp2_bps\tudp2_pps\tudp2_lost\tudp2_jitter_ms\tflood_sent\tdir\n' \
     > "${SUMMARY}"
 
 for backend in "${BACKENDS[@]}"; do

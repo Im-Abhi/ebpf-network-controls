@@ -251,6 +251,130 @@ print("flood_sent=%d" % sent)
 PY
 }
 
+# ---------------------------------------------------------------------------
+# Egress helpers (DIR=out): host -> ns traffic across the TC egress hook
+# ---------------------------------------------------------------------------
+# The TC egress hook sits on the host-side veth TX path, so egress measurements
+# must send bulk DATA *from the host into the sandbox* (the reverse of the
+# ingress pass). server/client roles therefore flip: iperf3 listens inside the
+# netns bound to ${NS_IP}; the client runs on the host. The nftable mirror is
+# an OUTPUT chain, and the firewall daemon runs with `-dir out` so its rules
+# and stats target the TC egress datapath.
+
+# run_iperf_egress <udp|tcp> <duration> <json_out> [bw] : iperf3 client on the
+# HOST targeting ${NS_IP} (server lives in benchns, started by measure()).
+# Bulk DATA crosses the host-side TC egress hook / nft OUTPUT chain; the
+# extraction below mirrors run_iperf so the kv() reader never changes.
+run_iperf_egress() {  # run_iperf_egress <udp|tcp> <dur> <json_out> [bw]
+    local mode="$1" dur="$2" out="$3" bw="${4:-}" extra=()
+    if [ "${mode}" = udp ]; then
+        extra=(-u -b "${bw:-${UDP_BW:-0}}")
+    fi
+    if ! iperf3 -c "${NS_IP}" -p 5201 -t "${dur}" "${extra[@]}" \
+         -J > "${out}" 2>/dev/null; then
+        echo "bench: iperf3 ${mode} egress run failed" >&2
+        return 1
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        if [ "${mode}" = udp ]; then
+            jq -r '"udp_bits_per_sec=\(.end.sum.bits_per_second)\nudp_bytes=\(.end.sum.bytes)\nudp_lost_packets=\(.end.sum.lost_packets)\nudp_sent_packets=\(.end.sum.packets)\nudp_jitter_ms=\(.end.sum.jitter_ms)"' "${out}"
+        else
+            jq -r '"tcp_bits_per_sec=\(.end.sum_received.bits_per_second)\ntcp_bytes_retrans=\(.end.sum_received.retransmits)"' "${out}"
+        fi
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "${out}" "${mode}" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception:
+    print("parse_failed=1")
+    sys.exit(0)
+
+if sys.argv[2] == "udp":
+    s = d["end"]["sum"]
+    print("udp_bits_per_sec=%d" % s["bits_per_second"])
+    print("udp_bytes=%d" % s["bytes"])
+    print("udp_lost_packets=%d" % s["lost_packets"])
+    print("udp_sent_packets=%d" % s["packets"])
+    print("udp_jitter_ms=%s" % s["jitter_ms"])
+else:
+    s = d["end"]["sum_received"]
+    print("tcp_bits_per_sec=%d" % s["bits_per_second"], flush=True)
+    print("tcp_bytes_retrans=%d" % s.get("retransmits", 0), flush=True)
+PY
+    else
+        echo "parser_missing=1 (install jq or python3)"
+    fi
+}
+
+# run_ping_egress <rounds> <out> : RTT stats from the HOST to the netns (the
+# egress direction), measured against the TC hook exactly like run_ping does
+# for the ingress direction.
+run_ping_egress() {
+    local rounds="$1" out="$2"
+    ping -c "${rounds}" -i 0.05 -q "${NS_IP}" > "${out}" 2>&1 || true
+    awk '/rtt/{split($4, a, "/"); print "rtt_min_ms=" a[1]; print "rtt_avg_ms=" a[2]; print "rtt_max_ms=" a[3]}' \
+        "${out}" 2>/dev/null || true
+}
+
+# run_flood_egress <duration> : raw-UDP offered load from the HOST into the
+# netns (egress direction, mirror of run_flood). Flood 1400-byte datagrams at
+# NS_IP:5201 for <duration> seconds and print `flood_sent=N`.
+run_flood_egress() {
+    local dur="$1"
+    python3 - "${dur}" "${NS_IP}" <<'PY' 2>/dev/null || { echo "flood_failed=1"; return 1; }
+import socket
+import sys
+import time
+
+dur = float(sys.argv[1])
+host = sys.argv[2]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setblocking(False)
+payload = b"\x00" * 1400
+start = time.monotonic()
+sent = 0
+while time.monotonic() - start < dur:
+    try:
+        s.sendto(payload, (host, 5201))
+        sent += 1
+    except BlockingIOError:
+        pass
+print("flood_sent=%d" % sent)
+PY
+}
+
+# snap_egress_stats <json-file> : dumps the firewall's egress packet/byte
+# counters (egress_stats in the one-shot control socket JSON). Best-effort.
+snap_egress_stats() {
+    python3 - "$1" <<'PY'
+import json
+import socket
+import sys
+
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    s.connect("/var/run/ebpf-firewall.sock")
+    s.sendall(b'{"command":"stats"}\n')
+    buf = b""
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    d = json.loads(buf)
+    with open(sys.argv[1], "w") as f:
+        json.dump(d.get("egress_stats", {}), f)
+except Exception:
+    pass
+PY
+}
+
 # snap_xdp_stats <json-file> : dumps the firewall's raw packet/byte counters
 # (via the one-shot JSON control socket) so the orchestrator can log how much
 # traffic actually crossed the XDP hook. Best-effort; writes nothing on failure.
@@ -301,7 +425,8 @@ if not b or not a:
     sys.exit(0)
 def d(k):
     return a.get(k, 0) - b.get(k, 0)
-    print("  fw-crossing: +pass-pkts=%d +pass-bytes=%d +drop-pkts=%d (datapath saw the traffic)" % (d("pass_packets"), d("pass_bytes"), d("drop_packets")))
+
+print("  fw-crossing: +pass-pkts=%d +pass-bytes=%d +drop-pkts=%d (datapath saw the traffic)" % (d("pass_packets"), d("pass_bytes"), d("drop_packets")))
 PY
 }
 
@@ -522,4 +647,70 @@ apply_nft_rules() {
             nft add rule inet "${NFT_TABLE}" input ip daddr "${ip}" drop
         fi
     done <<< "${targets}"
+}
+
+# ---------------------------------------------------------------------------
+# Egress backend rule application (DIR=out)
+# ---------------------------------------------------------------------------
+
+# apply_xdp_egress_rules <scenario> : adds egress drop rules via firewallctl
+# (daemon must be running `-dir out/both`). Mirrors apply_xdp_rules with the
+# direction flag; the egress datapath matches source then destination the same
+# way the ingress one does.
+apply_xdp_egress_rules() {
+    local ip targets
+    targets="$(scenario_targets "$1")" || return 1
+    while read -r ip; do
+        [ -n "${ip}" ] || continue
+        valid_cidr "${ip}" || { echo "bench: invalid CIDR target '${ip}' (scenario '$1')" >&2; return 1; }
+        "${CTL}" block "${ip}" --dir out || return 1
+    done <<< "${targets}"
+}
+
+clear_xdp_egress_rules() { "${CTL}" clear --dir out >/dev/null 2>&1 || true; }
+
+# apply_nft_egress_rules <scenario> : nftables mirror for the egress datapath —
+# an OUTPUT chain, the same rule forms as the INPUT mirror (saddr+daddr, or a
+# single src-side `counter` rule for `drop`).
+nft_egress_rules_up() {
+    nft add table inet "${NFT_TABLE}"
+    nft add chain inet "${NFT_TABLE}" output "{ type filter hook output priority 0; policy accept; }"
+}
+
+apply_nft_egress_rules() {
+    local ip targets counter=""
+    targets="$(scenario_targets "$1")" || return 1
+    # Re-create the OUTPUT chain with an accept policy: a preceding stateful
+    # scenario left it at policy drop, and nft_rules_flush only drops rules,
+    # so the block rules alone must not inherit the deny default.
+    nft delete chain inet "${NFT_TABLE}" output 2>/dev/null || true
+    nft add chain inet "${NFT_TABLE}" output "{ type filter hook output priority 0; policy accept; }"
+    [ "$1" = drop ] && counter=" counter"
+    while read -r ip; do
+        [ -n "${ip}" ] || continue
+        valid_cidr "${ip}" || { echo "bench: invalid CIDR target '${ip}' (scenario '$1')" >&2; return 1; }
+        if [ -n "${counter}" ]; then
+            nft add rule inet "${NFT_TABLE}" output ip saddr "${ip}" counter drop
+        else
+            nft add rule inet "${NFT_TABLE}" output ip saddr "${ip}" drop
+            nft add rule inet "${NFT_TABLE}" output ip daddr "${ip}" drop
+        fi
+    done <<< "${targets}"
+}
+
+# apply_xdp_stateful <scenario> : default-deny egress with a pass rule for the
+# sandbox LAN, so the conntrack-traced flow is the workload itself. The `drop`
+# scenario's block-rule install is skipped (deny covers it) and instead the
+# LAN is allowed so a real flow exercises the pass + conntrack path.
+apply_xdp_stateful() {
+    "${CTL}" default deny --dir out || return 1
+    "${CTL}" block "${HOST_IP}/32" --action pass --dir out || return 1
+    "${CTL}" block "${NS_IP}/32" --action pass --dir out || return 1
+}
+
+apply_nft_stateful() {
+    nft delete chain inet "${NFT_TABLE}" output 2>/dev/null || true
+    nft add chain inet "${NFT_TABLE}" output "{ type filter hook output priority 0; policy drop; }"
+    nft add rule inet "${NFT_TABLE}" output ip saddr "${HOST_IP}" accept
+    nft add rule inet "${NFT_TABLE}" output ip daddr "${NS_IP}" accept
 }
