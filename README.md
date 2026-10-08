@@ -66,7 +66,21 @@ maps descend from the original most-specific-first design; see
 `bpf/firewall.c` (`ip_block_action` / `port_rule_action` / `decide`) for the
 exact decision table.
 
-### Port rules (ingress only)
+### Scope
+
+The datapath is **IPv4-only**: ARP, IPv6, VLAN, unknown EtherTypes and
+truncated/unparseable frames never consult the rule maps and take only the
+configured **default policy** (see `bpf/firewall.c` `parse_packet`).
+**IPv4 fragments are handled the same way** — the L4 header is usable only on
+the first piece, so a port or conntrack decision would be inconsistent across
+the pieces. Any fragment (`MF` bit set or a non-zero offset in `frag_off`; the
+`DF` don't-fragment bit is not an indicator) is treated as not policy-relevant:
+it takes only the default policy, never a rule verdict, and writes no conntrack
+state. Under default-deny this means fragmented flows are dropped wholesale,
+and under default-allow they pass — a deliberate stateless posture, not a
+fragment-reassembly fast path.
+
+### Port rules
 
 XDP is a **receive-side hook**: the program sees packets *entering* the interface
 (inbound, or forwarded) and **cannot filter outbound traffic** the host itself
@@ -90,7 +104,13 @@ to partial matches (`dport` only, `sport` only, then neither) and finally to
 the default policy. `listports` prints the source port when a rule has one,
 e.g. `tcp/22 (sport 50000) -> 1.2.3.4 [drop] prio 0`.
 
-`clear` removes **both** the IP blocklist and all port rules in one call.
+`clear` removes **both** the IP blocklist and all port rules in one call
+(`--dir in|out|both` selects which direction's rule maps to wipe). Because the
+`conntrack` table is **shared by both directions**, every `clear` — even a
+direction-scoped one — also empties it: rule changes can invalidate tracked
+flows, and a stale entry could otherwise keep letting a flow pass after its
+rules are gone. This is a deliberate contract, not a bug (see `CmdClear` in
+`control/server/server.go`).
 Rule maps are anonymous kernel objects tied to the running daemon — they are
 reset when the daemon exits (no persistence across runs).
 
@@ -118,9 +138,9 @@ the `firewallctl` commands (`list`, `listports`, `block`, `unblock`, `default`,
 replies back through the same way the ingress fast-path does. The TCX hook
 requires **kernel >= 6.6**.
 
-Non-IPv4/unparseable frames (ARP, IPv6, etc.) take only the egress default
-policy, exactly as on the ingress path, so an IPv4 egress rule can never drop
-them. Datapath cost under the common both-defaults-`allow` configuration:
+Non-IPv4/unparseable frames (ARP, IPv6, etc.) — and **IPv4 fragments** — take
+only the egress default policy, exactly as on the ingress path, so an IPv4
+egress rule can never drop them. Datapath cost under the common both-defaults-`allow` configuration:
 traffic that matches no rule triggers **no conntrack or policy-map operations**
 (empty maps cannot match and the state gates are skipped), but the hook is not
 free — every packet pays a fixed cost of two array-map reads
@@ -163,7 +183,9 @@ Key properties:
   only on outbound traffic — replies pass (ingress is allow) but do not
   refresh it, so an alive-but-egress-idle flow could be reaped. Under
   default-deny ingress the replies refresh it too.
-- `firewallctl conntrack` lists live flows, and `clear` also clears the table.
+- `firewallctl conntrack` lists live flows, and `clear` also clears the table —
+  direction-scoped or not, the shared table is always wiped (see the `clear`
+  contract above).
 
 ```bash
 sudo ./bin/firewallctl block 1.2.3.4 --protocol tcp --dport 22 --action pass  # allow control connection

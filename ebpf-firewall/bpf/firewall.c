@@ -69,6 +69,12 @@
 #define TCP_ACK 0x10
 #endif
 
+/* IPv4 fragment indications in iphdr.frag_off (network byte order): the MF
+ * (more-fragments) bit plus the 13-bit fragment offset. The separate DF
+ * (don't-fragment) bit 0x4000 is deliberately not part of the mask — a normal
+ * unfragmented packet may set DF. */
+#define IP_FRAG_MASK 0x3FFF
+
 /* TC classifier action codes (linux/pkt_cls.h UAPI macros, not in vmlinux.h).
  * The egress program maps XDP verdicts onto these: DROP -> SHOT, PASS -> OK. */
 #ifndef TC_ACT_OK
@@ -116,6 +122,14 @@ static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
     info.saddr = ip->saddr;
     info.daddr = ip->daddr;
     info.protocol = protocol;
+
+    /* Fragmented IPv4: only the first piece carries a real L4 header, so a
+     * port/state decision here would be inconsistent across the pieces.
+     * Fragments are therefore not policy-relevant — like non-IPv4 frames they
+     * take only the default policy and never write conntrack state. */
+    if (ip->frag_off & bpf_htons(IP_FRAG_MASK)) {
+        return info;
+    }
 
     /* Capture source/destination ports for TCP/UDP so port rules can match. */
     if (protocol == IPPROTO_TCP) {

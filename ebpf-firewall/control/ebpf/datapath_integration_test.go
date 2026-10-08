@@ -146,6 +146,17 @@ func tcpPktFlags(src, dst string, sport, dport uint16, flags byte) []byte {
 	return v4PacketFlags(ip(src), ip(dst), 6, sport, dport, flags)
 }
 
+// ipv4PacketWithFrag builds a TCP packet and overrides the IPv4 frag_off
+// field (bytes 6-7 of the IP header, which sits at frame offset 20 after the
+// 14-byte Ethernet header). fragLow = 0x2000 sets MF (first fragment),
+// anything >= 0x0001 describes a non-first fragment (offset in 8-byte units).
+func ipv4PacketWithFrag(src, dst string, sport, dport uint16, fragLow uint16) []byte {
+	pkt := tcpPkt(src, dst, sport, dport)
+	pkt[20] = byte(fragLow >> 8)
+	pkt[21] = byte(fragLow)
+	return pkt
+}
+
 // ctStates parses the manager's listing into a map of "sport:dport" -> state
 // for unambiguous assertions on the standard 5-tuples used in these tests.
 func ctStates(t *testing.T, fw *Firewall) map[string]string {
@@ -452,6 +463,40 @@ func TestDatapath_Malformed_UsesDefault(t *testing.T) {
 	}
 	mustVerdict(t, fw, ethOnly, testXDPDrop)
 	mustVerdict(t, fw, trunc, testXDPDrop)
+}
+
+func TestDatapath_Fragments_FollowDefaultPolicy(t *testing.T) {
+	fw := loadTestFirewall(t)
+	// Rules that would match the tuple if it were not fragmented.
+	if err := fw.BlockIP("1.2.3.4"); err != nil {
+		t.Fatalf("BlockIP: %v", err)
+	}
+	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22, 0); err != nil {
+		t.Fatalf("BlockPortRule: %v", err)
+	}
+
+	// The pristine tuple is blocked...
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 22), testXDPDrop)
+	// ...but neither the first fragment (MF set, offset 0) nor a non-first
+	// fragment takes the rule verdict: fragments follow only the default
+	// policy (allow here), and write no conntrack state.
+	mustVerdict(t, fw, ipv4PacketWithFrag("192.168.0.1", "1.2.3.4", 12345, 22, 0x2000), testXDPPass)
+	mustVerdict(t, fw, ipv4PacketWithFrag("192.168.0.1", "1.2.3.4", 12345, 22, 0x0001), testXDPPass)
+	if states := ctStates(t, fw); len(states) != 0 {
+		t.Errorf("conntrack = %v, want empty (fragments never create state)", states)
+	}
+
+	// Under default-deny the same fragments are dropped by default (not by the
+	// rules), while the unfragmented block still stands.
+	if err := fw.SetDefaultPolicy("deny"); err != nil {
+		t.Fatalf("SetDefaultPolicy: %v", err)
+	}
+	mustVerdict(t, fw, ipv4PacketWithFrag("192.168.0.1", "1.2.3.4", 12345, 22, 0x2000), testXDPDrop)
+	mustVerdict(t, fw, ipv4PacketWithFrag("192.168.0.1", "1.2.3.4", 12345, 22, 0x0001), testXDPDrop)
+	mustVerdict(t, fw, tcpPkt("192.168.0.1", "1.2.3.4", 12345, 22), testXDPDrop)
+	if states := ctStates(t, fw); len(states) != 0 {
+		t.Errorf("conntrack = %v, want empty (dropped fragments leave no state)", states)
+	}
 }
 
 func TestDatapath_Conntrack_SpoofedAckCreatesNoState(t *testing.T) {

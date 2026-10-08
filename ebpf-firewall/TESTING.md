@@ -71,7 +71,7 @@ datapath** — not just Go map writes. Groups:
 Builds **raw Ethernet/IPv4/TCP/UDP frames** and injects them through
 `BPF_PROG_TEST_RUN` (`prog.Run`), asserting the returned XDP verdict and counter
 deltas. The program is loaded on `lo` but **not attached** — no real traffic,
-fully deterministic. The 24 scenarios:
+fully deterministic. The 25 scenarios:
 
 | Test | Asserts |
 | --- | --- |
@@ -98,6 +98,7 @@ fully deterministic. The 24 scenarios:
 | `TestDatapath_Conntrack_TcpOnlyUnderDefaultDeny` | denied UDP traffic leaves no state (TCP-only) |
 | `TestDatapath_NonIPv4_UsesDefault` | ARP follows the default policy |
 | `TestDatapath_Malformed_UsesDefault` | truncated/unparseable frames follow the default policy |
+| `TestDatapath_Fragments_FollowDefaultPolicy` | fragmented IPv4 (`MF` set or non-zero offset) never hits an IP/port rule and writes no conntrack state: fragments follow only the default policy, in both allow and deny modes |
 | `TestDatapath_CountersTrackDropsAndPasses` | total/drop/pass counters increment |
 
 Run one group without the whole suite:
@@ -232,7 +233,7 @@ Golden run: **38/38 checks**. Coverage:
 | 3d–3g | `--action pass` admits a flow; ESTABLISHED survives rule removal (stateful fast-path) |
 | 3i–3j | raw SYN denied, no conntrack state |
 | 3k–3l | FIN→CLOSED; the teardown tail (ACK on the CLOSED flow) passes without being dropped and without re-arming the entry (stays CLOSED) |
-| 4a–4d | `clear` empties blocklist + port rules + conntrack; then a fresh SYN is denied |
+| 4a–4d | `clear` empties blocklist + port rules + conntrack — including the direction-scoped `clear --dir out`, which also wipes the single **shared** conntrack table; then a fresh SYN is denied |
 | 5a–5e | `-ct-timeout 5s` reaper: flow reaped, daemon logs it, later packet denied |
 | 6a–6i | egress (`-dir both`, TCX): status shows attached; default allow passes; dst-only block semantics (`block <unrelated-ip> --dir out` doesn't affect traffic; `block <dst> --dir out` fails the connection and bumps the egress drop counter); `list`/`clear --dir out` round-trip; egress `default deny` blocks outbound and `default allow` restores it. Requires kernel >= 6.6 |
 
@@ -266,3 +267,11 @@ This is deliberate: under default-deny, **only** explicitly allowlisted traffic
 survive default-deny — e.g. ARP allowed as an unavoidable exception so peers can
 still resolve the host — that requires a special-case in the datapath
 (`bpf/firewall.c`), which is not currently implemented.
+
+**IPv4 fragments behave the same way.** A fragmented IPv4 flow has no usable L4
+header across its pieces (only the first fragment carries one), so deciding on
+ports or conntrack would be inconsistent piece-to-piece. `parse_packet` treats
+any fragment (`MF` set in `frag_off` or a non-zero offset; the `DF` bit is not
+an indicator) as not policy-relevant: it takes only the default policy, never a
+rule verdict, and writes no conntrack state. Under default-deny this makes
+fragmented flows dropped wholesale, exactly like any other unmatchable traffic.
