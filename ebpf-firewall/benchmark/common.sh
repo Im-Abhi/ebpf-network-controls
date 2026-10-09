@@ -103,6 +103,24 @@ sandbox_down() {
 
 ns_exec() { ip netns exec "${NS_NAME}" "$@"; }
 
+# sandbox_static_neighbors : pins permanent L2 neighbour entries on BOTH veth
+# peers so the stateful scenario needs no ARP. The TC egress hook applies the
+# egress default policy to non-IPv4 frames as well, so under default-deny an
+# ARP exchange is dropped and the synthetic veth link can never resolve a
+# neighbour (the nft mirror is unaffected: an inet OUTPUT chain never sees
+# ARP). Pre-populating both arp tables isolates the IPv4 L3 measurement.
+sandbox_static_neighbors() {
+    local v0 v1
+    v0="$(ip -o link show dev "${VETH0}" | sed -n 's/.*[[:space:]]link\/ether \([0-9a-f:]*\).*/\1/p')"
+    v1="$(ip netns exec "${NS_NAME}" ip -o link show dev "${VETH1}" | sed -n 's/.*[[:space:]]link\/ether \([0-9a-f:]*\).*/\1/p')"
+    [ -n "${v0:-}" ] && [ -n "${v1:-}" ] || {
+        echo "bench: could not read veth MACs (v0='${v0}' v1='${v1}'); stateful neighbours NOT pinned" >&2
+        return 1
+    }
+    ip neigh replace "${NS_IP}" lladdr "${v1}" dev "${VETH0}" nud permanent
+    ip netns exec "${NS_NAME}" ip neigh replace "${HOST_IP}" lladdr "${v0}" dev "${VETH1}" nud permanent
+}
+
 # ---------------------------------------------------------------------------
 # CPU / memory sampling (no external tooling required)
 # ---------------------------------------------------------------------------
@@ -229,7 +247,7 @@ run_ping() {
 # on stdout (redirected by the caller).
 run_flood() {
     local dur="$1"
-    ns_exec python3 - "${dur}" "${HOST_IP}" <<'PY' 2>/dev/null || { echo "flood_failed=1"; return 1; }
+    ns_exec python3 - "${dur}" "${HOST_IP}" <<'PY' || { echo "flood_failed=1"; return 1; }
 import socket
 import sys
 import time
@@ -325,7 +343,7 @@ run_ping_egress() {
 # NS_IP:5201 for <duration> seconds and print `flood_sent=N`.
 run_flood_egress() {
     local dur="$1"
-    python3 - "${dur}" "${NS_IP}" <<'PY' 2>/dev/null || { echo "flood_failed=1"; return 1; }
+    python3 - "${dur}" "${NS_IP}" <<'PY' || { echo "flood_failed=1"; return 1; }
 import socket
 import sys
 import time
@@ -703,12 +721,14 @@ apply_nft_egress_rules() {
 # scenario's block-rule install is skipped (deny covers it) and instead the
 # LAN is allowed so a real flow exercises the pass + conntrack path.
 apply_xdp_stateful() {
+    sandbox_static_neighbors || return 1
     "${CTL}" default deny --dir out || return 1
     "${CTL}" block "${HOST_IP}/32" --action pass --dir out || return 1
     "${CTL}" block "${NS_IP}/32" --action pass --dir out || return 1
 }
 
 apply_nft_stateful() {
+    sandbox_static_neighbors || return 1
     nft delete chain inet "${NFT_TABLE}" output 2>/dev/null || true
     nft add chain inet "${NFT_TABLE}" output "{ type filter hook output priority 0; policy drop; }"
     nft add rule inet "${NFT_TABLE}" output ip saddr "${HOST_IP}" accept

@@ -476,7 +476,7 @@ measure() { # $1=backend $2=scenario $3=iteration -> appends one summary row
         log "WARN: backend=${backend} scenario=${scenario} iter=${iter}: udp2_bps=0 (controlled UDP pass failed)"
     fi
     if [ "${scenario}" = drop ] && is_zero "${flood_sent}"; then
-        log "WARN: backend=${backend} scenario=drop iter=${iter}: flood offered 0 packets (sender or datapath problem; see ${rundir}/flood.kv)"
+        log "WARN: backend=${backend} scenario=drop iter=${iter}: flood offered 0 packets (sender or datapath problem; see ${rundir}/flood.kv and ${rundir}/flood.err)"
     fi
 
     [ "${backend}" = xdp ] && log_xdp_delta "${rundir}"

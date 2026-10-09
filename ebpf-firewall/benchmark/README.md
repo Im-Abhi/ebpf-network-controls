@@ -73,6 +73,15 @@ runs `-dir out` (TC egress) with `default deny --dir out` and two
 metrics under a stateful pass path (no `flood_sent`/`drop_pps` — nothing is
 dropped). `stateful` is not part of `--scenario all`; pass it explicitly.
 
+Note on L2 bootstrap: the TC egress datapath applies the egress *default*
+policy to non-IPv4 frames as well, so under `default deny --dir out` an ARP
+exchange on the veth is dropped and neighbour resolution dead-locks the link
+(the nft mirror is unaffected — an `inet` OUTPUT chain never sees ARP). The
+scenario therefore pins **permanent neighbour entries on both veth peers**
+(`ip neigh replace ... nud permanent`) before measuring, so the IPv4 flow needs
+no ARP; this surfaces a real datapath limitation (there is currently no ARP /
+non-IPv4 exception knob for egress default-deny).
+
 Fairness: the C datapath matches a network on **source, then destination**, so
 the nftables backend installs both `ip saddr <net> drop` and `ip daddr <net> drop`
 per network — the same number of effective lookups. The one exception is
