@@ -485,8 +485,62 @@ cilium/ebpf versions, before quoting either).
 
 This capture also serves as the **pre-TC `firewall_prog` codegen-identity
 reference**: the TC egress milestone must keep `firewall_prog` codegen
-unchanged, and the same harness (`-tc` implemented without altering XDP cells)
-was re-run to confirm the XDP medians above reproduce within noise.
+unchanged, and the same harness (`-tc` implemented without altering XDP cells,
+run `20261008-213012`) was re-run to confirm the XDP medians above reproduce
+within noise.
+
+## Egress-mode results — `20261008-224735` (matrix) + `20261009-122318` (stateful)
+
+Full egress matrix with `--dir out --backend all` (n=5 per cell, medians) plus
+the `stateful` scenario (n=3), on the same host as the other captures. TCX
+requires kernel ≥ 6.6 — each run's `meta.txt` records the kernel, XDP attach
+mode and toolchain; quote them alongside this section. Rows carry the trailing
+`dir` column and `meta.txt` records `direction: out`. Raw per-iteration data:
+`results/20261008-224735/` and `results/20261009-122318/` (gitignored).
+
+### Egress matrix (medians, n=5)
+
+UDP/TCP in Mbit/s; `drop` rows carry no workload throughput by design (the
+workload is blocked) — the `drop_pps` column is the signal.
+
+| scenario | XDP UDP | nft UDP | XDP TCP | nft TCP | xdp drop_pps | nft drop_pps |
+| --- | --- | --- | --- | --- | --- | --- |
+| `none` | 4,913 | 4,777 | 67,448 | 66,884 | 0 | 0 |
+| `single` | 4,813 | 4,759 | 65,780 | 65,526 | 0 | 0 |
+| `forward` | 4,821 | 4,682 | 66,316 | 64,974 | 0 | 0 |
+| `many` | 4,821 | **462** | 65,655 | **12,290** | 0 | 0 |
+| `drop` | 0 | 0 | 0 | 0 | 610,644 (offered 6,106,447) | void (EPERM) |
+
+Readings:
+
+- **Egress-mode backend parity.** Equal rule sets give equal egress datapaths:
+  UDP ~4.7-4.9 Gbit/s and TCP ~65-67 Gbit/s on both backends for
+  `none/single/forward`; rule updates stay XDP 2.0/2.0 ms (flat even at 1,000
+  rules) vs nft 3 ms add / 9-11 ms del.
+- **XDP egress unlocks a ~7× TCP gain over XDP ingress on this host**
+  (67.4 vs 8.9 Gbit/s at `none`), while nft is unchanged (66.9 vs 66.3): the
+  bulk-DATA hop in egress mode rides the TCX classifier, bypassing the
+  generic-XDP-on-veth SKB path that choked ingress TCP. The return/ACK hop
+  still traverses generic XDP but at a packet rate too small to matter.
+- **`many` discriminates exactly as it does in ingress.** XDP holds line rate
+  at 1,000 rules (UDP 4,821 Mbit/s, TCP 65,655); nft collapses ~91% on UDP
+  (462) and ~81% on TCP (12,290), with per-packet CPU 4,685 vs 961 jif/Mpkts.
+- **`drop` counter parity holds for XDP egress**: offered 6,106,447 →
+  dropped 610,644 pps in 10 s, ratio ≈ 1.000. The nft egress `drop` cell is
+  void by netfilter semantics (an OUTPUT-chain drop refuses the local sender —
+  `sendto` fails with `EPERM`, so no offered load can exist); documented in
+  the [Egress mode](#egress-mode-tc) section.
+
+### Stateful parity (medians, n=3) — `20261009-122318`
+
+With egress default-deny + the sandbox LAN whitelisted (permanent neighbours
+pinned, as documented for the scenario), the conntrack fast path costs nothing
+against the nft OUTPUT-deny mirror:
+
+| backend | UDP Mbit/s | TCP Mbit/s |
+| --- | --- | --- |
+| XDP (default deny + `--action pass` + conntrack) | 4,927 | 66,519 |
+| nft (OUTPUT chain `policy drop` + 2 accepts) | 4,834 | 66,811 |
 
 ## Baselines and superseded runs
 
