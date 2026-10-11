@@ -26,6 +26,9 @@ bin/
 scratch/
 build/
 
+# Local demo script / notes
+/DEMO.md
+
 # IDE and OS
 .DS_Store
 .idea/
