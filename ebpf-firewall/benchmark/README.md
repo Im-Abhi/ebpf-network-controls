@@ -219,6 +219,17 @@ sudo ./benchmark/run-bench.sh --tc --scenario stateful --iterations 3  # statefu
 sudo ./benchmark/run-bench.sh --dir out --backend xdp --scenario drop  # egress drop, XDP backend only
 ```
 
+The XDP egress `drop` cell is drivable: a TC egress verdict drops the skb
+after the socket has queued it, so the flood's `sendto` succeeds and hook-side
+drops are counted (`flood_sent` ≈ `drop_pps`). The nft egress `drop` cell is
+**void by design**: an nftables OUTPUT-chain drop refuses the locally-generated
+packet inside the stack — the sender's `sendto` fails with `EPERM`
+(netfilter semantics), so no offered load can exist and there is nothing to
+count (`flood_sent=0`, `flood.err` = `PermissionError`). The harness logs a
+`note:` row for that cell instead of a misleading WARN; the ingress `drop`
+scenario is unaffected, because the flood sender lives in the netns, remote
+from the host's INPUT drop.
+
 The `stateful` scenario (see [Scenarios](#scenarios)) only exists in egress
 mode: it asserts default-deny and whitelists the sandbox LAN, so the workload
 runs through the firewall's conntrack fast path (or the nft OUTPUT chain's
