@@ -99,7 +99,8 @@ enum counter_index {
     COUNTER_EGRESS_TOTAL = 3,
     COUNTER_EGRESS_DROP  = 4,
     COUNTER_EGRESS_PASS  = 5,
-    COUNTER_MAX          = 6,
+    COUNTER_EGRESS_DOMAIN_DROP = 6,   /* egress: TCP stream dropped on a blocked domain */
+    COUNTER_MAX          = 7,
 };
 
 struct counter_value {
@@ -111,16 +112,17 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, __u32);
     __type(value, struct counter_value);
-    __uint(max_entries, 6);
+    __uint(max_entries, 7);
 } counters SEC(".maps");
 
 /* ── Rule-presence flags ─────────────────────────────────────────────── */
 /* Single-entry array the daemon uses to tell the datapath whether each
- * policy map currently holds at least one rule. Entry 0 packs four bits:
+ * policy map currently holds at least one rule. Entry 0 packs five bits:
  *   bit 0 (RULE_IP_PRESENT)          -> blocked_ips has >= 1 entry
  *   bit 1 (RULE_PORT_PRESENT)        -> port_policy has >= 1 entry
  *   bit 2 (RULE_EGRESS_IP_PRESENT)   -> egress_blocked_ips has >= 1 entry
  *   bit 3 (RULE_EGRESS_PORT_PRESENT) -> egress_port_policy has >= 1 entry
+ *   bit 4 (RULE_DOMAIN_PRESENT)      -> domain_blocklist has >= 1 entry
  * When a bit is clear the datapath skips the (LPM/hash) lookups for that
  * map entirely, since an empty map cannot match. This preserves the exact
  * same verdicts: a lookup against an empty map can only miss, and the
@@ -133,11 +135,12 @@ struct {
  *
  * Each datapath only tests the bits for maps it consumes: the XDP program
  * reads flags but only acts on bits 0-1, the TC egress program only on
- * bits 2-3, so both stay independent. */
+ * bits 2-4, so both stay independent. */
 #define RULE_IP_PRESENT          (1U << 0)
 #define RULE_PORT_PRESENT        (1U << 1)
 #define RULE_EGRESS_IP_PRESENT   (1U << 2)
 #define RULE_EGRESS_PORT_PRESENT (1U << 3)
+#define RULE_DOMAIN_PRESENT      (1U << 4)
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -191,6 +194,30 @@ struct {
     __type(value, struct rule_value);
     __uint(max_entries, 65535);
 } egress_port_policy SEC(".maps");
+
+/* ── Domain blocklist (URL filtering) ───────────────────────────────── */
+/* Hostname rules consulted ONLY by the TC egress datapath: when the host
+ * sends a TLS ClientHello to port 443 (SNI) or an HTTP request to port 80
+ * (Host header), the datapath extracts the announced name into a
+ * domain_key and probes this map. The key is the zero-padded, lowercase
+ * hostname; names longer than 63 chars are truncated identically by the
+ * userspace loader and the datapath. The datapath probes the full name and
+ * then its parent suffixes (sub.example.com -> example.com), so blocking
+ * example.com also matches its subdomains. The value reuses rule_value for
+ * layout consistency; entries loaded from the blocklist file always carry
+ * ACTION_DROP, and the datapath treats a hit as an unconditional DROP
+ * before the rule/default decision (see firewall_tc_egress in
+ * bpf/firewall.c). */
+struct domain_key {
+    char name[64];   /* lowercase hostname, NUL/zero padded */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct domain_key);
+    __type(value, struct rule_value);
+    __uint(max_entries, 65536);
+} domain_blocklist SEC(".maps");
 
 /* ── Conntrack map ──────────────────────────────────────────────────── */
 /* TCP-only state table consulted only when the default policy is DENY, so
