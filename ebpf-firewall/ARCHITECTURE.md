@@ -57,6 +57,36 @@ daemon. The datapath reads them per packet; the daemon writes to them on command
 
 ---
 
+## Where things live (code map)
+
+A concept-to-file index for navigating the codebase. The kernel side is two
+files; everything policy-related on the Go side funnels through one facade.
+
+| Concept | File | Role |
+|---|---|---|
+| Datapath (ingress + egress) | `bpf/firewall.c` | Per-packet parse → lookup → decide, both hooks (`SEC("xdp")`, `SEC("classifier")`) |
+| Map definitions | `bpf/maps.h` | Every BPF map, its key/value layout, and the presence-bit contract |
+| Packet parsing helpers | `bpf/helpers.h` | Ethernet/IP/TCP/UDP header stepping |
+| Generated C↔Go bridge | `control/ebpf/firewall_bpf.go` | bpf2go output: embedded ELF + typed maps (regenerate via `make generate`) |
+| Rule tables | `control/ebpf/tables.go` | `cidrTable` + `portTable` — the only places that encode keys and maintain presence bits; instantiated once per direction |
+| Facade | `control/ebpf/facade.go` | `Firewall`: the single handle wiring four table instances, conntrack, counters, config, and both program lifecycles |
+| Conntrack | `control/ebpf/conntrack.go` | Flow table listing/clearing and the idle-flow reaper |
+| Counters / default policy | `control/ebpf/counters.go`, `config.go` | Reading the counter map; setting the per-direction fallback policy |
+| Program lifecycle | `control/ebpf/xdp.go`, `tc.go` | Load/attach/detach of XDP (driver→generic fallback) and TCX egress |
+| Control server | `control/server/server.go` | Unix-socket JSON API; one `handle*` method per command |
+| Wire protocol | `control/server/protocol.go` | Request/Response JSON shapes |
+| HTTP observability | `control/api/api.go` | Read-only `GET /health /status /stats /rules /conntrack` |
+| CLI client | `cmd/firewallctl/main.go` | Flag-anywhere parsing (`cliOptions`), request building, human-readable output |
+| Daemon entry point | `cmd/firewall/main.go` | Flags, attach, seeding, reaper, socket + HTTP startup, shutdown order |
+| IP/CIDR parsing | `control/rules/parser.go` | Shared IPv4/CIDR validation |
+
+The layering rule to keep in mind: `cmd/*` and `control/server`/`control/api`
+talk only to the `Firewall` facade; the facade talks only to tables and
+managers; tables (`tables.go`) are the only code that knows map key encodings;
+`firewall_bpf.go` is generated and never hand-edited.
+
+---
+
 ## How a packet is handled
 
 The eBPF program is attached to the chosen interface and fires on every incoming
