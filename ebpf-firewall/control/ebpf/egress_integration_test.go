@@ -99,8 +99,8 @@ func TestEgressDatapath_CIDR_DropsByDestination(t *testing.T) {
 
 func TestEgressDatapath_PortRule_DropsOnlyMatching(t *testing.T) {
 	fw := loadTestFirewall(t)
-	if err := fw.BlockEgressPortRule("1.2.3.4", "tcp", 443, 0); err != nil {
-		t.Fatalf("BlockEgressPortRule: %v", err)
+	if err := fw.BlockEgressPortRuleWithActionPriority("1.2.3.4", "tcp", 443, 0, "drop", 0); err != nil {
+		t.Fatalf("BlockEgressPortRuleWithActionPriority: %v", err)
 	}
 
 	// Outbound to the blocked dst:443: drop.
@@ -213,61 +213,65 @@ func TestEgressDatapath_Conntrack_ReverseEntryPassesInboundReplies(t *testing.T)
 	mustVerdict(t, fw, tcpPktFlags("1.2.3.4", "10.0.0.1", 22, 60000, tcpFlagACK), testXDPDrop)
 }
 
-// TestEgressPolicyManager_ClearRemovesAll guards the Clear() contract for both
-// egress maps. It inserts at least three rules per map so a delete-
+// TestEgressTables_ClearRemovesAll guards the Clear() contract for both
+// egress table shapes. It inserts at least three rules per table so a delete-
 // during-iteration hazard (which can silently skip entries on a real kernel)
 // has enough state to trip on, and asserts both lists are empty afterwards.
-func TestEgressPolicyManager_ClearRemovesAll(t *testing.T) {
-	em := NewEgressPolicyManager(newTestLpmMap(t), newTestPortPolicyMap(t))
+func TestEgressTables_ClearRemovesAll(t *testing.T) {
+	ips := newCidrTable(newTestLpmMap(t), nil, 0)
+	ports := newPortTable(newTestPortPolicyMap(t), nil, 0)
 
 	for _, cidr := range []string{"1.2.3.4", "10.0.0.0/8", "192.168.0.0/16"} {
-		if err := em.BlockIP(cidr, ActionDrop, 0); err != nil {
-			t.Fatalf("BlockIP(%s): %v", cidr, err)
+		if err := ips.Add(cidr, ActionDrop, 0); err != nil {
+			t.Fatalf("Add(%s): %v", cidr, err)
 		}
 	}
 
-	if err := em.BlockPort("8.8.8.8", "tcp", 443, 0, ActionDrop, 0); err != nil {
-		t.Fatalf("BlockPort: %v", err)
+	if err := ports.Add("8.8.8.8", "tcp", 443, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
-	if err := em.BlockPort("8.8.8.8", "udp", 53, 0, ActionDrop, 0); err != nil {
-		t.Fatalf("BlockPort: %v", err)
+	if err := ports.Add("8.8.8.8", "udp", 53, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
-	if err := em.BlockPort("1.1.1.1", "tcp", 22, 0, ActionPass, 100); err != nil {
-		t.Fatalf("BlockPort: %v", err)
-	}
-
-	ips, err := em.ListIPs()
-	if err != nil {
-		t.Fatalf("ListIPs before clear: %v", err)
-	}
-	if len(ips) != 3 {
-		t.Fatalf("ListIPs before clear len = %d, want 3", len(ips))
-	}
-	ports, err := em.ListPorts()
-	if err != nil {
-		t.Fatalf("ListPorts before clear: %v", err)
-	}
-	if len(ports) != 3 {
-		t.Fatalf("ListPorts before clear len = %d, want 3", len(ports))
+	if err := ports.Add("1.1.1.1", "tcp", 22, 0, ActionPass, 100); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
 
-	if err := em.Clear(); err != nil {
-		t.Fatalf("Clear: %v", err)
+	ipRules, err := ips.List()
+	if err != nil {
+		t.Fatalf("List before clear: %v", err)
+	}
+	if len(ipRules) != 3 {
+		t.Fatalf("List before clear len = %d, want 3", len(ipRules))
+	}
+	portRules, err := ports.List()
+	if err != nil {
+		t.Fatalf("List before clear: %v", err)
+	}
+	if len(portRules) != 3 {
+		t.Fatalf("List before clear len = %d, want 3", len(portRules))
 	}
 
-	ips, err = em.ListIPs()
+	if err := ips.Clear(); err != nil {
+		t.Fatalf("Clear ips: %v", err)
+	}
+	if err := ports.Clear(); err != nil {
+		t.Fatalf("Clear ports: %v", err)
+	}
+
+	ipRules, err = ips.List()
 	if err != nil {
-		t.Fatalf("ListIPs after clear: %v", err)
+		t.Fatalf("List after clear: %v", err)
 	}
-	if len(ips) != 0 {
-		t.Fatalf("ListIPs after clear len = %d, want 0; left over: %+v", len(ips), ips)
+	if len(ipRules) != 0 {
+		t.Fatalf("List after clear len = %d, want 0; left over: %+v", len(ipRules), ipRules)
 	}
-	ports, err = em.ListPorts()
+	portRules, err = ports.List()
 	if err != nil {
-		t.Fatalf("ListPorts after clear: %v", err)
+		t.Fatalf("List after clear: %v", err)
 	}
-	if len(ports) != 0 {
-		t.Fatalf("ListPorts after clear len = %d, want 0; left over: %+v", len(ports), ports)
+	if len(portRules) != 0 {
+		t.Fatalf("List after clear len = %d, want 0; left over: %+v", len(portRules), portRules)
 	}
 }
 

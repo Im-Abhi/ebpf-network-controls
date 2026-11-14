@@ -30,23 +30,23 @@ func newTestPortPolicyMap(t *testing.T) *ebpf.Map {
 	return tm
 }
 
-func TestPortPolicyManager_RoundTrip(t *testing.T) {
-	pm := NewPortPolicyManager(newTestPortPolicyMap(t))
+func TestPortTable_RoundTrip(t *testing.T) {
+	tbl := newPortTable(newTestPortPolicyMap(t), nil, 0)
 
-	if err := pm.Block("10.153.245.175", "tcp", 22); err != nil {
-		t.Fatalf("Block tcp/22: %v", err)
+	if err := tbl.Add("10.153.245.175", "tcp", 22, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("Add tcp/22: %v", err)
 	}
-	if err := pm.Block("8.8.8.8", "udp", 53); err != nil {
-		t.Fatalf("Block udp/53: %v", err)
+	if err := tbl.Add("8.8.8.8", "udp", 53, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("Add udp/53: %v", err)
 	}
-	if err := pm.Block("172.16.0.1", "tcp", 443); err != nil {
-		t.Fatalf("Block tcp/443: %v", err)
+	if err := tbl.Add("172.16.0.1", "tcp", 443, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("Add tcp/443: %v", err)
 	}
-	if err := pm.Block("10.153.245.176", "tcp", 22); err != nil {
-		t.Fatalf("Block tcp/22 #2: %v", err)
+	if err := tbl.Add("10.153.245.176", "tcp", 22, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("Add tcp/22 #2: %v", err)
 	}
 
-	rules, err := pm.List()
+	rules, err := tbl.List()
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -67,21 +67,21 @@ func TestPortPolicyManager_RoundTrip(t *testing.T) {
 		}
 	}
 
-	if err := pm.Unblock("8.8.8.8", "udp", 53); err != nil {
-		t.Fatalf("Unblock udp/53: %v", err)
+	if err := tbl.Remove("8.8.8.8", "udp", 53, 0); err != nil {
+		t.Fatalf("Remove udp/53: %v", err)
 	}
-	rules, err = pm.List()
+	rules, err = tbl.List()
 	if err != nil {
-		t.Fatalf("List after unblock: %v", err)
+		t.Fatalf("List after remove: %v", err)
 	}
 	if len(rules) != 3 {
-		t.Fatalf("List after unblock len = %d, want 3", len(rules))
+		t.Fatalf("List after remove len = %d, want 3", len(rules))
 	}
 
-	if err := pm.Clear(); err != nil {
+	if err := tbl.Clear(); err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
-	rules, err = pm.List()
+	rules, err = tbl.List()
 	if err != nil {
 		t.Fatalf("List after clear: %v", err)
 	}
@@ -90,27 +90,27 @@ func TestPortPolicyManager_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestPortPolicyManager_ClearRemovesAll guards the Clear() contract: every
-// rule must be deleted. It inserts at least three distinct rules so the
-// delete-during-iteration hazard (which can silently skip entries on a real
-// kernel) has enough state to trip on.
-func TestPortPolicyManager_ClearRemovesAll(t *testing.T) {
-	pm := NewPortPolicyManager(newTestPortPolicyMap(t))
+// TestPortTable_ClearRemovesAll guards the Clear() contract: every rule must
+// be deleted. It inserts at least three distinct rules so the delete-during-
+// iteration hazard (which can silently skip entries on a real kernel) has
+// enough state to trip on.
+func TestPortTable_ClearRemovesAll(t *testing.T) {
+	tbl := newPortTable(newTestPortPolicyMap(t), nil, 0)
 
-	if err := pm.Block("10.0.0.1", "tcp", 22); err != nil {
-		t.Fatalf("Block: %v", err)
+	if err := tbl.Add("10.0.0.1", "tcp", 22, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
-	if err := pm.Block("10.0.0.2", "tcp", 80); err != nil {
-		t.Fatalf("Block: %v", err)
+	if err := tbl.Add("10.0.0.2", "tcp", 80, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
-	if err := pm.Block("10.0.0.3", "udp", 53); err != nil {
-		t.Fatalf("Block: %v", err)
+	if err := tbl.Add("10.0.0.3", "udp", 53, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
-	if err := pm.Block("10.0.0.4", "", 0); err != nil {
-		t.Fatalf("Block: %v", err)
+	if err := tbl.Add("10.0.0.4", "", 0, 0, ActionDrop, 0); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
 
-	before, err := pm.List()
+	before, err := tbl.List()
 	if err != nil {
 		t.Fatalf("List before clear: %v", err)
 	}
@@ -118,11 +118,11 @@ func TestPortPolicyManager_ClearRemovesAll(t *testing.T) {
 		t.Fatalf("List before clear len = %d, want 4", len(before))
 	}
 
-	if err := pm.Clear(); err != nil {
+	if err := tbl.Clear(); err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
 
-	after, err := pm.List()
+	after, err := tbl.List()
 	if err != nil {
 		t.Fatalf("List after clear: %v", err)
 	}
@@ -131,17 +131,17 @@ func TestPortPolicyManager_ClearRemovesAll(t *testing.T) {
 	}
 }
 
-func TestPortPolicyManager_PriorityRoundTrip(t *testing.T) {
-	pm := NewPortPolicyManager(newTestPortPolicyMap(t))
+func TestPortTable_PriorityRoundTrip(t *testing.T) {
+	tbl := newPortTable(newTestPortPolicyMap(t), nil, 0)
 
-	if err := pm.BlockWithActionPriority("1.2.3.4", "tcp", 22, 0, ActionPass, 100); err != nil {
-		t.Fatalf("BlockWithActionPriority(pass,100): %v", err)
+	if err := tbl.Add("1.2.3.4", "tcp", 22, 0, ActionPass, 100); err != nil {
+		t.Fatalf("Add(pass,100): %v", err)
 	}
-	if err := pm.BlockWithActionPriority("5.6.7.8", "udp", 53, 0, ActionDrop, 3); err != nil {
-		t.Fatalf("BlockWithActionPriority(drop,3): %v", err)
+	if err := tbl.Add("5.6.7.8", "udp", 53, 0, ActionDrop, 3); err != nil {
+		t.Fatalf("Add(drop,3): %v", err)
 	}
 
-	rules, err := pm.List()
+	rules, err := tbl.List()
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -161,18 +161,18 @@ func TestPortPolicyManager_PriorityRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPortPolicyManager_InvalidInputs(t *testing.T) {
-	pm := NewPortPolicyManager(newTestPortPolicyMap(t))
+func TestPortTable_InvalidInputs(t *testing.T) {
+	tbl := newPortTable(newTestPortPolicyMap(t), nil, 0)
 
 	for _, bad := range []string{"", "not-an-ip", "::1", "10.0.0.0/8"} {
-		if err := pm.Block(bad, "tcp", 22); err == nil {
-			t.Errorf("Block(%q): expected error, got nil", bad)
+		if err := tbl.Add(bad, "tcp", 22, 0, ActionDrop, 0); err == nil {
+			t.Errorf("Add(%q): expected error, got nil", bad)
 		}
 	}
-	if err := pm.Block("1.2.3.4", "icmp", 0); err == nil {
-		t.Error("Block with unsupported protocol: expected error, got nil")
+	if err := tbl.Add("1.2.3.4", "icmp", 0, 0, ActionDrop, 0); err == nil {
+		t.Error("Add with unsupported protocol: expected error, got nil")
 	}
-	if err := pm.Block("1.2.3.4", "tcp", 22); err != nil {
-		t.Errorf("Block valid rule: %v", err)
+	if err := tbl.Add("1.2.3.4", "tcp", 22, 0, ActionDrop, 0); err != nil {
+		t.Errorf("Add valid rule: %v", err)
 	}
 }

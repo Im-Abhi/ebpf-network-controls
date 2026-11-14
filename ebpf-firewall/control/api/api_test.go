@@ -32,10 +32,6 @@ func newFakePolicy() *fakePolicy {
 	return &fakePolicy{def: "allow", edef: "allow"}
 }
 
-func (f *fakePolicy) BlockIP(string) error { return errors.New("unexpected write") }
-func (f *fakePolicy) BlockIPWithAction(string, string) error {
-	return errors.New("unexpected write")
-}
 func (f *fakePolicy) BlockIPWithActionPriority(string, string, uint32) error {
 	return errors.New("unexpected write")
 }
@@ -76,12 +72,6 @@ func (f *fakePolicy) Stats() (server.Stats, error) {
 		PassBytes:    4400,
 	}, nil
 }
-func (f *fakePolicy) BlockPortRule(string, string, uint16, uint16) error {
-	return errors.New("unexpected write")
-}
-func (f *fakePolicy) BlockPortRuleWithAction(string, string, uint16, uint16, string) error {
-	return errors.New("unexpected write")
-}
 func (f *fakePolicy) BlockPortRuleWithActionPriority(string, string, uint16, uint16, string, uint32) error {
 	return errors.New("unexpected write")
 }
@@ -108,9 +98,6 @@ func (f *fakePolicy) DefaultPolicy() (string, error) {
 	defer f.mu.Unlock()
 	return f.def, nil
 }
-func (f *fakePolicy) BlockEgressWithAction(string, string) error {
-	return errors.New("unexpected write")
-}
 func (f *fakePolicy) BlockEgressWithActionPriority(string, string, uint32) error {
 	return errors.New("unexpected write")
 }
@@ -122,12 +109,6 @@ func (f *fakePolicy) ListEgressRules() ([]server.BlockedRule, error) {
 		return nil, errors.New("boom")
 	}
 	return append([]server.BlockedRule(nil), f.eips...), nil
-}
-func (f *fakePolicy) BlockEgressPortRule(string, string, uint16, uint16) error {
-	return errors.New("unexpected write")
-}
-func (f *fakePolicy) BlockEgressPortRuleWithAction(string, string, uint16, uint16, string) error {
-	return errors.New("unexpected write")
 }
 func (f *fakePolicy) BlockEgressPortRuleWithActionPriority(string, string, uint16, uint16, string, uint32) error {
 	return errors.New("unexpected write")
@@ -179,8 +160,6 @@ func (f *fakePolicy) EgressAttached() bool {
 // errPolicy fails on every read, exercising the 500 paths.
 type errPolicy struct{}
 
-func (p *errPolicy) BlockIP(string) error                   { return errors.New("boom") }
-func (p *errPolicy) BlockIPWithAction(string, string) error { return errors.New("boom") }
 func (p *errPolicy) BlockIPWithActionPriority(string, string, uint32) error {
 	return errors.New("boom")
 }
@@ -194,12 +173,6 @@ func (p *errPolicy) Interface() string  { return "" }
 func (p *errPolicy) AttachMode() string { return "" }
 func (p *errPolicy) Stats() (server.Stats, error) {
 	return server.Stats{}, errors.New("boom")
-}
-func (p *errPolicy) BlockPortRule(string, string, uint16, uint16) error {
-	return errors.New("boom")
-}
-func (p *errPolicy) BlockPortRuleWithAction(string, string, uint16, uint16, string) error {
-	return errors.New("boom")
 }
 func (p *errPolicy) BlockPortRuleWithActionPriority(string, string, uint16, uint16, string, uint32) error {
 	return errors.New("boom")
@@ -217,21 +190,12 @@ func (p *errPolicy) SetDefaultPolicy(string) error { return errors.New("boom") }
 func (p *errPolicy) DefaultPolicy() (string, error) {
 	return "", errors.New("boom")
 }
-func (p *errPolicy) BlockEgressWithAction(string, string) error {
-	return errors.New("boom")
-}
 func (p *errPolicy) BlockEgressWithActionPriority(string, string, uint32) error {
 	return errors.New("boom")
 }
 func (p *errPolicy) UnblockEgress(string) error { return errors.New("boom") }
 func (p *errPolicy) ListEgressRules() ([]server.BlockedRule, error) {
 	return nil, errors.New("boom")
-}
-func (p *errPolicy) BlockEgressPortRule(string, string, uint16, uint16) error {
-	return errors.New("boom")
-}
-func (p *errPolicy) BlockEgressPortRuleWithAction(string, string, uint16, uint16, string) error {
-	return errors.New("boom")
 }
 func (p *errPolicy) BlockEgressPortRuleWithActionPriority(string, string, uint16, uint16, string, uint32) error {
 	return errors.New("boom")

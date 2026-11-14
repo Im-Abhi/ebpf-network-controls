@@ -227,7 +227,7 @@ func TestDatapath_CIDR_Drops(t *testing.T) {
 
 func TestDatapath_PortRule_DropsOnlyMatching(t *testing.T) {
 	fw := loadTestFirewall(t)
-	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22, 0); err != nil {
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 0, "drop", 0); err != nil {
 		t.Fatalf("BlockPortRule: %v", err)
 	}
 
@@ -243,7 +243,7 @@ func TestDatapath_PortRule_SourcePort(t *testing.T) {
 	fw := loadTestFirewall(t)
 
 	// Block only when the source port is 50000.
-	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22, 50000); err != nil {
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 50000, "drop", 0); err != nil {
 		t.Fatalf("BlockPortRule: %v", err)
 	}
 
@@ -261,11 +261,11 @@ func TestDatapath_PortRule_Specifity(t *testing.T) {
 	fw := loadTestFirewall(t)
 
 	// Most-specific rule drops exactly src-port 50000 -> dst:22.
-	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22, 50000); err != nil {
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 50000, "drop", 0); err != nil {
 		t.Fatalf("BlockPortRule: %v", err)
 	}
 	// Less-specific rule PASSes any other tcp traffic to dst:22.
-	if err := fw.BlockPortRuleWithAction("1.2.3.4", "tcp", 22, 0, "pass"); err != nil {
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 0, "pass", 0); err != nil {
 		t.Fatalf("BlockPortRuleWithAction: %v", err)
 	}
 
@@ -280,7 +280,7 @@ func TestDatapath_PassRule_OverridesDefaultDeny(t *testing.T) {
 	if err := fw.SetDefaultPolicy("deny"); err != nil {
 		t.Fatalf("SetDefaultPolicy: %v", err)
 	}
-	if err := fw.BlockIPWithAction("1.2.3.4", "pass"); err != nil {
+	if err := fw.BlockIPWithActionPriority("1.2.3.4", "pass", 0); err != nil {
 		t.Fatalf("BlockIPWithAction: %v", err)
 	}
 
@@ -296,10 +296,10 @@ func TestDatapath_DropWinsOverPass(t *testing.T) {
 		t.Fatalf("SetDefaultPolicy: %v", err)
 	}
 	// PASS rule for the IP, but a DROP port rule for the same dst:22.
-	if err := fw.BlockIPWithAction("1.2.3.4", "pass"); err != nil {
+	if err := fw.BlockIPWithActionPriority("1.2.3.4", "pass", 0); err != nil {
 		t.Fatalf("BlockIPWithAction: %v", err)
 	}
-	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22, 0); err != nil {
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 0, "drop", 0); err != nil {
 		t.Fatalf("BlockPortRule: %v", err)
 	}
 
@@ -471,7 +471,7 @@ func TestDatapath_Fragments_FollowDefaultPolicy(t *testing.T) {
 	if err := fw.BlockIP("1.2.3.4"); err != nil {
 		t.Fatalf("BlockIP: %v", err)
 	}
-	if err := fw.BlockPortRule("1.2.3.4", "tcp", 22, 0); err != nil {
+	if err := fw.BlockPortRuleWithActionPriority("1.2.3.4", "tcp", 22, 0, "drop", 0); err != nil {
 		t.Fatalf("BlockPortRule: %v", err)
 	}
 

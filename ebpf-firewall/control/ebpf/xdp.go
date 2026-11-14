@@ -24,7 +24,7 @@ const (
 
 // XDPProgram owns the full lifecycle (load, attach, detach, close) of the XDP
 // firewall program and its maps. It intentionally knows nothing about firewall
-// policy; policy operations live in MapManager (see blocklist.go).
+// policy; policy operations live in the rule tables (see tables.go).
 type XDPProgram struct {
 	ifaceName  string
 	ifaceIndex int

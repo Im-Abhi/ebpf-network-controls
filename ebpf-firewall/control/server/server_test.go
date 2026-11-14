@@ -40,14 +40,6 @@ func newFakePolicy() *fakePolicy {
 	}
 }
 
-func (f *fakePolicy) BlockIP(cidr string) error {
-	return f.BlockIPWithActionPriority(cidr, "drop", 0)
-}
-
-func (f *fakePolicy) BlockIPWithAction(cidr, action string) error {
-	return f.BlockIPWithActionPriority(cidr, action, 0)
-}
-
 func (f *fakePolicy) BlockIPWithActionPriority(cidr, action string, priority uint32) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -115,17 +107,6 @@ func (f *fakePolicy) Stats() (Stats, error) {
 	}, nil
 }
 
-func (f *fakePolicy) BlockPortRule(dst, protocol string, dport, sport uint16) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.rules[portKey(dst, protocol, dport, sport)] = PortRule{Protocol: protocol, Port: dport, SPort: sport, Dst: dst, Action: "drop"}
-	return nil
-}
-
-func (f *fakePolicy) BlockPortRuleWithAction(dst, protocol string, dport, sport uint16, action string) error {
-	return f.BlockPortRuleWithActionPriority(dst, protocol, dport, sport, action, 0)
-}
-
 func (f *fakePolicy) BlockPortRuleWithActionPriority(dst, protocol string, dport, sport uint16, action string, priority uint32) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -166,10 +147,6 @@ func (f *fakePolicy) ListPortRules() ([]PortRule, error) {
 	return out, nil
 }
 
-func (f *fakePolicy) BlockEgressWithAction(cidr, action string) error {
-	return f.BlockEgressWithActionPriority(cidr, action, 0)
-}
-
 func (f *fakePolicy) BlockEgressWithActionPriority(cidr, action string, priority uint32) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -192,14 +169,6 @@ func (f *fakePolicy) ListEgressRules() ([]BlockedRule, error) {
 		out = append(out, r)
 	}
 	return out, nil
-}
-
-func (f *fakePolicy) BlockEgressPortRule(dst, protocol string, dport, sport uint16) error {
-	return f.BlockEgressPortRuleWithActionPriority(dst, protocol, dport, sport, "drop", 0)
-}
-
-func (f *fakePolicy) BlockEgressPortRuleWithAction(dst, protocol string, dport, sport uint16, action string) error {
-	return f.BlockEgressPortRuleWithActionPriority(dst, protocol, dport, sport, action, 0)
 }
 
 func (f *fakePolicy) BlockEgressPortRuleWithActionPriority(dst, protocol string, dport, sport uint16, action string, priority uint32) error {

@@ -7,21 +7,31 @@ import (
 	"ebpf-firewall/control/server"
 )
 
-// Firewall is a thin facade coordinating the XDP program lifecycle (XDPProgram)
-// with policy map operations (MapManager), counter reads (CounterManager), the
-// config/default-policy state (ConfigManager), the conntrack table
-// (ConntrackManager), and the TC egress hook (TCProgram + EgressPolicyManager).
-// It is the single handle used by cmd/firewall and the runtime control plane.
+// Firewall is the single handle used by cmd/firewall and the runtime control
+// plane. It coordinates:
+//
+//   - the XDP program lifecycle      (prog, XDPProgram)
+//   - the TC egress hook lifecycle   (tc, TCProgram)
+//   - four rule tables               (ingress/egress × CIDR/port, see tables.go)
+//   - the conntrack table            (ctMgr)
+//   - counters + default policies    (counterMgr, configMgr, egressCfgMgr)
+//
+// The four table instances below are the whole policy surface: every Block/
+// Unblock/List/Clear operation on either direction goes through exactly one
+// of them.
 type Firewall struct {
-	prog          *XDPProgram
-	mgr           *MapManager
-	counterMgr    *CounterManager
-	portPolicyMgr *PortPolicyManager
-	configMgr     *ConfigManager
-	ctMgr         *ConntrackManager
-	egressMgr     *EgressPolicyManager
-	egressCfgMgr  *ConfigManager
-	tc            *TCProgram
+	prog *XDPProgram
+	tc   *TCProgram
+
+	ingressIPs   cidrTable // blocked_ips          (XDP)
+	ingressPorts portTable // port_policy          (XDP)
+	egressIPs    cidrTable // egress_blocked_ips   (TC)
+	egressPorts  portTable // egress_port_policy   (TC)
+
+	ctMgr        *ConntrackManager
+	counterMgr   *CounterManager
+	configMgr    *ConfigManager // ingress default policy
+	egressCfgMgr *ConfigManager // egress default policy
 }
 
 // NewFirewall loads the XDP program and its maps for the given interface but
@@ -33,23 +43,17 @@ func NewFirewall(ifaceName string) (*Firewall, error) {
 	}
 
 	presence := prog.RulePresence()
-	mgr := NewMapManager(prog.BlockedIps())
-	mgr.SetPresence(presence)
-	portPolicyMgr := NewPortPolicyManager(prog.PortPolicy())
-	portPolicyMgr.SetPresence(presence)
-	egressMgr := NewEgressPolicyManager(prog.EgressBlockedIps(), prog.EgressPortPolicy())
-	egressMgr.SetPresence(presence)
-
 	return &Firewall{
-		prog:          prog,
-		mgr:           mgr,
-		counterMgr:    NewCounterManager(prog.Counters()),
-		portPolicyMgr: portPolicyMgr,
-		configMgr:     NewConfigManager(prog.Config()),
-		ctMgr:         NewConntrackManager(prog.Conntrack()),
-		egressMgr:     egressMgr,
-		egressCfgMgr:  NewConfigManager(prog.EgressConfig()),
-		tc:            NewTCProgram(prog.EgressProgram(), prog.ifaceIndex),
+		prog:         prog,
+		tc:           NewTCProgram(prog.EgressProgram(), prog.ifaceIndex),
+		ingressIPs:   newCidrTable(prog.BlockedIps(), presence, rulePresenceIP),
+		ingressPorts: newPortTable(prog.PortPolicy(), presence, rulePresencePort),
+		egressIPs:    newCidrTable(prog.EgressBlockedIps(), presence, rulePresenceEgressIP),
+		egressPorts:  newPortTable(prog.EgressPortPolicy(), presence, rulePresenceEgressPort),
+		ctMgr:        NewConntrackManager(prog.Conntrack()),
+		counterMgr:   NewCounterManager(prog.Counters()),
+		configMgr:    NewConfigManager(prog.Config()),
+		egressCfgMgr: NewConfigManager(prog.EgressConfig()),
 	}, nil
 }
 
@@ -85,18 +89,14 @@ func (f *Firewall) AttachMode() string {
 	return f.prog.AttachMode()
 }
 
+// ── Ingress IP/CIDR rules ────────────────────────────────────────────────
+
 // BlockIP adds an IP or CIDR to the blocklist with a DROP action.
 func (f *Firewall) BlockIP(cidr string) error {
-	if err := f.mgr.BlockIP(cidr); err != nil {
+	if err := f.ingressIPs.Add(cidr, ActionDrop, 0); err != nil {
 		return fmt.Errorf("blocking %q: %w", cidr, err)
 	}
 	return nil
-}
-
-// BlockIPWithAction adds an IP or CIDR rule with an explicit action and the
-// default priority (0).
-func (f *Firewall) BlockIPWithAction(cidr, actionStr string) error {
-	return f.BlockIPWithActionPriority(cidr, actionStr, 0)
 }
 
 // BlockIPWithActionPriority adds an IP or CIDR rule with an explicit action
@@ -106,7 +106,7 @@ func (f *Firewall) BlockIPWithActionPriority(cidr, actionStr string, priority ui
 	if err != nil {
 		return err
 	}
-	if err := f.mgr.BlockIPWithActionPriority(cidr, action, priority); err != nil {
+	if err := f.ingressIPs.Add(cidr, action, priority); err != nil {
 		return fmt.Errorf("adding %q with action %s priority %d: %w", cidr, action, priority, err)
 	}
 	return nil
@@ -114,7 +114,7 @@ func (f *Firewall) BlockIPWithActionPriority(cidr, actionStr string, priority ui
 
 // UnblockIP removes an IP or CIDR from the blocklist.
 func (f *Firewall) UnblockIP(cidr string) error {
-	if err := f.mgr.UnblockIP(cidr); err != nil {
+	if err := f.ingressIPs.Remove(cidr); err != nil {
 		return fmt.Errorf("unblocking %q: %w", cidr, err)
 	}
 	return nil
@@ -122,43 +122,25 @@ func (f *Firewall) UnblockIP(cidr string) error {
 
 // IsBlocked reports whether the given IP or CIDR is covered by a blocked prefix.
 func (f *Firewall) IsBlocked(ip string) (bool, error) {
-	return f.mgr.IsBlocked(ip)
+	return f.ingressIPs.Contains(ip)
 }
 
 // ListBlockedIPs returns the current blocked prefixes as CIDR strings.
 func (f *Firewall) ListBlockedIPs() ([]string, error) {
-	return f.mgr.ListBlockedIPs()
+	return f.ingressIPs.CIDRs()
 }
 
 // ListBlockedRules returns the current IP rules with their action and priority.
 func (f *Firewall) ListBlockedRules() ([]server.BlockedRule, error) {
-	return f.mgr.ListBlockedRules()
+	return f.ingressIPs.List()
 }
 
 // Clear removes every blocked prefix.
 func (f *Firewall) Clear() error {
-	return f.mgr.Clear()
+	return f.ingressIPs.Clear()
 }
 
-// Stats returns the global packet and byte counters from the BPF map.
-func (f *Firewall) Stats() (server.Stats, error) {
-	return f.counterMgr.GetCounters()
-}
-
-// BlockPortRule adds a rule that DROPs traffic destined to dst on the given
-// protocol/dport (sport 0 = any source port). dport 0 means any port.
-func (f *Firewall) BlockPortRule(dst, protocol string, dport, sport uint16) error {
-	if err := f.portPolicyMgr.BlockWithAction(dst, protocol, dport, sport, ActionDrop); err != nil {
-		return fmt.Errorf("blocking port rule %s/%d (sport %d) to %s: %w", protocol, dport, sport, dst, err)
-	}
-	return nil
-}
-
-// BlockPortRuleWithAction adds a port rule with an explicit action and the
-// default priority (0).
-func (f *Firewall) BlockPortRuleWithAction(dst, protocol string, dport, sport uint16, actionStr string) error {
-	return f.BlockPortRuleWithActionPriority(dst, protocol, dport, sport, actionStr, 0)
-}
+// ── Ingress port rules ───────────────────────────────────────────────────
 
 // BlockPortRuleWithActionPriority adds a port rule with an explicit action and
 // priority.
@@ -167,7 +149,7 @@ func (f *Firewall) BlockPortRuleWithActionPriority(dst, protocol string, dport, 
 	if err != nil {
 		return err
 	}
-	if err := f.portPolicyMgr.BlockWithActionPriority(dst, protocol, dport, sport, action, priority); err != nil {
+	if err := f.ingressPorts.Add(dst, protocol, dport, sport, action, priority); err != nil {
 		return fmt.Errorf("adding port rule %s/%d (sport %d) to %s with action %s priority %d: %w", protocol, dport, sport, dst, action, priority, err)
 	}
 	return nil
@@ -175,7 +157,7 @@ func (f *Firewall) BlockPortRuleWithActionPriority(dst, protocol string, dport, 
 
 // UnblockPortRule removes a protocol/dport rule for dst (sport 0 = any).
 func (f *Firewall) UnblockPortRule(dst, protocol string, dport, sport uint16) error {
-	if err := f.portPolicyMgr.UnblockWithAction(dst, protocol, dport, sport); err != nil {
+	if err := f.ingressPorts.Remove(dst, protocol, dport, sport); err != nil {
 		return fmt.Errorf("unblocking port rule %s/%d (sport %d) to %s: %w", protocol, dport, sport, dst, err)
 	}
 	return nil
@@ -183,55 +165,17 @@ func (f *Firewall) UnblockPortRule(dst, protocol string, dport, sport uint16) er
 
 // ListPortRules returns all active protocol/port rules.
 func (f *Firewall) ListPortRules() ([]server.PortRule, error) {
-	return f.portPolicyMgr.List()
+	return f.ingressPorts.List()
 }
 
 // ClearPortRules removes every protocol/port rule.
 func (f *Firewall) ClearPortRules() error {
-	return f.portPolicyMgr.Clear()
+	return f.ingressPorts.Clear()
 }
 
-// ListConntrack returns the currently tracked TCP flows.
-func (f *Firewall) ListConntrack() ([]server.ConntrackEntry, error) {
-	return f.ctMgr.List()
-}
-
-// ClearConntrack removes all tracked TCP flows.
-func (f *Firewall) ClearConntrack() error {
-	return f.ctMgr.Clear()
-}
-
-// ReapConntrack removes tracked flows idle for at least idle and returns how
-// many were removed. The daemon calls it on a timer to bound the table.
-func (f *Firewall) ReapConntrack(idle time.Duration) (int, error) {
-	return f.ctMgr.Reap(idle)
-}
-
-// SetDefaultPolicy sets the fallback policy ("allow" or "deny") applied when
-// no rule matches.
-func (f *Firewall) SetDefaultPolicy(s string) error {
-	policy, err := ParseDefaultPolicy(s)
-	if err != nil {
-		return err
-	}
-	if err := f.configMgr.SetDefaultPolicy(policy); err != nil {
-		return fmt.Errorf("setting default policy to %s: %w", policy, err)
-	}
-	return nil
-}
-
-// DefaultPolicy returns the current fallback policy ("allow" or "deny").
-func (f *Firewall) DefaultPolicy() (string, error) {
-	p, err := f.configMgr.DefaultPolicy()
-	if err != nil {
-		return "", err
-	}
-	return p.String(), nil
-}
-
-// ── TC egress (direction-aware) ────────────────────────────────────────
-// The egress hook filters host-generated outbound traffic with its own maps;
-// see EgressPolicyManager for the destination-based semantics.
+// ── Egress (TC) rules ────────────────────────────────────────────────────
+// Egress rules operate on the REMOTE destination (see tables.go and the
+// egress datapath in bpf/firewall.c for the direction semantics).
 
 // StartEgress attaches the TC egress classifier to the interface's egress
 // path. It is a no-op when already attached. Requires kernel >= 6.6 (TCX).
@@ -257,7 +201,7 @@ func (f *Firewall) BlockEgressWithActionPriority(cidr, actionStr string, priorit
 	if err != nil {
 		return err
 	}
-	if err := f.egressMgr.BlockIP(cidr, action, priority); err != nil {
+	if err := f.egressIPs.Add(cidr, action, priority); err != nil {
 		return fmt.Errorf("adding egress rule %q with action %s priority %d: %w", cidr, action, priority, err)
 	}
 	return nil
@@ -271,7 +215,7 @@ func (f *Firewall) BlockEgressWithAction(cidr, actionStr string) error {
 
 // UnblockEgress removes a destination IP/CIDR rule from the egress policy.
 func (f *Firewall) UnblockEgress(cidr string) error {
-	if err := f.egressMgr.UnblockIP(cidr); err != nil {
+	if err := f.egressIPs.Remove(cidr); err != nil {
 		return fmt.Errorf("removing egress rule %q: %w", cidr, err)
 	}
 	return nil
@@ -279,36 +223,25 @@ func (f *Firewall) UnblockEgress(cidr string) error {
 
 // ListEgressRules returns the current egress IP rules.
 func (f *Firewall) ListEgressRules() ([]server.BlockedRule, error) {
-	return f.egressMgr.ListIPs()
+	return f.egressIPs.List()
 }
 
-// BlockEgressPortRule adds an egress port rule with an explicit action and
-// priority for remote (dst, proto, dport, sport).
+// BlockEgressPortRuleWithActionPriority adds an egress port rule with an
+// explicit action and priority for remote (dst, proto, dport, sport).
 func (f *Firewall) BlockEgressPortRuleWithActionPriority(dst, protocol string, dport, sport uint16, actionStr string, priority uint32) error {
 	action, err := ParseAction(actionStr)
 	if err != nil {
 		return err
 	}
-	if err := f.egressMgr.BlockPort(dst, protocol, dport, sport, action, priority); err != nil {
+	if err := f.egressPorts.Add(dst, protocol, dport, sport, action, priority); err != nil {
 		return fmt.Errorf("adding egress port rule %s/%d (sport %d) to %s with action %s priority %d: %w", protocol, dport, sport, dst, action, priority, err)
 	}
 	return nil
 }
 
-// BlockEgressPortRuleWithAction adds an egress port rule with an explicit
-// action at the default priority.
-func (f *Firewall) BlockEgressPortRuleWithAction(dst, protocol string, dport, sport uint16, actionStr string) error {
-	return f.BlockEgressPortRuleWithActionPriority(dst, protocol, dport, sport, actionStr, 0)
-}
-
-// BlockEgressPortRule adds a DROP egress port rule (dport 0 = any port).
-func (f *Firewall) BlockEgressPortRule(dst, protocol string, dport, sport uint16) error {
-	return f.BlockEgressPortRuleWithAction(dst, protocol, dport, sport, "drop")
-}
-
 // UnblockEgressPortRule removes an egress port rule.
 func (f *Firewall) UnblockEgressPortRule(dst, protocol string, dport, sport uint16) error {
-	if err := f.egressMgr.UnblockPort(dst, protocol, dport, sport); err != nil {
+	if err := f.egressPorts.Remove(dst, protocol, dport, sport); err != nil {
 		return fmt.Errorf("removing egress port rule %s/%d (sport %d) to %s: %w", protocol, dport, sport, dst, err)
 	}
 	return nil
@@ -316,15 +249,66 @@ func (f *Firewall) UnblockEgressPortRule(dst, protocol string, dport, sport uint
 
 // ListEgressPortRules returns the current egress port rules.
 func (f *Firewall) ListEgressPortRules() ([]server.PortRule, error) {
-	return f.egressMgr.ListPorts()
+	return f.egressPorts.List()
 }
 
 // ClearEgress removes every egress IP rule and egress port rule.
 func (f *Firewall) ClearEgress() error {
-	if err := f.egressMgr.Clear(); err != nil {
+	if err := f.egressIPs.Clear(); err != nil {
 		return fmt.Errorf("clearing egress policy: %w", err)
 	}
 	return nil
+}
+
+// ── Conntrack, counters, default policies ────────────────────────────────
+
+// ListConntrack returns the currently tracked TCP flows.
+func (f *Firewall) ListConntrack() ([]server.ConntrackEntry, error) {
+	return f.ctMgr.List()
+}
+
+// ClearConntrack removes all tracked TCP flows.
+func (f *Firewall) ClearConntrack() error {
+	return f.ctMgr.Clear()
+}
+
+// ReapConntrack removes tracked flows idle for at least idle and returns how
+// many were removed. The daemon calls it on a timer to bound the table.
+func (f *Firewall) ReapConntrack(idle time.Duration) (int, error) {
+	return f.ctMgr.Reap(idle)
+}
+
+// Stats returns the global packet and byte counters from the BPF map.
+func (f *Firewall) Stats() (server.Stats, error) {
+	return f.counterMgr.GetCounters()
+}
+
+// EgressStats returns the egress packet/byte counters (indices 3-5 of the
+// counters map), separate from the ingress Stats.
+func (f *Firewall) EgressStats() (server.Stats, error) {
+	return f.counterMgr.GetEgressCounters()
+}
+
+// SetDefaultPolicy sets the fallback policy ("allow" or "deny") applied when
+// no rule matches.
+func (f *Firewall) SetDefaultPolicy(s string) error {
+	policy, err := ParseDefaultPolicy(s)
+	if err != nil {
+		return err
+	}
+	if err := f.configMgr.SetDefaultPolicy(policy); err != nil {
+		return fmt.Errorf("setting default policy to %s: %w", policy, err)
+	}
+	return nil
+}
+
+// DefaultPolicy returns the current fallback policy ("allow" or "deny").
+func (f *Firewall) DefaultPolicy() (string, error) {
+	p, err := f.configMgr.DefaultPolicy()
+	if err != nil {
+		return "", err
+	}
+	return p.String(), nil
 }
 
 // SetEgressDefault sets the egress fallback policy ("allow" or "deny") applied
@@ -348,10 +332,4 @@ func (f *Firewall) EgressDefault() (string, error) {
 		return "", err
 	}
 	return p.String(), nil
-}
-
-// EgressStats returns the egress packet/byte counters (indices 3-5 of the
-// counters map), separate from the ingress Stats.
-func (f *Firewall) EgressStats() (server.Stats, error) {
-	return f.counterMgr.GetEgressCounters()
 }

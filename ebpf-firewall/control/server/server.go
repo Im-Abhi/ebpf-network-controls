@@ -12,43 +12,46 @@ import (
 
 // Policy is the minimal firewall surface the control server drives. It is
 // satisfied by *ebpf.Firewall and lets the server be unit-tested against a
-// fake without a kernel. Ingress methods (BlockIP, BlockPortRule, ...) manage
-// the XDP policy; Egress* methods manage the TC egress policy.
+// fake without a kernel.
+//
+// The write path is deliberately minimal: every rule add goes through one
+// ...WithActionPriority method per (direction × IP/port), with the action and
+// priority always explicit. A request without an action is normalized to
+// "drop" by the server before calling in (see handleBlock), so the interface
+// needs no convenience overloads. Ingress methods manage the XDP policy;
+// Egress* methods manage the TC egress policy; the rest is shared state.
 type Policy interface {
-	BlockIP(cidr string) error
-	BlockIPWithAction(cidr, action string) error
+	// Ingress (XDP) policy.
 	BlockIPWithActionPriority(cidr, action string, priority uint32) error
 	UnblockIP(cidr string) error
 	ListBlockedIPs() ([]string, error)
 	ListBlockedRules() ([]BlockedRule, error)
-	Clear() error
-	Interface() string
-	AttachMode() string
-	Stats() (Stats, error)
-	BlockPortRule(dst, protocol string, dport, sport uint16) error
-	BlockPortRuleWithAction(dst, protocol string, dport, sport uint16, action string) error
 	BlockPortRuleWithActionPriority(dst, protocol string, dport, sport uint16, action string, priority uint32) error
 	UnblockPortRule(dst, protocol string, dport, sport uint16) error
 	ListPortRules() ([]PortRule, error)
-	ClearPortRules() error
-	ListConntrack() ([]ConntrackEntry, error)
-	ClearConntrack() error
-	SetDefaultPolicy(s string) error
-	DefaultPolicy() (string, error)
+	Clear() error          // ingress IP rules
+	ClearPortRules() error // ingress port rules
 
-	BlockEgressWithAction(cidr, action string) error
+	// Egress (TC) policy.
 	BlockEgressWithActionPriority(cidr, action string, priority uint32) error
 	UnblockEgress(cidr string) error
 	ListEgressRules() ([]BlockedRule, error)
-	BlockEgressPortRule(dst, protocol string, dport, sport uint16) error
-	BlockEgressPortRuleWithAction(dst, protocol string, dport, sport uint16, action string) error
 	BlockEgressPortRuleWithActionPriority(dst, protocol string, dport, sport uint16, action string, priority uint32) error
 	UnblockEgressPortRule(dst, protocol string, dport, sport uint16) error
 	ListEgressPortRules() ([]PortRule, error)
 	ClearEgress() error
+
+	// Shared state.
+	Interface() string
+	AttachMode() string
+	Stats() (Stats, error)
+	EgressStats() (Stats, error)
+	SetDefaultPolicy(s string) error
+	DefaultPolicy() (string, error)
 	SetEgressDefault(s string) error
 	EgressDefault() (string, error)
-	EgressStats() (Stats, error)
+	ListConntrack() ([]ConntrackEntry, error)
+	ClearConntrack() error
 	EgressAttached() bool
 }
 
@@ -207,7 +210,8 @@ func writeResponse(conn net.Conn, r Response) {
 // handle applies a single request against the policy. It is reached through
 // the accept loop only while the server is live, so no live gate is needed
 // here; the `live` flag is status data used by CmdStatus. Safe for concurrent
-// use via the mutex.
+// use via the mutex. Each command's logic lives in its own handle* method so
+// this function stays a readable dispatch table.
 func (s *Server) handle(req Request) Response {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -223,211 +227,236 @@ func (s *Server) handle(req Request) Response {
 		echoDir = dirBoth
 	}
 
-	isPortRule := req.Protocol != "" || req.Port != 0 || req.SPort != 0
-
 	switch req.Command {
 	case CmdBlock:
-		for _, d := range dirs {
-			if isPortRule {
-				if d == dirIn {
-					if req.Action != "" {
-						if err := s.policy.BlockPortRuleWithActionPriority(req.Value, req.Protocol, req.Port, req.SPort, req.Action, req.Priority); err != nil {
-							return Response{OK: false, Error: err.Error()}
-						}
-					} else if err := s.policy.BlockPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
-						return Response{OK: false, Error: err.Error()}
-					}
-				} else {
-					if req.Action != "" {
-						if err := s.policy.BlockEgressPortRuleWithActionPriority(req.Value, req.Protocol, req.Port, req.SPort, req.Action, req.Priority); err != nil {
-							return Response{OK: false, Error: err.Error()}
-						}
-					} else if err := s.policy.BlockEgressPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
-						return Response{OK: false, Error: err.Error()}
-					}
-				}
-				continue
-			}
-			if d == dirIn {
-				if req.Action != "" {
-					if err := s.policy.BlockIPWithActionPriority(req.Value, req.Action, req.Priority); err != nil {
-						return Response{OK: false, Error: err.Error()}
-					}
-				} else if err := s.policy.BlockIP(req.Value); err != nil {
-					return Response{OK: false, Error: err.Error()}
-				}
-			} else {
-				if req.Action != "" {
-					if err := s.policy.BlockEgressWithActionPriority(req.Value, req.Action, req.Priority); err != nil {
-						return Response{OK: false, Error: err.Error()}
-					}
-				} else if err := s.policy.BlockEgressWithAction(req.Value, "drop"); err != nil {
-					return Response{OK: false, Error: err.Error()}
-				}
-			}
-		}
-		return Response{OK: true, Direction: echoDir}
-
+		return s.handleBlock(req, dirs, echoDir)
 	case CmdUnblock:
-		for _, d := range dirs {
-			if isPortRule {
-				if d == dirIn {
-					if err := s.policy.UnblockPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
-						return Response{OK: false, Error: err.Error()}
-					}
-				} else if err := s.policy.UnblockEgressPortRule(req.Value, req.Protocol, req.Port, req.SPort); err != nil {
-					return Response{OK: false, Error: err.Error()}
-				}
-				continue
-			}
-			if d == dirIn {
-				if err := s.policy.UnblockIP(req.Value); err != nil {
-					return Response{OK: false, Error: err.Error()}
-				}
-			} else if err := s.policy.UnblockEgress(req.Value); err != nil {
-				return Response{OK: false, Error: err.Error()}
-			}
-		}
-		return Response{OK: true, Direction: echoDir}
-
+		return s.handleUnblock(req, dirs, echoDir)
 	case CmdList:
-		// Non-nil empty slices so an empty table serializes as [] (not null)
-		// for the same client-detection reason as CmdListPorts.
-		blocked := make([]BlockedRule, 0)
-		egress := make([]BlockedRule, 0)
-		for _, d := range dirs {
-			if d == dirIn {
-				rules, err := s.policy.ListBlockedRules()
-				if err != nil {
-					return Response{OK: false, Error: err.Error()}
-				}
-				blocked = append(blocked, rules...)
-			} else {
-				rules, err := s.policy.ListEgressRules()
-				if err != nil {
-					return Response{OK: false, Error: err.Error()}
-				}
-				egress = append(egress, rules...)
-			}
-		}
-		blockedCids := make([]string, 0, len(blocked))
-		for _, r := range blocked {
-			blockedCids = append(blockedCids, r.Cidr)
-		}
-		return Response{
-			OK:           true,
-			Blocked:      blockedCids,
-			BlockedRules: blocked,
-			EgressRules:  egress,
-			Count:        len(blocked) + len(egress),
-			Direction:    echoDir,
-		}
-
+		return s.handleList(dirs, echoDir)
 	case CmdListPorts:
-		// Non-nil empty slices: an empty table must serialize as [] (not null)
-		// so the client can distinguish "listed, nothing here" from "field
-		// absent" and print "no port rules".
-		ports := make([]PortRule, 0)
-		egressPorts := make([]PortRule, 0)
-		for _, d := range dirs {
-			if d == dirIn {
-				rules, err := s.policy.ListPortRules()
-				if err != nil {
-					return Response{OK: false, Error: err.Error()}
-				}
-				ports = append(ports, rules...)
-			} else {
-				rules, err := s.policy.ListEgressPortRules()
-				if err != nil {
-					return Response{OK: false, Error: err.Error()}
-				}
-				egressPorts = append(egressPorts, rules...)
-			}
-		}
-		return Response{
-			OK:              true,
-			PortRules:       ports,
-			EgressPortRules: egressPorts,
-			Count:           len(ports) + len(egressPorts),
-			Direction:       echoDir,
-		}
-
+		return s.handleListPorts(dirs, echoDir)
 	case CmdStatus:
-		blocked, err := s.policy.ListBlockedIPs()
-		if err != nil {
-			return Response{OK: false, Error: err.Error()}
-		}
-		def, err := s.policy.DefaultPolicy()
-		if err != nil {
-			return Response{OK: false, Error: err.Error()}
-		}
-		egressDef, err := s.policy.EgressDefault()
-		if err != nil {
-			return Response{OK: false, Error: err.Error()}
-		}
-		return Response{
-			OK:             true,
-			Iface:          s.policy.Interface(),
-			Attached:       s.live,
-			Count:          len(blocked),
-			Default:        def,
-			AttachMode:     s.policy.AttachMode(),
-			Direction:      "in",
-			EgressDefault:  egressDef,
-			EgressAttached: s.policy.EgressAttached(),
-		}
-
+		return s.handleStatus()
 	case CmdSetDefault, CmdDefault:
-		for _, d := range dirs {
-			if d == dirIn {
-				if err := s.policy.SetDefaultPolicy(req.Value); err != nil {
-					return Response{OK: false, Error: err.Error()}
-				}
-			} else if err := s.policy.SetEgressDefault(req.Value); err != nil {
-				return Response{OK: false, Error: err.Error()}
-			}
-		}
-		return Response{OK: true, Direction: echoDir}
-
+		return s.handleDefault(req, dirs, echoDir)
 	case CmdClear:
-		for _, d := range dirs {
-			if d == dirIn {
-				if err := s.policy.Clear(); err != nil {
-					return Response{OK: false, Error: err.Error()}
-				}
-				if err := s.policy.ClearPortRules(); err != nil {
-					return Response{OK: false, Error: err.Error()}
-				}
-			} else if err := s.policy.ClearEgress(); err != nil {
-				return Response{OK: false, Error: err.Error()}
-			}
-		}
-		// Rule changes can invalidate established flows, so clear the tracked
-		// state too.
-		if err := s.policy.ClearConntrack(); err != nil {
-			return Response{OK: false, Error: err.Error()}
-		}
-		return Response{OK: true, Direction: echoDir}
-
+		return s.handleClear(dirs, echoDir)
 	case CmdConntrack:
-		entries, err := s.policy.ListConntrack()
-		if err != nil {
-			return Response{OK: false, Error: err.Error()}
-		}
-		return Response{OK: true, Conntrack: entries, Count: len(entries), Direction: "in"}
-
+		return s.handleConntrack()
 	case CmdStats:
-		stats, err := s.policy.Stats()
-		if err != nil {
-			return Response{OK: false, Error: err.Error()}
-		}
-		egressStats, err := s.policy.EgressStats()
-		if err != nil {
-			return Response{OK: false, Error: err.Error()}
-		}
-		return Response{OK: true, Stats: &stats, EgressStats: &egressStats}
-
+		return s.handleStats()
 	default:
 		return Response{OK: false, Error: "unknown command: " + string(req.Command)}
 	}
+}
+
+// handleBlock adds one rule per requested direction. A request carries either
+// an IP rule (value = IP/CIDR) or a port rule (any of protocol/port/sport
+// set), and an optional action + priority. An empty action means DROP — the
+// blocklist default — so the ...WithActionPriority methods are called with
+// fully explicit arguments.
+func (s *Server) handleBlock(req Request, dirs []string, echoDir string) Response {
+	action := req.Action
+	if action == "" {
+		action = "drop"
+	}
+	isPortRule := req.Protocol != "" || req.Port != 0 || req.SPort != 0
+
+	for _, d := range dirs {
+		var err error
+		if isPortRule {
+			if d == dirIn {
+				err = s.policy.BlockPortRuleWithActionPriority(req.Value, req.Protocol, req.Port, req.SPort, action, req.Priority)
+			} else {
+				err = s.policy.BlockEgressPortRuleWithActionPriority(req.Value, req.Protocol, req.Port, req.SPort, action, req.Priority)
+			}
+		} else {
+			if d == dirIn {
+				err = s.policy.BlockIPWithActionPriority(req.Value, action, req.Priority)
+			} else {
+				err = s.policy.BlockEgressWithActionPriority(req.Value, action, req.Priority)
+			}
+		}
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+	}
+	return Response{OK: true, Direction: echoDir}
+}
+
+// handleUnblock removes one rule per requested direction (IP or port rule,
+// same discriminator as handleBlock).
+func (s *Server) handleUnblock(req Request, dirs []string, echoDir string) Response {
+	isPortRule := req.Protocol != "" || req.Port != 0 || req.SPort != 0
+
+	for _, d := range dirs {
+		var err error
+		if isPortRule {
+			if d == dirIn {
+				err = s.policy.UnblockPortRule(req.Value, req.Protocol, req.Port, req.SPort)
+			} else {
+				err = s.policy.UnblockEgressPortRule(req.Value, req.Protocol, req.Port, req.SPort)
+			}
+		} else {
+			if d == dirIn {
+				err = s.policy.UnblockIP(req.Value)
+			} else {
+				err = s.policy.UnblockEgress(req.Value)
+			}
+		}
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+	}
+	return Response{OK: true, Direction: echoDir}
+}
+
+// handleList returns the IP rules of the requested directions. Non-nil empty
+// slices so an empty table serializes as [] (not null) — clients distinguish
+// "listed, nothing here" from "field absent".
+func (s *Server) handleList(dirs []string, echoDir string) Response {
+	blocked := make([]BlockedRule, 0)
+	egress := make([]BlockedRule, 0)
+	for _, d := range dirs {
+		if d == dirIn {
+			rules, err := s.policy.ListBlockedRules()
+			if err != nil {
+				return Response{OK: false, Error: err.Error()}
+			}
+			blocked = append(blocked, rules...)
+		} else {
+			rules, err := s.policy.ListEgressRules()
+			if err != nil {
+				return Response{OK: false, Error: err.Error()}
+			}
+			egress = append(egress, rules...)
+		}
+	}
+	blockedCids := make([]string, 0, len(blocked))
+	for _, r := range blocked {
+		blockedCids = append(blockedCids, r.Cidr)
+	}
+	return Response{
+		OK:           true,
+		Blocked:      blockedCids,
+		BlockedRules: blocked,
+		EgressRules:  egress,
+		Count:        len(blocked) + len(egress),
+		Direction:    echoDir,
+	}
+}
+
+// handleListPorts returns the port rules of the requested directions (same
+// non-nil-empty-slice contract as handleList).
+func (s *Server) handleListPorts(dirs []string, echoDir string) Response {
+	ports := make([]PortRule, 0)
+	egressPorts := make([]PortRule, 0)
+	for _, d := range dirs {
+		if d == dirIn {
+			rules, err := s.policy.ListPortRules()
+			if err != nil {
+				return Response{OK: false, Error: err.Error()}
+			}
+			ports = append(ports, rules...)
+		} else {
+			rules, err := s.policy.ListEgressPortRules()
+			if err != nil {
+				return Response{OK: false, Error: err.Error()}
+			}
+			egressPorts = append(egressPorts, rules...)
+		}
+	}
+	return Response{
+		OK:              true,
+		PortRules:       ports,
+		EgressPortRules: egressPorts,
+		Count:           len(ports) + len(egressPorts),
+		Direction:       echoDir,
+	}
+}
+
+func (s *Server) handleStatus() Response {
+	blocked, err := s.policy.ListBlockedIPs()
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	def, err := s.policy.DefaultPolicy()
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	egressDef, err := s.policy.EgressDefault()
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	return Response{
+		OK:             true,
+		Iface:          s.policy.Interface(),
+		Attached:       s.live,
+		Count:          len(blocked),
+		Default:        def,
+		AttachMode:     s.policy.AttachMode(),
+		Direction:      "in",
+		EgressDefault:  egressDef,
+		EgressAttached: s.policy.EgressAttached(),
+	}
+}
+
+func (s *Server) handleDefault(req Request, dirs []string, echoDir string) Response {
+	for _, d := range dirs {
+		var err error
+		if d == dirIn {
+			err = s.policy.SetDefaultPolicy(req.Value)
+		} else {
+			err = s.policy.SetEgressDefault(req.Value)
+		}
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+	}
+	return Response{OK: true, Direction: echoDir}
+}
+
+// handleClear wipes the requested directions' rules. Rule changes can
+// invalidate established flows, so the shared conntrack table is always
+// cleared too — even for a direction-scoped clear (documented contract).
+func (s *Server) handleClear(dirs []string, echoDir string) Response {
+	for _, d := range dirs {
+		var err error
+		if d == dirIn {
+			if err = s.policy.Clear(); err != nil {
+				return Response{OK: false, Error: err.Error()}
+			}
+			err = s.policy.ClearPortRules()
+		} else {
+			err = s.policy.ClearEgress()
+		}
+		if err != nil {
+			return Response{OK: false, Error: err.Error()}
+		}
+	}
+	if err := s.policy.ClearConntrack(); err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	return Response{OK: true, Direction: echoDir}
+}
+
+func (s *Server) handleConntrack() Response {
+	entries, err := s.policy.ListConntrack()
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	return Response{OK: true, Conntrack: entries, Count: len(entries), Direction: "in"}
+}
+
+func (s *Server) handleStats() Response {
+	stats, err := s.policy.Stats()
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	egressStats, err := s.policy.EgressStats()
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	return Response{OK: true, Stats: &stats, EgressStats: &egressStats}
 }
