@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	args, sockPath, protocol, action, direction, portUint, sportUint, priorityUint, err := extractOptions(os.Args[1:])
+	args, opts, err := extractOptions(os.Args[1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "firewallctl: %v\n", err)
 		os.Exit(2)
@@ -23,10 +23,6 @@ func main() {
 		os.Exit(2)
 	}
 
-	port := uint16(portUint)
-	sport := uint16(sportUint)
-	priority := uint32(priorityUint)
-
 	cmd := args[0]
 
 	var req server.Request
@@ -36,15 +32,24 @@ func main() {
 			fmt.Fprintf(os.Stderr, "firewallctl: %s requires an IP/CIDR argument\n", cmd)
 			os.Exit(2)
 		}
-		req = server.Request{Command: server.Command(cmd), Value: args[1], Protocol: protocol, Port: port, SPort: sport, Action: action, Priority: priority, Direction: direction}
+		req = server.Request{
+			Command:   server.Command(cmd),
+			Value:     args[1],
+			Protocol:  opts.protocol,
+			Port:      uint16(opts.port),
+			SPort:     uint16(opts.sport),
+			Action:    opts.action,
+			Priority:  uint32(opts.priority),
+			Direction: opts.direction,
+		}
 	case "list":
-		req = server.Request{Command: server.CmdList, Direction: direction}
+		req = server.Request{Command: server.CmdList, Direction: opts.direction}
 	case "listports":
-		req = server.Request{Command: server.CmdListPorts, Direction: direction}
+		req = server.Request{Command: server.CmdListPorts, Direction: opts.direction}
 	case "status":
 		req = server.Request{Command: server.CmdStatus}
 	case "clear":
-		req = server.Request{Command: server.CmdClear, Direction: direction}
+		req = server.Request{Command: server.CmdClear, Direction: opts.direction}
 	case "stats":
 		req = server.Request{Command: server.CmdStats}
 	case "conntrack":
@@ -54,7 +59,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "firewallctl: default requires allow or deny")
 			os.Exit(2)
 		}
-		req = server.Request{Command: server.CmdDefault, Value: args[1], Direction: direction}
+		req = server.Request{Command: server.CmdDefault, Value: args[1], Direction: opts.direction}
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -64,7 +69,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	resp, err := roundTrip(sockPath, req)
+	resp, err := roundTrip(opts.sockPath, req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "firewallctl: %v\n", err)
 		os.Exit(1)
@@ -73,14 +78,27 @@ func main() {
 	printResponse(resp)
 }
 
+// cliOptions carries the flag values firewallctl accepts anywhere on the
+// command line (see extractOptions). Ports and priority are held as uint and
+// converted to their wire widths when the Request is built.
+type cliOptions struct {
+	sockPath  string
+	protocol  string
+	action    string
+	direction string
+	port      uint
+	sport     uint
+	priority  uint
+}
+
 // extractOptions pulls the -sock/-protocol/-dport/-sport/-dir options out of
 // the raw arguments (also accepting --x and x=value forms) so they work in
 // any position relative to the command. Go's flag package stops at the first
 // positional argument, which made the documented form
 // `block <ip> --protocol tcp --dport 22` silently ignore the options.
 // Returns the remaining positional arguments.
-func extractOptions(raw []string) (args []string, sockPath, protocol, action, direction string, port, sport, priority uint, err error) {
-	sockPath = "/var/run/ebpf-firewall.sock"
+func extractOptions(raw []string) (args []string, opts cliOptions, err error) {
+	opts.sockPath = "/var/run/ebpf-firewall.sock"
 
 	for i := 0; i < len(raw); i++ {
 		arg := raw[i]
@@ -90,118 +108,106 @@ func extractOptions(raw []string) (args []string, sockPath, protocol, action, di
 			os.Exit(0)
 		case arg == "-sock" || arg == "--sock":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", "", 0, 0, 0, fmt.Errorf("%s requires a path", arg)
+				return nil, opts, fmt.Errorf("%s requires a path", arg)
 			}
 			i++
-			sockPath = raw[i]
+			opts.sockPath = raw[i]
 		case strings.HasPrefix(arg, "-sock="):
-			sockPath = strings.TrimPrefix(arg, "-sock=")
+			opts.sockPath = strings.TrimPrefix(arg, "-sock=")
 		case strings.HasPrefix(arg, "--sock="):
-			sockPath = strings.TrimPrefix(arg, "--sock=")
+			opts.sockPath = strings.TrimPrefix(arg, "--sock=")
 		case arg == "-dir" || arg == "--dir":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", "", 0, 0, 0, fmt.Errorf("%s requires a value (in, out, or both)", arg)
+				return nil, opts, fmt.Errorf("%s requires a value (in, out, or both)", arg)
 			}
 			i++
-			direction, err = parseDirection(raw[i], "-dir")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.direction, err = parseDirection(raw[i], "-dir"); err != nil {
+				return nil, opts, err
 			}
 		case strings.HasPrefix(arg, "-dir="):
-			direction, err = parseDirection(strings.TrimPrefix(arg, "-dir="), "-dir")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.direction, err = parseDirection(strings.TrimPrefix(arg, "-dir="), "-dir"); err != nil {
+				return nil, opts, err
 			}
 		case strings.HasPrefix(arg, "--dir="):
-			direction, err = parseDirection(strings.TrimPrefix(arg, "--dir="), "--dir")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.direction, err = parseDirection(strings.TrimPrefix(arg, "--dir="), "--dir"); err != nil {
+				return nil, opts, err
 			}
 		case arg == "-protocol" || arg == "--protocol":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", "", 0, 0, 0, fmt.Errorf("%s requires a value (tcp or udp)", arg)
+				return nil, opts, fmt.Errorf("%s requires a value (tcp or udp)", arg)
 			}
 			i++
-			protocol = raw[i]
+			opts.protocol = raw[i]
 		case strings.HasPrefix(arg, "-protocol="):
-			protocol = strings.TrimPrefix(arg, "-protocol=")
+			opts.protocol = strings.TrimPrefix(arg, "-protocol=")
 		case strings.HasPrefix(arg, "--protocol="):
-			protocol = strings.TrimPrefix(arg, "--protocol=")
+			opts.protocol = strings.TrimPrefix(arg, "--protocol=")
 		case arg == "-action" || arg == "--action":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", "", 0, 0, 0, fmt.Errorf("%s requires a value (pass or drop)", arg)
+				return nil, opts, fmt.Errorf("%s requires a value (pass or drop)", arg)
 			}
 			i++
-			action = raw[i]
+			opts.action = raw[i]
 		case strings.HasPrefix(arg, "-action="):
-			action = strings.TrimPrefix(arg, "-action=")
+			opts.action = strings.TrimPrefix(arg, "-action=")
 		case strings.HasPrefix(arg, "--action="):
-			action = strings.TrimPrefix(arg, "--action=")
+			opts.action = strings.TrimPrefix(arg, "--action=")
 		case arg == "-priority" || arg == "--priority":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", "", 0, 0, 0, fmt.Errorf("%s requires a numeric value (0-4294967295)", arg)
+				return nil, opts, fmt.Errorf("%s requires a numeric value (0-4294967295)", arg)
 			}
 			i++
-			priority, err = parsePriority(raw[i], "-priority")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.priority, err = parsePriority(raw[i], "-priority"); err != nil {
+				return nil, opts, err
 			}
 		case strings.HasPrefix(arg, "-priority="):
-			priority, err = parsePriority(strings.TrimPrefix(arg, "-priority="), "-priority")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.priority, err = parsePriority(strings.TrimPrefix(arg, "-priority="), "-priority"); err != nil {
+				return nil, opts, err
 			}
 		case strings.HasPrefix(arg, "--priority="):
-			priority, err = parsePriority(strings.TrimPrefix(arg, "--priority="), "-priority")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.priority, err = parsePriority(strings.TrimPrefix(arg, "--priority="), "-priority"); err != nil {
+				return nil, opts, err
 			}
 		case arg == "-dport" || arg == "--dport":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", "", 0, 0, 0, fmt.Errorf("%s requires a numeric value (0-65535)", arg)
+				return nil, opts, fmt.Errorf("%s requires a numeric value (0-65535)", arg)
 			}
 			i++
-			port, err = parsePort(raw[i], "-dport")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.port, err = parsePort(raw[i], "-dport"); err != nil {
+				return nil, opts, err
 			}
 		case strings.HasPrefix(arg, "-dport="):
-			port, err = parsePort(strings.TrimPrefix(arg, "-dport="), "-dport")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.port, err = parsePort(strings.TrimPrefix(arg, "-dport="), "-dport"); err != nil {
+				return nil, opts, err
 			}
 		case strings.HasPrefix(arg, "--dport="):
-			port, err = parsePort(strings.TrimPrefix(arg, "--dport="), "-dport")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.port, err = parsePort(strings.TrimPrefix(arg, "--dport="), "-dport"); err != nil {
+				return nil, opts, err
 			}
 		case arg == "-sport" || arg == "--sport":
 			if i+1 >= len(raw) {
-				return nil, "", "", "", "", 0, 0, 0, fmt.Errorf("%s requires a numeric value (0-65535)", arg)
+				return nil, opts, fmt.Errorf("%s requires a numeric value (0-65535)", arg)
 			}
 			i++
-			sport, err = parsePort(raw[i], "-sport")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.sport, err = parsePort(raw[i], "-sport"); err != nil {
+				return nil, opts, err
 			}
 		case strings.HasPrefix(arg, "-sport="):
-			sport, err = parsePort(strings.TrimPrefix(arg, "-sport="), "-sport")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.sport, err = parsePort(strings.TrimPrefix(arg, "-sport="), "-sport"); err != nil {
+				return nil, opts, err
 			}
 		case strings.HasPrefix(arg, "--sport="):
-			sport, err = parsePort(strings.TrimPrefix(arg, "--sport="), "-sport")
-			if err != nil {
-				return nil, "", "", "", "", 0, 0, 0, err
+			if opts.sport, err = parsePort(strings.TrimPrefix(arg, "--sport="), "-sport"); err != nil {
+				return nil, opts, err
 			}
 		case strings.HasPrefix(arg, "-"):
-			return nil, "", "", "", "", 0, 0, 0, fmt.Errorf("unknown option %q", arg)
+			return nil, opts, fmt.Errorf("unknown option %q", arg)
 		default:
 			args = append(args, arg)
 		}
 	}
 
-	return args, sockPath, protocol, action, direction, port, sport, priority, nil
+	return args, opts, nil
 }
 
 // parseDirection validates a -dir value.

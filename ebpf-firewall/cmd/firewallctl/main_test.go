@@ -13,7 +13,7 @@ import (
 )
 
 func TestExtractOptions_FlagsAfterCommand(t *testing.T) {
-	args, sock, proto, action, dir, port, sport, priority, err := extractOptions(
+	args, opts, err := extractOptions(
 		[]string{"block", "10.153.245.175", "--protocol", "tcp", "--dport", "22", "--sport", "50000", "--action", "pass", "--priority", "100"},
 	)
 	if err != nil {
@@ -22,25 +22,25 @@ func TestExtractOptions_FlagsAfterCommand(t *testing.T) {
 	if !reflect.DeepEqual(args, []string{"block", "10.153.245.175"}) {
 		t.Errorf("args = %v, want [block 10.153.245.175]", args)
 	}
-	if sock != "/var/run/ebpf-firewall.sock" {
-		t.Errorf("sock = %q, want default", sock)
+	if opts.sockPath != "/var/run/ebpf-firewall.sock" {
+		t.Errorf("sock = %q, want default", opts.sockPath)
 	}
-	if proto != "tcp" || port != 22 || sport != 50000 {
-		t.Errorf("proto=%q port=%d sport=%d, want tcp 22 50000", proto, port, sport)
+	if opts.protocol != "tcp" || opts.port != 22 || opts.sport != 50000 {
+		t.Errorf("proto=%q port=%d sport=%d, want tcp 22 50000", opts.protocol, opts.port, opts.sport)
 	}
-	if action != "pass" {
-		t.Errorf("action = %q, want pass", action)
+	if opts.action != "pass" {
+		t.Errorf("action = %q, want pass", opts.action)
 	}
-	if priority != 100 {
-		t.Errorf("priority = %d, want 100", priority)
+	if opts.priority != 100 {
+		t.Errorf("priority = %d, want 100", opts.priority)
 	}
-	if dir != "" {
-		t.Errorf("dir = %q, want empty", dir)
+	if opts.direction != "" {
+		t.Errorf("dir = %q, want empty", opts.direction)
 	}
 }
 
 func TestExtractOptions_FlagsBeforeCommand(t *testing.T) {
-	args, _, proto, action, _, port, sport, _, err := extractOptions(
+	args, opts, err := extractOptions(
 		[]string{"-protocol", "udp", "-dport", "53", "-sport", "1234", "block", "1.2.3.4"},
 	)
 	if err != nil {
@@ -49,16 +49,16 @@ func TestExtractOptions_FlagsBeforeCommand(t *testing.T) {
 	if !reflect.DeepEqual(args, []string{"block", "1.2.3.4"}) {
 		t.Errorf("args = %v", args)
 	}
-	if proto != "udp" || port != 53 || sport != 1234 {
-		t.Errorf("proto=%q port=%d sport=%d, want udp 53 1234", proto, port, sport)
+	if opts.protocol != "udp" || opts.port != 53 || opts.sport != 1234 {
+		t.Errorf("proto=%q port=%d sport=%d, want udp 53 1234", opts.protocol, opts.port, opts.sport)
 	}
-	if action != "" {
-		t.Errorf("action = %q, want empty", action)
+	if opts.action != "" {
+		t.Errorf("action = %q, want empty", opts.action)
 	}
 }
 
 func TestExtractOptions_EqualsForms(t *testing.T) {
-	args, sock, proto, action, _, port, sport, priority, err := extractOptions(
+	args, opts, err := extractOptions(
 		[]string{"block", "1.2.3.4", "--protocol=tcp", "--dport=8080", "--sport=40000", "--action=drop", "-sock=/tmp/fw.sock", "--priority=42"},
 	)
 	if err != nil {
@@ -67,17 +67,17 @@ func TestExtractOptions_EqualsForms(t *testing.T) {
 	if !reflect.DeepEqual(args, []string{"block", "1.2.3.4"}) {
 		t.Errorf("args = %v", args)
 	}
-	if sock != "/tmp/fw.sock" {
-		t.Errorf("sock = %q, want /tmp/fw.sock", sock)
+	if opts.sockPath != "/tmp/fw.sock" {
+		t.Errorf("sock = %q, want /tmp/fw.sock", opts.sockPath)
 	}
-	if proto != "tcp" || port != 8080 || sport != 40000 {
-		t.Errorf("proto=%q port=%d sport=%d, want tcp 8080 40000", proto, port, sport)
+	if opts.protocol != "tcp" || opts.port != 8080 || opts.sport != 40000 {
+		t.Errorf("proto=%q port=%d sport=%d, want tcp 8080 40000", opts.protocol, opts.port, opts.sport)
 	}
-	if action != "drop" {
-		t.Errorf("action = %q, want drop", action)
+	if opts.action != "drop" {
+		t.Errorf("action = %q, want drop", opts.action)
 	}
-	if priority != 42 {
-		t.Errorf("priority = %d, want 42", priority)
+	if opts.priority != 42 {
+		t.Errorf("priority = %d, want 42", opts.priority)
 	}
 }
 
@@ -91,12 +91,12 @@ func TestExtractOptions_Direction(t *testing.T) {
 		{[]string{"list", "--dir", "in"}, "in"},
 		{[]string{"clear", "-dir", "out"}, "out"},
 	} {
-		_, _, _, _, dir, _, _, _, err := extractOptions(tc.raw)
+		_, opts, err := extractOptions(tc.raw)
 		if err != nil {
 			t.Fatalf("extractOptions(%v): %v", tc.raw, err)
 		}
-		if dir != tc.want {
-			t.Errorf("extractOptions(%v) dir = %q, want %q", tc.raw, dir, tc.want)
+		if opts.direction != tc.want {
+			t.Errorf("extractOptions(%v) dir = %q, want %q", tc.raw, opts.direction, tc.want)
 		}
 	}
 
@@ -106,22 +106,22 @@ func TestExtractOptions_Direction(t *testing.T) {
 		{"block", "1.2.3.4", "--dir"},
 		{"block", "1.2.3.4", "--dir="},
 	} {
-		if _, _, _, _, _, _, _, _, err := extractOptions(raw); err == nil {
+		if _, _, err := extractOptions(raw); err == nil {
 			t.Errorf("extractOptions(%v): expected error, got nil", raw)
 		}
 	}
 }
 
 func TestExtractOptions_PlainCommand(t *testing.T) {
-	args, _, proto, action, _, port, sport, _, err := extractOptions([]string{"listports"})
+	args, opts, err := extractOptions([]string{"listports"})
 	if err != nil {
 		t.Fatalf("extractOptions: %v", err)
 	}
 	if !reflect.DeepEqual(args, []string{"listports"}) {
 		t.Errorf("args = %v", args)
 	}
-	if proto != "" || port != 0 || sport != 0 || action != "" {
-		t.Errorf("proto=%q port=%d sport=%d action=%q, want empty/0", proto, port, sport, action)
+	if opts.protocol != "" || opts.port != 0 || opts.sport != 0 || opts.action != "" {
+		t.Errorf("proto=%q port=%d sport=%d action=%q, want empty/0", opts.protocol, opts.port, opts.sport, opts.action)
 	}
 }
 
@@ -140,7 +140,7 @@ func TestExtractOptions_Errors(t *testing.T) {
 		{"block", "1.2.3.4", "--bogus"},                  // unknown option
 	}
 	for _, raw := range tests {
-		if _, _, _, _, _, _, _, _, err := extractOptions(raw); err == nil {
+		if _, _, err := extractOptions(raw); err == nil {
 			t.Errorf("extractOptions(%v): expected error, got nil", raw)
 		}
 	}

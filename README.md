@@ -244,28 +244,32 @@ Unix socket  ─────────  control plane (Go)
 ### Structure (current)
 
 ```text
-ebpf-firewall/
+ebpf-network-controls/
 │
-├── bpf/                 # eBPF C programs (dataplane)
-│   ├── firewall.c
-│   ├── helpers.h        # packet parsing helpers
-│   ├── maps.h           # BPF map definitions
-│   └── vmlinux.h        # GENERATED – do not edit
+├── INSTALLATION.md        # environment setup (packages, toolchain)
+├── README.md
 │
-├── control/
-│   ├── api/             # read-only HTTP stats API
-│   ├── ebpf/            # map managers, XDP + TC(TCX) lifecycle, generated bindings
-│   │   └── firewall_bpf.go   # GENERATED – do not edit
-│   ├── rules/           # rule/IP parsing
-│   └── server/          # Unix socket control API
-│
-├── cmd/
-│   ├── firewall/        # daemon entry point
-│   └── firewallctl/     # CLI client
-│
-├── scripts/             # build / vmlinux generation helpers
-├── INSTALLATION.md
-└── TODO.md              # milestone roadmap (MTP1 / MTP2)
+└── ebpf-firewall/
+    │
+    ├── bpf/                 # eBPF C programs (dataplane)
+    │   ├── firewall.c
+    │   ├── helpers.h        # packet parsing helpers
+    │   ├── maps.h           # BPF map definitions
+    │   └── vmlinux.h        # GENERATED – do not edit
+    │
+    ├── control/
+    │   ├── api/             # read-only HTTP stats API
+    │   ├── ebpf/            # rule tables, XDP + TC(TCX) lifecycle, generated bindings
+    │   │   └── firewall_bpf.go   # GENERATED – do not edit
+    │   ├── rules/           # rule/IP parsing
+    │   └── server/          # Unix socket control API
+    │
+    ├── cmd/
+    │   ├── firewall/        # daemon entry point
+    │   └── firewallctl/     # CLI client
+    │
+    ├── scripts/             # build / vmlinux generation helpers
+    └── TODO.md              # milestone roadmap (MTP1 / MTP2)
 ```
 
 ---
