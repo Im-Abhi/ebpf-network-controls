@@ -62,12 +62,51 @@ cleanup() {
     ip link del "$V0" 2>/dev/null
     iptables -D INPUT -i "$V0" -j ACCEPT 2>/dev/null
     rm -f "$SOCK"
+    # Keep the artifacts (daemon log, server output, client transcripts) when a
+    # check failed — a suite that deletes its own evidence turns a single red
+    # run into an afternoon of guesswork. Remove the sandbox dir only on
+    # success, or when this run never got as far as starting the daemon.
+    if [ "${SUCCEEDED:-0}" = 1 ] || [ ! -f "$LOG" ]; then
+        rm -rf "$DIR"
+    else
+        echo "--- artifacts kept in $DIR (daemon log: $LOG) ---"
+    fi
     echo "--- cleanup done ---"
 }
-trap 'cleanup; rm -rf "$DIR"' EXIT
+trap cleanup EXIT
 
 # ---- bring up the sandbox --------------------------------------------------
 cleanup
+
+# ---- preflight: fail fast on a polluted environment -------------------------
+# Orphan daemons/servers, a stale socket or an occupied port from an earlier
+# aborted run change the verdicts in confusing ways (a surviving echo server
+# on $PORT makes every "should be denied" check pass trivially, and a stale
+# socket makes every control command reach the wrong daemon). Refuse to start
+# rather than produce a page of red herrings.
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    echo "PREFLIGHT FAIL: run as root (sudo bash integration/fw-smoke.sh)"
+    exit 1
+fi
+if pgrep -f "bin/firewall" >/dev/null 2>&1; then
+    echo "PREFLIGHT FAIL: an eBPF firewall daemon is already running:"
+    pgrep -af "bin/firewall"
+    exit 1
+fi
+if pgrep -f "smoke.py" >/dev/null 2>&1; then
+    echo "PREFLIGHT FAIL: a smoke server is already running:"
+    pgrep -af "smoke.py"
+    exit 1
+fi
+if [ -e "$SOCK" ]; then
+    echo "PREFLIGHT FAIL: stale control socket $SOCK exists; remove it or kill its daemon"
+    exit 1
+fi
+if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
+    echo "PREFLIGHT FAIL: TCP port $PORT is already in use"
+    exit 1
+fi
+
 set -e
 ip netns add "$NS_NAME"
 ip link add "$V0" type veth peer name "$V1"
@@ -291,5 +330,10 @@ fi
 echo
 echo "================ SUMMARY ================"
 echo "PASS: $pass  FAIL: $fail"
-[ "$fail" -eq 0 ] && echo "ALL SMOKE CHECKS PASSED" || echo "SOME CHECKS FAILED"
-exit "$([ "$fail" -eq 0 ] && echo 0 || echo 1)"
+if [ "$fail" -eq 0 ]; then
+    SUCCEEDED=1
+    echo "ALL SMOKE CHECKS PASSED"
+    exit 0
+fi
+echo "SOME CHECKS FAILED"
+exit 1
