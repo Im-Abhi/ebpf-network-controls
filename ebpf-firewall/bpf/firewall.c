@@ -725,7 +725,16 @@ static __always_inline void count_egress(int verdict, __u64 bytes) {
  *     with a loaded blocklist.
  * Known gaps: a ClientHello split across TCP segments, raw-IP TLS,
  * QUIC/HTTP-3 (UDP), ECH-encrypted SNI — those connections fall through
- * to the ordinary rule/default path.
+ * to the ordinary rule/default path. Non-linear skbs: direct
+ * data/data_end access covers only the skb's linear area, so a
+ * ClientHello extending into paged fragments aborts cleanly and fails
+ * open (same observable behavior as the split case; never a false
+ * drop). Exposure is small — a ClientHello is the first stream byte and
+ * rides in its own small linear skb. v2 upgrade path:
+ * bpf_skb_pull_data(skb, hs_len + 9) gated on skb->gso_size == 0 and a
+ * size cap, then re-load data/data_end and re-run the stage.
+ * bpf_skb_load_bytes() is not viable — the copy needs a stack buffer and
+ * the BPF stack is capped at 512 bytes total.
  */
 
 /* Minimal byte reader over the TCP payload. Every accessor proves the read
@@ -822,8 +831,10 @@ static __always_inline int domain_block_action(const __u8 *name, __u32 len) {
 /* Extract the server_name (SNI) from a TLS ClientHello carried whole in
  * this segment. Returns 1 and sets (*out, *out_len) to the name inside the
  * packet; 0 when anything is malformed, truncated, or simply not a
- * ClientHello. Fixed signposts + a bounded extension loop; never crosses
- * the payload end. */
+ * ClientHello. Every level of the walk is bounded by the protocol's own
+ * declared lengths (record body, handshake body, extension block, name
+ * list) on top of the packet bound, so bytes outside a declared structure
+ * are never interpreted as part of it. */
 static __always_inline int tls_sni_extract(const __u8 *pl, __u32 plen,
                                            const __u8 **out, __u32 *out_len) {
     struct bcur c = { pl, plen };
@@ -837,6 +848,13 @@ static __always_inline int tls_sni_extract(const __u8 *pl, __u32 plen,
         return 0;
     if (!bcur_take16(&c, &rec_len) || rec_len < 4)
         return 0;
+    /* Bound what follows to the record's declared body: bytes beyond
+     * rec_len belong to another record and must never be parsed as part
+     * of this handshake. A record claiming more than the packet carries
+     * is left alone; the handshake-length check below rejects the
+     * split-ClientHello case. */
+    if (rec_len < c.left)
+        c.left = rec_len;
     if (!bcur_take8(&c, &hs_type) || hs_type != 0x01)    /* ClientHello */
         return 0;
     if (!bcur_take24(&c, &hs_len))
@@ -845,6 +863,8 @@ static __always_inline int tls_sni_extract(const __u8 *pl, __u32 plen,
      * across TCP segments gets no verdict (documented gap). */
     if (hs_len > c.left)
         return 0;
+    if (hs_len < c.left)                                 /* bound to the   */
+        c.left = hs_len;                                 /* handshake body */
     if (!bcur_take16(&c, &ver))                          /* client version */
         return 0;
     if (!bcur_skip(&c, 32))                              /* random */
@@ -855,9 +875,11 @@ static __always_inline int tls_sni_extract(const __u8 *pl, __u32 plen,
         return 0;
     if (!bcur_take8(&c, &comp_len) || !bcur_skip(&c, comp_len))
         return 0;
-    if (!bcur_take16(&c, &ext_len))
+    if (!bcur_take16(&c, &ext_len) || ext_len > c.left)  /* ext block must
+                                                            end the body */
         return 0;
-
+    c.left = ext_len;                                    /* walk ends where the
+                                                            extension block ends */
     for (ext_i = 0; ext_i < 32; ext_i++) {
         __u16 et, el;
         if (!bcur_take16(&c, &et) || !bcur_take16(&c, &el))
@@ -869,6 +891,11 @@ static __always_inline int tls_sni_extract(const __u8 *pl, __u32 plen,
             __u16 list_len, nl;
             __u8 name_type;
             if (!bcur_take16(&e, &list_len))
+                return 0;
+            /* the name list must fill the extension exactly (single
+             * HostName entry, as every real client encodes it) — this
+             * also pins the name inside the declared list */
+            if (list_len != el - 2)
                 return 0;
             if (!bcur_take8(&e, &name_type) || name_type != 0)
                 return 0;
