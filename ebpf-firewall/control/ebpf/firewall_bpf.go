@@ -35,6 +35,11 @@ type firewallCtValue struct {
 	Pad      uint32
 }
 
+type firewallDomainKey struct {
+	_    structs.HostLayout
+	Name [64]int8
+}
+
 type firewallIpv4LpmKey struct {
 	_         structs.HostLayout
 	Prefixlen uint32
@@ -64,6 +69,7 @@ const (
 	firewallMapBlockedIps        = "blocked_ips"
 	firewallMapConntrack         = "conntrack"
 	firewallMapCounters          = "counters"
+	firewallMapDomainBlocklist   = "domain_blocklist"
 	firewallMapEgressBlockedIps  = "egress_blocked_ips"
 	firewallMapEgressConfig      = "egress_config"
 	firewallMapEgressPortPolicy  = "egress_port_policy"
@@ -127,6 +133,7 @@ type firewallMapSpecs struct {
 	BlockedIps       *ebpf.MapSpec `ebpf:"blocked_ips"`
 	Conntrack        *ebpf.MapSpec `ebpf:"conntrack"`
 	Counters         *ebpf.MapSpec `ebpf:"counters"`
+	DomainBlocklist  *ebpf.MapSpec `ebpf:"domain_blocklist"`
 	EgressBlockedIps *ebpf.MapSpec `ebpf:"egress_blocked_ips"`
 	EgressConfig     *ebpf.MapSpec `ebpf:"egress_config"`
 	EgressPortPolicy *ebpf.MapSpec `ebpf:"egress_port_policy"`
@@ -164,6 +171,7 @@ type firewallMaps struct {
 	BlockedIps       *ebpf.Map `ebpf:"blocked_ips"`
 	Conntrack        *ebpf.Map `ebpf:"conntrack"`
 	Counters         *ebpf.Map `ebpf:"counters"`
+	DomainBlocklist  *ebpf.Map `ebpf:"domain_blocklist"`
 	EgressBlockedIps *ebpf.Map `ebpf:"egress_blocked_ips"`
 	EgressConfig     *ebpf.Map `ebpf:"egress_config"`
 	EgressPortPolicy *ebpf.Map `ebpf:"egress_port_policy"`
@@ -177,6 +185,7 @@ func (m *firewallMaps) Close() error {
 		m.BlockedIps,
 		m.Conntrack,
 		m.Counters,
+		m.DomainBlocklist,
 		m.EgressBlockedIps,
 		m.EgressConfig,
 		m.EgressPortPolicy,

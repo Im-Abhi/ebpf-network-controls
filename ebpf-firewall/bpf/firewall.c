@@ -684,7 +684,8 @@ static __always_inline void ct_update_egress(const struct packet_info *info) {
     bpf_map_update_elem(&conntrack, &rev, &nv, BPF_ANY);
 }
 
-/* Egress counter increment (indices 3-5; ingress keeps 0-2). */
+/* Egress counter increment (indices 3-6; ingress keeps 0-2). Index 6 is
+ * the domain-drop tally, a subset of the generic egress drop count. */
 static __always_inline void incr_egress_counter(__u32 idx, __u64 bytes) {
     struct counter_value *val = bpf_map_lookup_elem(&counters, &idx);
     if (val) {
@@ -701,6 +702,274 @@ static __always_inline void count_egress(int verdict, __u64 bytes) {
         incr_egress_counter(COUNTER_EGRESS_TOTAL, bytes);
         incr_egress_counter(COUNTER_EGRESS_PASS, bytes);
     }
+}
+
+/* ══ Domain blocklist (URL filtering) — egress only ════════════════════
+ * Third policy surface: hostname rules, loaded from a blocklist file by
+ * the daemon into domain_blocklist (see maps.h). A destination name
+ * appears in cleartext on the wire exactly once per connection — the TLS
+ * ClientHello's server_name (SNI) extension on port 443, or the HTTP
+ * Host header on port 80 — and this stage extracts it and probes the map.
+ *
+ * Scope decisions (all deliberate):
+ *   - Egress only: the stage lives in firewall_tc_egress; the XDP
+ *     (ingress) datapath is untouched.
+ *   - A hit is an unconditional DROP that precedes the rule/default
+ *     decision: the blocklist is an explicit deny, not a priority
+ *     participant.
+ *   - Suffix probing: the full name is probed first, then its parent
+ *     labels (cdn.badsite.com -> badsite.com), so one entry covers a
+ *     whole domain tree.
+ *   - The gate (presence bit + TCP + port 443/80 + payload + !SYN) keeps
+ *     the per-packet cost at zero unless web-bound traffic is on the wire
+ *     with a loaded blocklist.
+ * Known gaps: a ClientHello split across TCP segments, raw-IP TLS,
+ * QUIC/HTTP-3 (UDP), ECH-encrypted SNI — those connections fall through
+ * to the ordinary rule/default path.
+ */
+
+/* Minimal byte reader over the TCP payload. Every accessor proves the read
+ * against `left` before touching memory, which keeps the verifier's bounds
+ * reasoning linear. */
+struct bcur {
+    const __u8 *p;
+    __u32 left;
+};
+
+static __always_inline int bcur_take8(struct bcur *c, __u8 *out) {
+    if (c->left < 1)
+        return 0;
+    *out = *c->p;
+    c->p++;
+    c->left--;
+    return 1;
+}
+
+static __always_inline int bcur_take16(struct bcur *c, __u16 *out) {
+    if (c->left < 2)
+        return 0;
+    *out = ((__u16)c->p[0] << 8) | (__u16)c->p[1];
+    c->p += 2;
+    c->left -= 2;
+    return 1;
+}
+
+static __always_inline int bcur_take24(struct bcur *c, __u32 *out) {
+    if (c->left < 3)
+        return 0;
+    *out = ((__u32)c->p[0] << 16) | ((__u32)c->p[1] << 8) | (__u32)c->p[2];
+    c->p += 3;
+    c->left -= 3;
+    return 1;
+}
+
+static __always_inline int bcur_skip(struct bcur *c, __u32 n) {
+    if (c->left < n)
+        return 0;
+    c->p += n;
+    c->left -= n;
+    return 1;
+}
+
+/* Probe domain_blocklist for `name` (a packet-pointer hostname of `len`
+ * bytes) and, on a miss, its parent suffixes. Lowercasing happens here so
+ * a ClientHello with unusual case still matches the loader's normalized
+ * entries. Returns 1 on a hit. */
+#define DOMAIN_MAX_PROBES 6
+#define DOMAIN_NAME_MAX   63   /* domain_key.name holds 64 with padding */
+
+static __always_inline int domain_block_action(const __u8 *name, __u32 len) {
+    struct domain_key key;
+    __u32 start = 0;
+    __u32 probe;
+
+    if (len == 0)
+        return 0;
+    if (len > DOMAIN_NAME_MAX)
+        len = DOMAIN_NAME_MAX;   /* same truncation contract as the loader */
+
+    for (probe = 0; probe < DOMAIN_MAX_PROBES; probe++) {
+        __u32 sub = len - start;
+        __u32 i;
+
+        if (sub == 0)
+            break;
+        __builtin_memset(&key, 0, sizeof(key));
+        for (i = 0; i < sub; i++) {
+            __u8 ch = name[start + i];
+            if (ch >= 'A' && ch <= 'Z')
+                ch += 32;
+            key.name[i] = ch;
+        }
+        if (bpf_map_lookup_elem(&domain_blocklist, &key))
+            return 1;
+
+        /* Advance `start` past the next dot to the next parent suffix. */
+        {
+            __u32 dot = start;
+            for (; dot < len && dot < DOMAIN_NAME_MAX; dot++) {
+                if (name[dot] == '.')
+                    break;
+            }
+            if (dot >= len || dot >= DOMAIN_NAME_MAX)
+                break;
+            start = dot + 1;
+        }
+    }
+    return 0;
+}
+
+/* Extract the server_name (SNI) from a TLS ClientHello carried whole in
+ * this segment. Returns 1 and sets (*out, *out_len) to the name inside the
+ * packet; 0 when anything is malformed, truncated, or simply not a
+ * ClientHello. Fixed signposts + a bounded extension loop; never crosses
+ * the payload end. */
+static __always_inline int tls_sni_extract(const __u8 *pl, __u32 plen,
+                                           const __u8 **out, __u32 *out_len) {
+    struct bcur c = { pl, plen };
+    __u8 content, hs_type, sid_len, comp_len;
+    __u16 ver, rec_len, cs_len, ext_len, ext_i;
+    __u32 hs_len;
+
+    if (!bcur_take8(&c, &content) || content != 0x16)   /* handshake record */
+        return 0;
+    if (!bcur_take16(&c, &ver))                          /* record version */
+        return 0;
+    if (!bcur_take16(&c, &rec_len) || rec_len < 4)
+        return 0;
+    if (!bcur_take8(&c, &hs_type) || hs_type != 0x01)    /* ClientHello */
+        return 0;
+    if (!bcur_take24(&c, &hs_len))
+        return 0;
+    /* The ClientHello must be whole in this segment; a handshake split
+     * across TCP segments gets no verdict (documented gap). */
+    if (hs_len > c.left)
+        return 0;
+    if (!bcur_take16(&c, &ver))                          /* client version */
+        return 0;
+    if (!bcur_skip(&c, 32))                              /* random */
+        return 0;
+    if (!bcur_take8(&c, &sid_len) || !bcur_skip(&c, sid_len))
+        return 0;
+    if (!bcur_take16(&c, &cs_len) || !bcur_skip(&c, cs_len))
+        return 0;
+    if (!bcur_take8(&c, &comp_len) || !bcur_skip(&c, comp_len))
+        return 0;
+    if (!bcur_take16(&c, &ext_len))
+        return 0;
+
+    for (ext_i = 0; ext_i < 32; ext_i++) {
+        __u16 et, el;
+        if (!bcur_take16(&c, &et) || !bcur_take16(&c, &el))
+            return 0;
+        if (el > c.left)
+            return 0;
+        if (et == 0x0000) {                              /* server_name */
+            struct bcur e = { c.p, el };
+            __u16 list_len, nl;
+            __u8 name_type;
+            if (!bcur_take16(&e, &list_len))
+                return 0;
+            if (!bcur_take8(&e, &name_type) || name_type != 0)
+                return 0;
+            if (!bcur_take16(&e, &nl) || nl == 0 || nl > e.left)
+                return 0;
+            *out = e.p;
+            *out_len = nl;
+            return 1;
+        }
+        if (!bcur_skip(&c, el))
+            return 0;
+    }
+    return 0;
+}
+
+/* Extract the Host header value from an outbound HTTP/1.x request: a
+ * bounded scan of the first HTTP_HOST_SCAN_MAX bytes for a line starting
+ * with "Host:" (case-insensitive, preceded by a newline or at offset 0).
+ * Strips any :port suffix and one trailing dot. */
+#define HTTP_HOST_SCAN_MAX 512
+
+static __always_inline int http_host_extract(const __u8 *pl, __u32 plen,
+                                             const __u8 **out, __u32 *out_len) {
+    __u32 scan = plen < HTTP_HOST_SCAN_MAX ? plen : HTTP_HOST_SCAN_MAX;
+    __u32 i;
+
+    for (i = 0; i < scan; i++) {
+        __u32 vstart, vend, k;
+
+        if (i + 5 > plen)
+            break;
+        if (i != 0 && pl[i - 1] != '\n')
+            continue;                                    /* not a line start */
+        if ((pl[i] | 32) != 'h' || (pl[i + 1] | 32) != 'o' ||
+            (pl[i + 2] | 32) != 's' || (pl[i + 3] | 32) != 't' ||
+            pl[i + 4] != ':')
+            continue;
+
+        vstart = i + 5;                                  /* skip spaces/tabs */
+        for (k = 0; k < 16; k++) {
+            __u32 idx = vstart + k;
+            if (idx >= plen || (pl[idx] != ' ' && pl[idx] != '\t'))
+                break;
+        }
+        vstart += k;
+
+        vend = vstart;                                   /* read to end of line */
+        for (k = 0; k < DOMAIN_NAME_MAX + 8; k++) {
+            __u32 idx = vstart + k;
+            if (idx >= plen || pl[idx] == '\r' || pl[idx] == '\n')
+                break;
+            vend = idx + 1;
+        }
+
+        for (k = 0; k < DOMAIN_NAME_MAX + 8 && vstart + k < vend; k++) {
+            if (pl[vstart + k] == ':') {                 /* strip :port */
+                vend = vstart + k;
+                break;
+            }
+        }
+        if (vend == vstart)
+            continue;
+        if (pl[vend - 1] == '.' && vend - vstart > 1)
+            vend--;                                      /* strip trailing dot */
+
+        *out = pl + vstart;
+        *out_len = vend - vstart;
+        return 1;
+    }
+    return 0;
+}
+
+/* Payload bounds for an outbound TCP packet. parse_packet stops its cursor
+ * right after the fixed 20-byte TCP header (it is shared with the XDP
+ * datapath and must not change), so this re-walks L2/L3 locally and uses
+ * the header's real data offset to find the first payload byte. Returns 1
+ * with (*pl, *plen) set, 0 when there is no payload. */
+static __always_inline int domain_tcp_payload(void *data, void *data_end,
+                                              const __u8 **pl, __u32 *plen) {
+    struct hdr_cursor c = { data };
+    struct ethhdr *eth;
+    struct iphdr *ip;
+    struct tcphdr *tcp;
+    __u32 hlen;
+
+    if (parse_ethhdr(&c, data_end, &eth) != bpf_htons(ETH_P_IP))
+        return 0;
+    if (parse_iphdr(&c, data_end, &ip) < 0)
+        return 0;
+    if (ip->protocol != IPPROTO_TCP)
+        return 0;
+    if (parse_tcphdr(&c, data_end, &tcp) < 0)
+        return 0;
+    hlen = (__u32)tcp->doff * 4;
+    if (hlen < sizeof(*tcp) || hlen > 60)
+        return 0;
+    if ((void *)tcp + hlen >= data_end)
+        return 0;
+    *pl = (const __u8 *)tcp + hlen;
+    *plen = (__u32)((void *)data_end - (void *)tcp - hlen);
+    return 1;
 }
 
 SEC("classifier")
@@ -740,6 +1009,35 @@ int firewall_tc_egress(struct __sk_buff *skb) {
     }
     if (flags & RULE_EGRESS_PORT_PRESENT) {
         port_matched = egress_port_rule_action(&info, &port_rule);
+    }
+
+    /* 2.5 domain blocklist (URL filtering). Only web-bound TCP traffic
+     * with payload carries a destination name; every other packet exits
+     * this stage after the presence-bit test. A hit is an unconditional
+     * DROP that precedes rules, priorities and the default policy
+     * (explicit blocklist semantics), counted separately so URL filtering
+     * is observable on its own. A dropped stream writes no conntrack
+     * state (state is only ever written after a PASS). */
+    if ((flags & RULE_DOMAIN_PRESENT) && !(info.tcp_flags & TCP_SYN)) {
+        const __u8 *pl;
+        __u32 plen;
+        const __u8 *name;
+        __u32 name_len = 0;
+        int blocked = 0;
+
+        if (domain_tcp_payload(data, data_end, &pl, &plen)) {
+            if (info.dport == bpf_htons(443))
+                blocked = tls_sni_extract(pl, plen, &name, &name_len) &&
+                          domain_block_action(name, name_len);
+            else if (info.dport == bpf_htons(80))
+                blocked = http_host_extract(pl, plen, &name, &name_len) &&
+                          domain_block_action(name, name_len);
+        }
+        if (blocked) {
+            count_egress(XDP_DROP, pkt_len);
+            incr_egress_counter(COUNTER_EGRESS_DOMAIN_DROP, pkt_len);
+            return tc_action(XDP_DROP);
+        }
     }
 
     /* 3. decision: same priority table as ingress; on no rule match the
