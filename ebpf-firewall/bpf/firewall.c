@@ -939,12 +939,16 @@ static __always_inline int tls_sni_extract(struct __sk_buff *skb, __u32 pbase,
 static __always_inline int http_host_extract(struct __sk_buff *skb, __u32 pbase,
                                              __u32 plen, __u32 *out_off, __u32 *out_len) {
     __u32 scan = plen < HTTP_HOST_SCAN_MAX ? plen : HTTP_HOST_SCAN_MAX;
-    __u32 i;
+    __u32 i, hit = 0, vstart, vend, k;
+    int found = 0;
     __u8 b;
 
+    /* Pass 1: locate the first line starting with "Host:". The value
+     * extraction is deliberately NOT nested inside this loop: the verifier
+     * explores the bounded scan for every position, and nesting the
+     * extraction walks inside it multiplies the processed-insn budget past
+     * the kernel's 1M limit. */
     for (i = 0; i < scan; i++) {
-        __u32 vstart, vend, k;
-
         if (i + 5 > plen)
             break;
         if (i != 0) {
@@ -962,54 +966,59 @@ static __always_inline int http_host_extract(struct __sk_buff *skb, __u32 pbase,
                 h[4] != ':')
                 continue;
         }
-
-        vstart = i + 5;                                  /* skip spaces/tabs */
-        for (k = 0; k < 16; k++) {
-            __u32 idx = vstart + k;
-            if (idx >= plen)
-                break;
-            if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
-                return 0;
-            if (b != ' ' && b != '\t')
-                break;
-        }
-        vstart += k;
-
-        vend = vstart;                                   /* read to end of line */
-        for (k = 0; k < DOMAIN_NAME_MAX + 8; k++) {
-            __u32 idx = vstart + k;
-            if (idx >= plen)
-                break;
-            if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
-                return 0;
-            if (b == '\r' || b == '\n')
-                break;
-            vend = idx + 1;
-        }
-
-        for (k = 0; k < DOMAIN_NAME_MAX + 8 && vstart + k < vend; k++) {
-            __u32 idx = vstart + k;
-            if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
-                return 0;
-            if (b == ':') {                              /* strip :port */
-                vend = vstart + k;
-                break;
-            }
-        }
-        if (vend == vstart)
-            continue;
-        if (vend - vstart > 1) {                         /* strip trailing dot */
-            if (bpf_skb_load_bytes(skb, pbase + vend - 1, &b, 1))
-                return 0;
-            if (b == '.')
-                vend--;
-        }
-
-        *out_off = pbase + vstart;
-        *out_len = vend - vstart;
-        return 1;
+        hit = i;
+        found = 1;
+        break;
     }
-    return 0;
+    if (!found)
+        return 0;
+
+    /* Pass 2: extract the value on the matched line (executes once). */
+    vstart = hit + 5;                                    /* skip spaces/tabs */
+    for (k = 0; k < 16; k++) {
+        __u32 idx = vstart + k;
+        if (idx >= plen)
+            break;
+        if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
+            return 0;
+        if (b != ' ' && b != '\t')
+            break;
+    }
+    vstart += k;
+
+    vend = vstart;                                       /* read to end of line */
+    for (k = 0; k < DOMAIN_NAME_MAX + 8; k++) {
+        __u32 idx = vstart + k;
+        if (idx >= plen)
+            break;
+        if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
+            return 0;
+        if (b == '\r' || b == '\n')
+            break;
+        vend = idx + 1;
+    }
+
+    for (k = 0; k < DOMAIN_NAME_MAX + 8 && vstart + k < vend; k++) {
+        __u32 idx = vstart + k;
+        if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
+            return 0;
+        if (b == ':') {                                  /* strip :port */
+            vend = vstart + k;
+            break;
+        }
+    }
+    if (vend == vstart)
+        return 0;
+    if (vend - vstart > 1) {                             /* strip trailing dot */
+        if (bpf_skb_load_bytes(skb, pbase + vend - 1, &b, 1))
+            return 0;
+        if (b == '.')
+            vend--;
+    }
+
+    *out_off = pbase + vstart;
+    *out_len = vend - vstart;
+    return 1;
 }
 
 /* Payload position for an outbound TCP packet. parse_packet stops its cursor
