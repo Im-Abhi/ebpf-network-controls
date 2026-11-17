@@ -143,6 +143,12 @@ func (x *XDPProgram) EgressPortPolicy() *ebpf.Map {
 	return x.objs.EgressPortPolicy
 }
 
+// DomainBlocklist returns the eBPF map holding the hostname blocklist
+// (URL filtering; consumed only by the TC egress datapath).
+func (x *XDPProgram) DomainBlocklist() *ebpf.Map {
+	return x.objs.DomainBlocklist
+}
+
 // Config returns the eBPF map holding the default policy configuration.
 func (x *XDPProgram) Config() *ebpf.Map {
 	return x.objs.FirewallConfig

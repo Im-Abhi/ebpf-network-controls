@@ -7,17 +7,18 @@ import (
 )
 
 // Rule-presence bits mirroring bpf/maps.h (RULE_IP_PRESENT, RULE_PORT_PRESENT,
-// RULE_EGRESS_IP_PRESENT, RULE_EGRESS_PORT_PRESENT). The datapaths skip the
-// lookups while the matching bit is clear, because an empty map can only miss.
-// Managers keep the bits conservative (set before the first insert, cleared
-// only after the last delete) so a live rule is never bypassed. The ingress
-// managers only touch bits 0-1 and the egress managers only bits 2-3, keeping
-// the two hooks independent.
+// RULE_EGRESS_IP_PRESENT, RULE_EGRESS_PORT_PRESENT, RULE_DOMAIN_PRESENT).
+// The datapaths skip the lookups while the matching bit is clear, because an
+// empty map can only miss. Managers keep the bits conservative (set before
+// the first insert, cleared only after the last delete) so a live rule is
+// never bypassed. The ingress managers only touch bits 0-1 and the egress
+// managers only bits 2-4, keeping the two hooks independent.
 const (
 	rulePresenceIP         uint32 = 1 << 0
 	rulePresencePort       uint32 = 1 << 1
 	rulePresenceEgressIP   uint32 = 1 << 2
 	rulePresenceEgressPort uint32 = 1 << 3
+	rulePresenceDomain     uint32 = 1 << 4
 )
 
 // presenceMapKey is entry 0 of the single-entry rule_presence array map.
@@ -46,7 +47,7 @@ func clearPresenceBit(presence *ebpf.Map, bit uint32) error {
 	if err := presence.Lookup(presenceMapKey, &flags); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		return err
 	}
-	return presence.Put(presenceMapKey, flags &^ bit)
+	return presence.Put(presenceMapKey, flags&^bit)
 }
 
 // mapHasEntries reports whether the given map contains at least one entry,

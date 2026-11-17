@@ -286,6 +286,150 @@ func (t portTable) syncPresence() error {
 	return clearPresenceBit(t.presence, t.bit)
 }
 
+// domainTable is the hostname blocklist (URL filtering): a hash map keyed
+// by the name itself. It is consumed only by the TC egress datapath
+// (tls_sni_extract / http_host_extract in bpf/firewall.c), and every entry
+// carries ACTION_DROP — the blocklist is an explicit deny, not a priority
+// participant.
+//
+// Key normalization lives here so every writer (the file loader today, a
+// CLI command later) produces byte-identical keys to the datapath's
+// probes: lowercase, truncated to the kernel's 63-byte contract
+// (DOMAIN_NAME_MAX in bpf/firewall.c), zero-padded by the marshaller.
+type domainTable struct {
+	m        *ebpf.Map
+	presence *ebpf.Map
+	bit      uint32
+}
+
+// newDomainTable wraps one hostname-blocklist hash map. presence may be
+// nil, which disables the fast-path flag maintenance (used by standalone
+// test maps).
+func newDomainTable(m, presence *ebpf.Map, bit uint32) domainTable {
+	return domainTable{m: m, presence: presence, bit: bit}
+}
+
+// domainNameMax must match DOMAIN_NAME_MAX in bpf/firewall.c: longer names
+// are truncated identically on both sides of the map.
+const domainNameMax = 63
+
+// domainKeyOf normalizes a hostname into the map key.
+func domainKeyOf(name string) (firewallDomainKey, error) {
+	var key firewallDomainKey
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return key, fmt.Errorf("empty domain name")
+	}
+	if len(name) > domainNameMax {
+		name = name[:domainNameMax] // same truncation contract as the datapath
+	}
+	for i := 0; i < len(name); i++ {
+		key.Name[i] = int8(name[i])
+	}
+	return key, nil
+}
+
+// Add inserts a hostname with the blocklist's fixed verdict (DROP).
+func (t domainTable) Add(name string) error {
+	key, err := domainKeyOf(name)
+	if err != nil {
+		return err
+	}
+	// Advertise before inserting (same ordering contract as cidrTable).
+	if err := setPresenceBit(t.presence, t.bit); err != nil {
+		return err
+	}
+	return t.m.Put(key, ruleValue{Action: uint32(ActionDrop)})
+}
+
+// Remove deletes a hostname from the table.
+func (t domainTable) Remove(name string) error {
+	key, err := domainKeyOf(name)
+	if err != nil {
+		return err
+	}
+	if err := t.m.Delete(key); err != nil {
+		return err
+	}
+	return t.syncPresence()
+}
+
+// Contains reports whether the hostname is on the blocklist.
+func (t domainTable) Contains(name string) (bool, error) {
+	key, err := domainKeyOf(name)
+	if err != nil {
+		return false, err
+	}
+	var value ruleValue
+	err = t.m.Lookup(key, &value)
+	if err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// List returns all blocklisted hostnames.
+func (t domainTable) List() ([]string, error) {
+	names := make([]string, 0, 8)
+	var (
+		key   firewallDomainKey
+		value ruleValue
+	)
+	iter := t.m.Iterate()
+	for iter.Next(&key, &value) {
+		name := make([]byte, 0, domainNameMax)
+		for _, b := range key.Name {
+			if b == 0 {
+				break
+			}
+			name = append(name, byte(b))
+		}
+		names = append(names, string(name))
+	}
+	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
+// Clear removes every hostname from the table (snapshot-first; see
+// cidrTable).
+func (t domainTable) Clear() error {
+	var (
+		keys  []firewallDomainKey
+		key   firewallDomainKey
+		value ruleValue
+	)
+	iter := t.m.Iterate()
+	for iter.Next(&key, &value) {
+		keys = append(keys, key)
+	}
+	if err := iter.Err(); err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if err := t.m.Delete(k); err != nil {
+			return err
+		}
+	}
+	return t.syncPresence()
+}
+
+// syncPresence makes the table's presence bit match reality.
+func (t domainTable) syncPresence() error {
+	has, err := mapHasEntries(t.m)
+	if err != nil {
+		return err
+	}
+	if has {
+		return setPresenceBit(t.presence, t.bit)
+	}
+	return clearPresenceBit(t.presence, t.bit)
+}
+
 // ── Key & wire-encoding helpers ──────────────────────────────────────────────
 // These encode the byte-order contracts with bpf/maps.h. Both directions use
 // them unchanged; only the maps differ.

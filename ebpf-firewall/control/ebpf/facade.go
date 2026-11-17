@@ -12,21 +12,23 @@ import (
 //
 //   - the XDP program lifecycle      (prog, XDPProgram)
 //   - the TC egress hook lifecycle   (tc, TCProgram)
-//   - four rule tables               (ingress/egress × CIDR/port, see tables.go)
+//   - five rule tables               (ingress/egress × CIDR/port, plus the
+//     egress domain blocklist — see tables.go)
 //   - the conntrack table            (ctMgr)
 //   - counters + default policies    (counterMgr, configMgr, egressCfgMgr)
 //
-// The four table instances below are the whole policy surface: every Block/
-// Unblock/List/Clear operation on either direction goes through exactly one
-// of them.
+// The table instances below are the whole policy surface: every Block/
+// Unblock/List/Clear operation on either direction goes through exactly
+// one of them.
 type Firewall struct {
 	prog *XDPProgram
 	tc   *TCProgram
 
-	ingressIPs   cidrTable // blocked_ips          (XDP)
-	ingressPorts portTable // port_policy          (XDP)
-	egressIPs    cidrTable // egress_blocked_ips   (TC)
-	egressPorts  portTable // egress_port_policy   (TC)
+	ingressIPs    cidrTable   // blocked_ips           (XDP)
+	ingressPorts  portTable   // port_policy           (XDP)
+	egressIPs     cidrTable   // egress_blocked_ips    (TC)
+	egressPorts   portTable   // egress_port_policy    (TC)
+	egressDomains domainTable // domain_blocklist     (TC, URL filtering)
 
 	ctMgr        *ConntrackManager
 	counterMgr   *CounterManager
@@ -44,16 +46,17 @@ func NewFirewall(ifaceName string) (*Firewall, error) {
 
 	presence := prog.RulePresence()
 	return &Firewall{
-		prog:         prog,
-		tc:           NewTCProgram(prog.EgressProgram(), prog.ifaceIndex),
-		ingressIPs:   newCidrTable(prog.BlockedIps(), presence, rulePresenceIP),
-		ingressPorts: newPortTable(prog.PortPolicy(), presence, rulePresencePort),
-		egressIPs:    newCidrTable(prog.EgressBlockedIps(), presence, rulePresenceEgressIP),
-		egressPorts:  newPortTable(prog.EgressPortPolicy(), presence, rulePresenceEgressPort),
-		ctMgr:        NewConntrackManager(prog.Conntrack()),
-		counterMgr:   NewCounterManager(prog.Counters()),
-		configMgr:    NewConfigManager(prog.Config()),
-		egressCfgMgr: NewConfigManager(prog.EgressConfig()),
+		prog:          prog,
+		tc:            NewTCProgram(prog.EgressProgram(), prog.ifaceIndex),
+		ingressIPs:    newCidrTable(prog.BlockedIps(), presence, rulePresenceIP),
+		ingressPorts:  newPortTable(prog.PortPolicy(), presence, rulePresencePort),
+		egressIPs:     newCidrTable(prog.EgressBlockedIps(), presence, rulePresenceEgressIP),
+		egressPorts:   newPortTable(prog.EgressPortPolicy(), presence, rulePresenceEgressPort),
+		egressDomains: newDomainTable(prog.DomainBlocklist(), presence, rulePresenceDomain),
+		ctMgr:         NewConntrackManager(prog.Conntrack()),
+		counterMgr:    NewCounterManager(prog.Counters()),
+		configMgr:     NewConfigManager(prog.Config()),
+		egressCfgMgr:  NewConfigManager(prog.EgressConfig()),
 	}, nil
 }
 
@@ -258,6 +261,25 @@ func (f *Firewall) ClearEgress() error {
 		return fmt.Errorf("clearing egress policy: %w", err)
 	}
 	return nil
+}
+
+// ── Domain blocklist (URL filtering) ─────────────────────────────────────
+// Hostname rules for the TC egress datapath. Loaded from a blocklist file
+// at daemon startup (-url-blocklist); every entry is an unconditional DROP
+// verdict in the kernel (see domain_blocklist in bpf/maps.h).
+
+// BlockDomain adds a hostname to the URL blocklist. Subdomains are covered
+// by the datapath's suffix probing.
+func (f *Firewall) BlockDomain(name string) error {
+	if err := f.egressDomains.Add(name); err != nil {
+		return fmt.Errorf("blocking domain %q: %w", name, err)
+	}
+	return nil
+}
+
+// ListDomains returns the blocklisted hostnames.
+func (f *Firewall) ListDomains() ([]string, error) {
+	return f.egressDomains.List()
 }
 
 // ── Conntrack, counters, default policies ────────────────────────────────
