@@ -934,7 +934,7 @@ static __always_inline int tls_sni_extract(struct __sk_buff *skb, __u32 pbase,
  * with "Host:" (case-insensitive, preceded by a newline or at offset 0).
  * Strips any :port suffix and one trailing dot. Reads go through
  * bpf_skb_load_bytes (see struct bcur). */
-#define HTTP_HOST_SCAN_MAX 512
+#define HTTP_HOST_SCAN_MAX 128
 
 static __always_inline int http_host_extract(struct __sk_buff *skb, __u32 pbase,
                                              __u32 plen, __u32 *out_off, __u32 *out_len) {
@@ -961,9 +961,14 @@ static __always_inline int http_host_extract(struct __sk_buff *skb, __u32 pbase,
             __u8 h[5];
             if (bpf_skb_load_bytes(skb, pbase + i, h, 5))
                 return 0;
-            if ((h[0] | 32) != 'h' || (h[1] | 32) != 'o' ||
-                (h[2] | 32) != 's' || (h[3] | 32) != 't' ||
-                h[4] != ':')
+            /* Single-branch match test: fold the five byte compares into
+             * one scalar (0 only on an exact "Host:" match). A chained
+             * short-circuit compare over unknown bytes forks the verifier
+             * 2^5 ways per scan position and blows the 1M insn budget. */
+            __u32 mm = ((__u32)(h[0] | 32) ^ 'h') | ((__u32)(h[1] | 32) ^ 'o') |
+                       ((__u32)(h[2] | 32) ^ 's') | ((__u32)(h[3] | 32) ^ 't') |
+                       ((__u32)h[4] ^ ':');
+            if (mm)
                 continue;
         }
         hit = i;
