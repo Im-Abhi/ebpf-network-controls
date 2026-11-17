@@ -14,6 +14,7 @@ import (
 
 	"ebpf-firewall/control/api"
 	"ebpf-firewall/control/ebpf"
+	"ebpf-firewall/control/rules"
 	"ebpf-firewall/control/server"
 
 	"github.com/cilium/ebpf/rlimit"
@@ -22,12 +23,14 @@ import (
 func main() {
 	var ifname string
 	var blockList string
+	var urlBlocklist string
 	var sockPath string
 	var ctTimeout time.Duration
 	var httpAddr string
 	var dir string
 	flag.StringVar(&ifname, "i", "wlp0s20f3", "Network interface name where the eBPF programs will be attached")
 	flag.StringVar(&blockList, "block", "", "Comma-separated list of IPs/CIDRs to block (e.g. '192.168.1.5, 10.0.0.0/8')")
+	flag.StringVar(&urlBlocklist, "url-blocklist", "", "Text file of domains/URLs to block on egress: one entry per line, # comments. A bare IPv4 goes to the egress IP table; a URL's host goes to the domain blocklist. Implies the egress hook (-dir out), since URL filtering only exists there")
 	flag.StringVar(&sockPath, "sock", "/var/run/ebpf-firewall.sock", "unix socket path for control")
 	flag.DurationVar(&ctTimeout, "ct-timeout", 5*time.Minute, "idle timeout for conntrack entries (0 disables the reaper)")
 	flag.StringVar(&httpAddr, "http-addr", "127.0.0.1:8080", "read-only HTTP stats API listen address (0 or empty disables)")
@@ -47,6 +50,15 @@ func main() {
 	wantEgress := dir == "out" || dir == "both"
 	if dir != "in" && dir != "out" && dir != "both" {
 		log.Fatalf("Invalid -dir %q: use in, out, or both", dir)
+	}
+
+	// The domain blocklist is consumed only by the TC egress datapath, so
+	// asking for URL filtering implies the egress hook even under the
+	// default -dir in: loading rules nothing reads would silently enforce
+	// nothing.
+	if urlBlocklist != "" && !wantEgress {
+		wantEgress = true
+		log.Printf("-url-blocklist requires the egress hook; attaching TC egress")
 	}
 
 	// Remove resource limits for kernels <5.11.
@@ -100,6 +112,42 @@ func main() {
 				}
 			}
 		}
+	}
+
+	// Load the URL blocklist: hostnames into the egress domain table (the
+	// datapath drops any TLS ClientHello / HTTP Host matching them), bare
+	// IPs into the egress IP table. A file passed explicitly must exist —
+	// silently running without the promised enforcement is worse than
+	// failing to start. Bad lines are warnings, not errors.
+	if urlBlocklist != "" {
+		bf, err := os.Open(urlBlocklist)
+		if err != nil {
+			log.Fatalf("opening url blocklist %q: %v", urlBlocklist, err)
+		}
+		res, err := rules.ParseBlocklist(bf)
+		bf.Close()
+		if err != nil {
+			log.Fatalf("reading url blocklist %q: %v", urlBlocklist, err)
+		}
+		for _, w := range res.Warnings {
+			log.Printf("url blocklist: %s", w)
+		}
+		domains, ips := 0, 0
+		for _, d := range res.Domains {
+			if err := fw.BlockDomain(d); err != nil {
+				log.Printf("url blocklist: blocking %q: %v", d, err)
+				continue
+			}
+			domains++
+		}
+		for _, ip := range res.IPs {
+			if err := fw.BlockEgressWithAction(ip, "drop"); err != nil {
+				log.Printf("url blocklist: blocking %q: %v", ip, err)
+				continue
+			}
+			ips++
+		}
+		log.Printf("url blocklist: %d domain(s) + %d ip rule(s) loaded from %s", domains, ips, urlBlocklist)
 	}
 
 	// Conntrack is a plain (non-LRU) hash map, so a userspace reaper bounds its
