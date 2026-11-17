@@ -3,6 +3,7 @@ package ebpf
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpf firewall ../../bpf/firewall.c -- -I../../bpf
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -45,7 +46,14 @@ func LoadXDP(ifaceName string) (*XDPProgram, error) {
 
 	var objs firewallObjects
 	if err := loadFirewallObjects(&objs, nil); err != nil {
-		return nil, fmt.Errorf("loading objects: %v", err)
+		// The default VerifierError display keeps only the last line(s); the
+		// full log (including the C source annotations) pinpoints exactly
+		// which statement the verifier rejected, so dump it in full.
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			return nil, fmt.Errorf("loading objects: %w\nfull verifier log:\n%+v", err, ve)
+		}
+		return nil, fmt.Errorf("loading objects: %w", err)
 	}
 
 	return &XDPProgram{
