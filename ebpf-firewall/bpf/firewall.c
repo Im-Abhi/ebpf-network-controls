@@ -806,7 +806,7 @@ static __always_inline int bcur_skip(struct bcur *c, __u32 n) {
 static __always_inline int domain_block_action(struct __sk_buff *skb, __u32 name_off, __u32 len) {
     struct lpm_domain_key key;
     __u8 ch;
-    __u32 i;
+    __u32 w;
 
     if (len == 0)
         return 0;
@@ -815,12 +815,19 @@ static __always_inline int domain_block_action(struct __sk_buff *skb, __u32 name
 
     __builtin_memset(&key, 0, sizeof(key));
     key.prefixlen = len * 8;
-    for (i = 0; i < len; i++) {
-        if (bpf_skb_load_bytes(skb, name_off + i, &ch, 1))
+    /* The WRITE index is the loop induction itself (a precise value at
+     * every verifier step); the mirrored read index (len-1-w) only feeds
+     * the runtime-checked helper, which needs no verifier-visible bounds.
+     * Writing key.name[len-1-i] instead leaves the stack-write offset
+     * with a signed range dipping below zero, which the verifier rejects
+     * as an unbounded variable-offset write. */
+    for (w = 0; w < len; w++) {
+        __u32 rd = len - 1 - w;
+        if (bpf_skb_load_bytes(skb, name_off + rd, &ch, 1))
             return 0;                       /* load past the stream: fail open */
         if (ch >= 'A' && ch <= 'Z')
             ch += 32;                       /* lowercase */
-        key.name[len - 1 - i] = ch;
+        key.name[w] = ch;
     }
     return bpf_map_lookup_elem(&domain_blocklist, &key) != NULL;
 }
