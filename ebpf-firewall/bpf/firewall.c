@@ -994,8 +994,18 @@ static __always_inline int domain_tcp_payload(void *data, void *data_end,
         return 0;
     if ((void *)tcp + hlen >= data_end)
         return 0;
+    /* Pure-32-bit length math, plen before the pointer: the original u64
+     * form ((u32)(data_end - tcp - hlen)) made LLVM schedule a u32
+     * zero-extension past the caller's dport branch onto the register
+     * carrying `tcp + hlen`, and the verifier rejects a <<= on a packet
+     * pointer ("R3 pointer arithmetic with <<= operator prohibited").
+     * All-u32 scalars leave the compiler nothing to widen. */
+    {
+        __u32 off = (__u32)((void *)tcp - (void *)data);
+        __u32 end = (__u32)((void *)data_end - (void *)data);
+        *plen = end - off - hlen;
+    }
     *pl = (const __u8 *)tcp + hlen;
-    *plen = (__u32)((void *)data_end - (void *)tcp - hlen);
     return 1;
 }
 
