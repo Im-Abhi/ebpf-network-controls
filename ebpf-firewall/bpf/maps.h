@@ -198,23 +198,28 @@ struct {
 /* ── Domain blocklist (URL filtering) ───────────────────────────────── */
 /* Hostname rules consulted ONLY by the TC egress datapath: when the host
  * sends a TLS ClientHello to port 443 (SNI) or an HTTP request to port 80
- * (Host header), the datapath extracts the announced name into a
- * domain_key and probes this map. The key is the zero-padded, lowercase
- * hostname; names longer than 63 chars are truncated identically by the
- * userspace loader and the datapath. The datapath probes the full name and
- * then its parent suffixes (sub.example.com -> example.com), so blocking
- * example.com also matches its subdomains. The value reuses rule_value for
- * layout consistency; entries loaded from the blocklist file always carry
- * ACTION_DROP, and the datapath treats a hit as an unconditional DROP
- * before the rule/default decision (see firewall_tc_egress in
- * bpf/firewall.c). */
-struct domain_key {
-    char name[64];   /* lowercase hostname, NUL/zero padded */
+ * (Host header), the datapath extracts the announced name into an
+ * lpm_domain_key and probes this map. The key is the lowercase hostname
+ * REVERSED with its length in bits, so a domain's parent suffix is a byte
+ * PREFIX of the reversed name: "sub.example.com" reversed is
+ * "moc.elpmaxe.bus", whose 11-byte prefix "moc.elpmaxe" is the stored
+ * "example.com" — one longest-prefix-match lookup then implements the
+ * documented subdomain coverage (blocking example.com also matches its
+ * subdomains) without data-dependent probing, which the verifier's state
+ * budget cannot afford. Names longer than 63 chars are truncated
+ * identically by the userspace loader and the datapath. The value reuses
+ * rule_value for layout consistency; entries loaded from the blocklist
+ * file always carry ACTION_DROP, and the datapath treats a hit as an
+ * unconditional DROP before the rule/default decision (see
+ * firewall_tc_egress in bpf/firewall.c). */
+struct lpm_domain_key {
+    __u32 prefixlen;   /* name length in bits (len * 8) */
+    __u8  name[64];    /* lowercase hostname, reversed, zero padded */
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, struct domain_key);
+    __uint(type, BPF_LPM_TRIE);
+    __type(key, struct lpm_domain_key);
     __type(value, struct rule_value);
     __uint(max_entries, 65536);
 } domain_blocklist SEC(".maps");

@@ -717,9 +717,10 @@ static __always_inline void count_egress(int verdict, __u64 bytes) {
  *   - A hit is an unconditional DROP that precedes the rule/default
  *     decision: the blocklist is an explicit deny, not a priority
  *     participant.
- *   - Suffix probing: the full name is probed first, then its parent
- *     labels (cdn.badsite.com -> badsite.com), so one entry covers a
- *     whole domain tree.
+ *   - Suffix matching via LPM: names are stored REVERSED in an LPM trie,
+ *     so a parent suffix is a byte prefix of the reversed name and one
+ *     longest-prefix-match lookup covers a whole domain tree
+ *     (cdn.badsite.com -> badsite.com) without data-dependent probing.
  *   - The gate (presence bit + TCP + port 443/80 + payload + !SYN) keeps
  *     the per-packet cost at zero unless web-bound traffic is on the wire
  *     with a loaded blocklist.
@@ -793,57 +794,35 @@ static __always_inline int bcur_skip(struct bcur *c, __u32 n) {
     return 1;
 }
 
-/* Probe domain_blocklist for `name` (a packet-pointer hostname of `len`
- * bytes) and, on a miss, its parent suffixes. Lowercasing happens here so
- * a ClientHello with unusual case still matches the loader's normalized
- * entries. Returns 1 on a hit. */
-#define DOMAIN_MAX_PROBES 6
-#define DOMAIN_NAME_MAX   63   /* domain_key.name holds 64 with padding */
+/* Match `name` (an skb-offset hostname of `len` bytes) against
+ * domain_blocklist. The name is lowercased, REVERSED into the LPM key and
+ * looked up once: storing names reversed makes a parent suffix a byte
+ * prefix of the reversed name, so the single longest-prefix-match lookup
+ * covers subdomains (see maps.h) with no data-dependent probing — the
+ * verifier's state budget cannot afford a probe per possible dot position.
+ * Returns 1 on a hit. */
+#define DOMAIN_NAME_MAX   63   /* lpm_domain_key.name holds 64 bytes */
 
 static __always_inline int domain_block_action(struct __sk_buff *skb, __u32 name_off, __u32 len) {
-    struct domain_key key;
-    __u32 start = 0;
-    __u32 probe;
+    struct lpm_domain_key key;
+    __u8 ch;
+    __u32 i;
 
     if (len == 0)
         return 0;
     if (len > DOMAIN_NAME_MAX)
         len = DOMAIN_NAME_MAX;   /* same truncation contract as the loader */
 
-    for (probe = 0; probe < DOMAIN_MAX_PROBES; probe++) {
-        __u32 sub = len - start;
-        __u32 i;
-
-        if (sub == 0)
-            break;
-        __builtin_memset(&key, 0, sizeof(key));
-        if (bpf_skb_load_bytes(skb, name_off + start, key.name, sub))
+    __builtin_memset(&key, 0, sizeof(key));
+    key.prefixlen = len * 8;
+    for (i = 0; i < len; i++) {
+        if (bpf_skb_load_bytes(skb, name_off + i, &ch, 1))
             return 0;                       /* load past the stream: fail open */
-        for (i = 0; i < sub; i++) {         /* lowercase in place */
-            __u8 ch = (__u8)key.name[i];
-            if (ch >= 'A' && ch <= 'Z')
-                ch += 32;
-            key.name[i] = ch;
-        }
-        if (bpf_map_lookup_elem(&domain_blocklist, &key))
-            return 1;
-
-        /* Advance `start` past the next dot to the next parent suffix. */
-        {
-            __u32 dot = start;
-            for (; dot < len && dot < DOMAIN_NAME_MAX; dot++) {
-                __u8 ch;
-                if (bpf_skb_load_bytes(skb, name_off + dot, &ch, 1))
-                    return 0;
-                if (ch == '.')
-                    break;
-            }
-            if (dot >= len || dot >= DOMAIN_NAME_MAX)
-                break;
-            start = dot + 1;
-        }
+        if (ch >= 'A' && ch <= 'Z')
+            ch += 32;                       /* lowercase */
+        key.name[len - 1 - i] = ch;
     }
-    return 0;
+    return bpf_map_lookup_elem(&domain_blocklist, &key) != NULL;
 }
 
 /* Extract the server_name (SNI) from a TLS ClientHello carried whole in
