@@ -218,7 +218,7 @@ struct lpm_domain_key {
 };
 
 struct {
-    __uint(type, BPF_LPM_TRIE);
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __type(key, struct lpm_domain_key);
     __type(value, struct rule_value);
     __uint(max_entries, 65536);
