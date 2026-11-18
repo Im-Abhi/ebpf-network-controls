@@ -38,7 +38,18 @@ jobs:
       - name: Install eBPF toolchain (clang, llvm, libbpf, bpftool)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev bpftool
+          # NOTE: on Ubuntu 22.04/24.04 `bpftool` is a *virtual* package
+          # provided by linux-tools-*; there is no installable "bpftool"
+          # package (Debian and Ubuntu 25.04+ have real ones).
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libbpf-dev linux-tools-common linux-tools-generic
+          # Verify the wrapper actually resolves bpftool; if not, point it
+          # at the newest installed toolchain directly.
+          bpftool version || {
+            latest=$(ls -1 /usr/lib/linux-tools/ | sort -V | tail -1)
+            sudo ln -sf "/usr/lib/linux-tools/${latest}/bpftool" /usr/local/bin/bpftool
+            bpftool version
+          }
 
       # Compiles bpf/firewall.c with the runner kernel's BTF (ubuntu-24.04 has
       # BTF) and generates the Go bindings that embed the object. CO-RE makes
