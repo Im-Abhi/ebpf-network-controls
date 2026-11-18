@@ -109,10 +109,12 @@ sudo go test -tags integration ./control/ebpf/ -run TestDatapath -v -count=1
 
 ### Egress datapath tests — `egress_integration_test.go`
 
-The same raw-frame injection through `BPF_PROG_TEST_RUN`, but against the **TC
-(TCX) egress program** (loaded, not attached, on `lo`). Frames are family-swapped
-so `(10.0.0.1 → 1.2.3.4)` reads as an outbound packet at the egress hook. The
-scenarios mirror the ingress suite plus the hook-specific cases:
+The same raw-frame injection through `BPF_PROG_TEST_RUN`, but against the
+**cgroup/skb egress program** (loaded, not attached, on `lo` — the synthetic
+skbs carry ifindex 0, which the egress scope gate treats as process-all).
+Packets are family-swapped so `(10.0.0.1 → 1.2.3.4)` reads as an outbound
+packet at the egress hook. The scenarios mirror the ingress suite plus the
+hook-specific cases:
 
 | Test | Asserts |
 | --- | --- |
@@ -155,7 +157,7 @@ Start the daemon on an interface, then drive it with `firewallctl`:
 ```bash
 sudo ./bin/firewall -i wlp0s20f3        # your interface; default is wlp0s20f3
 sudo ./bin/firewall -i wlp0s20f3 -http-addr 127.0.0.1:8081  # HTTP API on a non-default port
-sudo ./bin/firewall -i wlp0s20f3 -dir both   # also attach the TC egress hook (kernel >= 6.6)
+sudo ./bin/firewall -i wlp0s20f3 -dir both   # also attach the cgroup/skb egress hook
 ```
 
 In another terminal:
@@ -175,9 +177,10 @@ sudo ./bin/firewallctl stats                   # total / drop / pass counters (i
 ```
 
 The daemon's **egress hook** (`-dir out` / `-dir both`) runs the same rule
-engine on outbound traffic via TCX — egress `block` rules match the **remote
-destination** being contacted (dst-only for IP/CIDR, remote dst for port
-rules):
+engine on outbound traffic via a cgroup/skb program (`BPF_CGROUP_INET_EGRESS`,
+attached at the root cgroup and scoped to the daemon's interface) — egress
+`block` rules match the **remote destination** being contacted (dst-only for
+IP/CIDR, remote dst for port rules):
 
 ```bash
 sudo ./bin/firewallctl block 6.6.6.6 --dir out          # drop outbound to 6.6.6.6
@@ -235,11 +238,11 @@ Golden run: **38/38 checks**. Coverage:
 | 3k–3l | FIN→CLOSED; the teardown tail (ACK on the CLOSED flow) passes without being dropped and without re-arming the entry (stays CLOSED) |
 | 4a–4d | `clear` empties blocklist + port rules + conntrack — including the direction-scoped `clear --dir out`, which also wipes the single **shared** conntrack table; then a fresh SYN is denied |
 | 5a–5e | `-ct-timeout 5s` reaper: flow reaped, daemon logs it, later packet denied |
-| 6a–6i | egress (`-dir both`, TCX): status shows attached; default allow passes; dst-only block semantics (`block <unrelated-ip> --dir out` doesn't affect traffic; `block <dst> --dir out` fails the connection and bumps the egress drop counter); `list`/`clear --dir out` round-trip; egress `default deny` blocks outbound and `default allow` restores it. Requires kernel >= 6.6 |
+| 6a–6i | egress (`-dir both`, cgroup/skb): status shows attached; default allow passes; dst-only block semantics (`block <unrelated-ip> --dir out` doesn't affect traffic; `block <dst> --dir out` fails the connection and bumps the egress drop counter); `list`/`clear --dir out` round-trip; egress `default deny` blocks outbound and `default allow` restores it. Requires cgroup v2 |
 
-The egress checks restart the daemon with `-dir both` (XDP + TCX) at the end of
-the run; if the kernel lacks TCX support the daemon fails to start and CHECK 6
-reports itself skipped.
+The egress checks restart the daemon with `-dir both` (XDP + cgroup/skb) at
+the end of the run; if the kernel lacks cgroup v2 the daemon fails to start
+and CHECK 6 reports itself skipped.
 
 Client sockets are `SO_REUSEADDR` + RST-close (`SO_LINGER=0`) so the teardown of
 each connection cannot leave a TIME_WAIT port that a later check reuses. A clean
@@ -247,6 +250,37 @@ FIN teardown would also work — the datapath lets a CLOSED flow's tail pass
 without re-arming it (see `ct_is_passable` / `ct_update` in `bpf/firewall.c`) —
 but that keeps the negotiated 5-tuple in CLOSED until the reaper ages it out,
 which could collide with a later check's ports. Hence the deliberate RST-close.
+
+### Layer 3.6 — URL blocklist smoke (domain filtering, root required)
+
+`integration/url-smoke.sh` drives the **domain stage** (the URL blocklist)
+end-to-end: disposable veth + netns, real `python3 -m http.server` on port 80
+and a threaded TLS server on port 443 inside the netns, the daemon attached
+with `-url-blocklist`, and real `curl` traffic from the host. The TLS server
+is threaded on purpose — a blocklist-fenced flow is black-holed (its teardown
+is dropped with the flow), which wedges a serial acceptor in `SSL_accept`
+forever and starves every connection behind it; that is a property of the
+test server, not the firewall.
+
+```bash
+make generate && make build
+sudo bash integration/url-smoke.sh
+```
+
+Golden run: **7/7 checks**.
+
+| Check | What is asserted |
+| --- | --- |
+| 1 | daemon loads the egress program with `-url-blocklist` |
+| 2–3 | HTTP `Host: bad.example.com` and `Host: sub.bad.example.com` are dropped (suffix match covers subdomains) |
+| 4 | HTTP `Host: good.example.com` passes (200) |
+| 5 | TLS SNI `bad.example.com` is dropped (curl rc=28) |
+| 6 | TLS SNI `good.example.com` passes (handshake + 200) |
+| 7 | the egress drop counter moved |
+
+Known limits (by design, fail-open): ECH-encrypted ClientHellos, QUIC/HTTP-3
+(UDP), and raw-IP TLS carry no inspectable SNI and pass; URL *path* filtering
+requires TLS termination (MITM), which this firewall deliberately does not do.
 
 ---
 

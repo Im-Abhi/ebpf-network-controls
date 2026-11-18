@@ -157,7 +157,7 @@ if [ ! -S "$SOCK" ]; then
     F "daemon did not come up with -url-blocklist (log tail above on exit)"
     exit 1
 fi
-P "daemon loads firewall_tc_egress with -url-blocklist"
+P "daemon loads the cgroup/skb egress program with -url-blocklist"
 
 # ---- checks ------------------------------------------------------------------
 curl_bad_rc=0; http_try "$BAD" >/dev/null 2>&1 || curl_bad_rc=$?
