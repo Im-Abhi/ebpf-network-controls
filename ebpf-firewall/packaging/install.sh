@@ -10,7 +10,7 @@
 #   sudo ./install.sh --uninstall          stop/remove everything installed
 #
 # One-line remote install:
-#   curl -fsSL https://raw.githubusercontent.com/Im-Abhi/ebpf-network-controls/main/ebpf-firewall/packaging/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/Im-Abhi/ebpf-network-controls/master/ebpf-firewall/packaging/install.sh \
 #     | sudo bash -s -- --iface eth0
 #
 # The release binaries embed the compiled eBPF program (bpf2go), so no build

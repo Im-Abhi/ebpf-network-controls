@@ -55,7 +55,7 @@ tag via `-version` (stamped with `-ldflags "-X main.version=..."`).
 
 ## Cutting a release
 
-1. Merge the release branch into `main`.
+1. Merge the release branch into `master` (the default branch).
 2. Tag and push:
    ```bash
    git tag -a vX.Y.Z -m "ebpf-firewall vX.Y.Z"

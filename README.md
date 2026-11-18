@@ -293,7 +293,7 @@ The release binaries embed the compiled eBPF program — users need only Linux
 and root, not clang/libbpf/Go:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Im-Abhi/ebpf-network-controls/main/ebpf-firewall/packaging/install.sh | sudo bash -s -- --iface eth0
+curl -fsSL https://raw.githubusercontent.com/Im-Abhi/ebpf-network-controls/master/ebpf-firewall/packaging/install.sh | sudo bash -s -- --iface eth0
 ```
 
 Or download `ebpf-firewall-<tag>-linux-<amd64|arm64>.tar.gz` from
