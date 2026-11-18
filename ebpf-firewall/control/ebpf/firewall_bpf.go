@@ -35,9 +35,10 @@ type firewallCtValue struct {
 	Pad      uint32
 }
 
-type firewallDomainKey struct {
-	_    structs.HostLayout
-	Name [64]int8
+type firewallLpmDomainKey struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Name      [64]uint8
 }
 
 type firewallIpv4LpmKey struct {

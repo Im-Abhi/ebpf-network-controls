@@ -717,57 +717,71 @@ static __always_inline void count_egress(int verdict, __u64 bytes) {
  *   - A hit is an unconditional DROP that precedes the rule/default
  *     decision: the blocklist is an explicit deny, not a priority
  *     participant.
- *   - Suffix probing: the full name is probed first, then its parent
- *     labels (cdn.badsite.com -> badsite.com), so one entry covers a
- *     whole domain tree.
+ *   - Suffix matching via LPM: names are stored REVERSED in an LPM trie,
+ *     so a parent suffix is a byte prefix of the reversed name and one
+ *     longest-prefix-match lookup covers a whole domain tree
+ *     (cdn.badsite.com -> badsite.com) without data-dependent probing.
  *   - The gate (presence bit + TCP + port 443/80 + payload + !SYN) keeps
  *     the per-packet cost at zero unless web-bound traffic is on the wire
  *     with a loaded blocklist.
  * Known gaps: a ClientHello split across TCP segments, raw-IP TLS,
- * QUIC/HTTP-3 (UDP), ECH-encrypted SNI — those connections fall through
- * to the ordinary rule/default path. Non-linear skbs: direct
- * data/data_end access covers only the skb's linear area, so a
- * ClientHello extending into paged fragments aborts cleanly and fails
- * open (same observable behavior as the split case; never a false
- * drop). Exposure is small — a ClientHello is the first stream byte and
- * rides in its own small linear skb. v2 upgrade path:
- * bpf_skb_pull_data(skb, hs_len + 9) gated on skb->gso_size == 0 and a
- * size cap, then re-load data/data_end and re-run the stage.
- * bpf_skb_load_bytes() is not viable — the copy needs a stack buffer and
- * the BPF stack is capped at 512 bytes total.
+ * QUIC/HTTP-3 (UDP), ECH-encrypted SNI, and names beyond the scanned
+ * window — those connections fail open and fall through to the ordinary
+ * rule/default path; never a false drop. The stream is read by skb offset
+ * through bpf_skb_load_bytes rather than by packet pointer: the payload
+ * offset varies with the IP/TCP header lengths, a packet pointer with a
+ * variable offset cannot be range-verified beyond one byte, and stack
+ * copies hit the same wall (protocol-declared skip lengths make a stack
+ * cursor's offset unbounded). Helper loads are runtime-bounds-checked, so
+ * the parsing needs no verifier-visible bounds at all, and the reads also
+ * reach paged fragments that direct data/data_end access cannot.
  */
 
-/* Minimal byte reader over the TCP payload. Every accessor proves the read
- * against `left` before touching memory, which keeps the verifier's bounds
- * reasoning linear. */
+/* Byte reader over the outbound stream, addressed by skb offset and read
+ * through bpf_skb_load_bytes. The payload start varies with the IP/TCP
+ * header lengths, so no packet pointer can carry a verifier-usable range
+ * here (a packet pointer with a variable offset proves only one readable
+ * byte against data_end), and stack copies hit the same wall: the skips
+ * are protocol-declared lengths, which make a stack cursor's offset
+ * unbounded too. Helper loads are runtime-bounds-checked, so the parsing
+ * logic needs no verifier-visible bounds at all, and a load past the
+ * linear area simply fails open. Every accessor proves the read against
+ * `left` (the protocol + packet cap) before touching the wire. */
 struct bcur {
-    const __u8 *p;
+    __u32 off;     /* absolute skb offset of the next byte */
     __u32 left;
 };
 
-static __always_inline int bcur_take8(struct bcur *c, __u8 *out) {
+static __always_inline int bcur_take8(struct __sk_buff *skb, struct bcur *c, __u8 *out) {
     if (c->left < 1)
         return 0;
-    *out = *c->p;
-    c->p++;
+    if (bpf_skb_load_bytes(skb, c->off, out, 1))
+        return 0;
+    c->off++;
     c->left--;
     return 1;
 }
 
-static __always_inline int bcur_take16(struct bcur *c, __u16 *out) {
+static __always_inline int bcur_take16(struct __sk_buff *skb, struct bcur *c, __u16 *out) {
+    __u8 b[2];
     if (c->left < 2)
         return 0;
-    *out = ((__u16)c->p[0] << 8) | (__u16)c->p[1];
-    c->p += 2;
+    if (bpf_skb_load_bytes(skb, c->off, b, 2))
+        return 0;
+    *out = ((__u16)b[0] << 8) | (__u16)b[1];
+    c->off += 2;
     c->left -= 2;
     return 1;
 }
 
-static __always_inline int bcur_take24(struct bcur *c, __u32 *out) {
+static __always_inline int bcur_take24(struct __sk_buff *skb, struct bcur *c, __u32 *out) {
+    __u8 b[3];
     if (c->left < 3)
         return 0;
-    *out = ((__u32)c->p[0] << 16) | ((__u32)c->p[1] << 8) | (__u32)c->p[2];
-    c->p += 3;
+    if (bpf_skb_load_bytes(skb, c->off, b, 3))
+        return 0;
+    *out = ((__u32)b[0] << 16) | ((__u32)b[1] << 8) | (__u32)b[2];
+    c->off += 3;
     c->left -= 3;
     return 1;
 }
@@ -775,78 +789,68 @@ static __always_inline int bcur_take24(struct bcur *c, __u32 *out) {
 static __always_inline int bcur_skip(struct bcur *c, __u32 n) {
     if (c->left < n)
         return 0;
-    c->p += n;
+    c->off += n;
     c->left -= n;
     return 1;
 }
 
-/* Probe domain_blocklist for `name` (a packet-pointer hostname of `len`
- * bytes) and, on a miss, its parent suffixes. Lowercasing happens here so
- * a ClientHello with unusual case still matches the loader's normalized
- * entries. Returns 1 on a hit. */
-#define DOMAIN_MAX_PROBES 6
-#define DOMAIN_NAME_MAX   63   /* domain_key.name holds 64 with padding */
+/* Match `name` (an skb-offset hostname of `len` bytes) against
+ * domain_blocklist. The name is lowercased, REVERSED into the LPM key and
+ * looked up once: storing names reversed makes a parent suffix a byte
+ * prefix of the reversed name, so the single longest-prefix-match lookup
+ * covers subdomains (see maps.h) with no data-dependent probing — the
+ * verifier's state budget cannot afford a probe per possible dot position.
+ * Returns 1 on a hit. */
+#define DOMAIN_NAME_MAX   63   /* lpm_domain_key.name holds 64 bytes */
 
-static __always_inline int domain_block_action(const __u8 *name, __u32 len) {
-    struct domain_key key;
-    __u32 start = 0;
-    __u32 probe;
+static __always_inline int domain_block_action(struct __sk_buff *skb, __u32 name_off, __u32 len) {
+    struct lpm_domain_key key;
+    __u8 ch;
+    __u32 w;
 
     if (len == 0)
         return 0;
     if (len > DOMAIN_NAME_MAX)
         len = DOMAIN_NAME_MAX;   /* same truncation contract as the loader */
 
-    for (probe = 0; probe < DOMAIN_MAX_PROBES; probe++) {
-        __u32 sub = len - start;
-        __u32 i;
-
-        if (sub == 0)
-            break;
-        __builtin_memset(&key, 0, sizeof(key));
-        for (i = 0; i < sub; i++) {
-            __u8 ch = name[start + i];
-            if (ch >= 'A' && ch <= 'Z')
-                ch += 32;
-            key.name[i] = ch;
-        }
-        if (bpf_map_lookup_elem(&domain_blocklist, &key))
-            return 1;
-
-        /* Advance `start` past the next dot to the next parent suffix. */
-        {
-            __u32 dot = start;
-            for (; dot < len && dot < DOMAIN_NAME_MAX; dot++) {
-                if (name[dot] == '.')
-                    break;
-            }
-            if (dot >= len || dot >= DOMAIN_NAME_MAX)
-                break;
-            start = dot + 1;
-        }
+    __builtin_memset(&key, 0, sizeof(key));
+    key.prefixlen = len * 8;
+    /* The WRITE index is the loop induction itself (a precise value at
+     * every verifier step); the mirrored read index (len-1-w) only feeds
+     * the runtime-checked helper, which needs no verifier-visible bounds.
+     * Writing key.name[len-1-i] instead leaves the stack-write offset
+     * with a signed range dipping below zero, which the verifier rejects
+     * as an unbounded variable-offset write. */
+    for (w = 0; w < len; w++) {
+        __u32 rd = len - 1 - w;
+        if (bpf_skb_load_bytes(skb, name_off + rd, &ch, 1))
+            return 0;                       /* load past the stream: fail open */
+        if (ch >= 'A' && ch <= 'Z')
+            ch += 32;                       /* lowercase */
+        key.name[w] = ch;
     }
-    return 0;
+    return bpf_map_lookup_elem(&domain_blocklist, &key) != NULL;
 }
 
 /* Extract the server_name (SNI) from a TLS ClientHello carried whole in
- * this segment. Returns 1 and sets (*out, *out_len) to the name inside the
- * packet; 0 when anything is malformed, truncated, or simply not a
- * ClientHello. Every level of the walk is bounded by the protocol's own
- * declared lengths (record body, handshake body, extension block, name
+ * this segment. Returns 1 and sets (*out_off, *out_len) to the name's skb
+ * offset and length; 0 when anything is malformed, truncated, or simply
+ * not a ClientHello. Every level of the walk is bounded by the protocol's
+ * own declared lengths (record body, handshake body, extension block, name
  * list) on top of the packet bound, so bytes outside a declared structure
  * are never interpreted as part of it. */
-static __always_inline int tls_sni_extract(const __u8 *pl, __u32 plen,
-                                           const __u8 **out, __u32 *out_len) {
-    struct bcur c = { pl, plen };
+static __always_inline int tls_sni_extract(struct __sk_buff *skb, __u32 pbase,
+                                           __u32 plen, __u32 *out_off, __u32 *out_len) {
+    struct bcur c = { pbase, plen };
     __u8 content, hs_type, sid_len, comp_len;
     __u16 ver, rec_len, cs_len, ext_len, ext_i;
     __u32 hs_len;
 
-    if (!bcur_take8(&c, &content) || content != 0x16)   /* handshake record */
+    if (!bcur_take8(skb, &c, &content) || content != 0x16)   /* handshake record */
         return 0;
-    if (!bcur_take16(&c, &ver))                          /* record version */
+    if (!bcur_take16(skb, &c, &ver))                     /* record version */
         return 0;
-    if (!bcur_take16(&c, &rec_len) || rec_len < 4)
+    if (!bcur_take16(skb, &c, &rec_len) || rec_len < 4)
         return 0;
     /* Bound what follows to the record's declared body: bytes beyond
      * rec_len belong to another record and must never be parsed as part
@@ -855,9 +859,9 @@ static __always_inline int tls_sni_extract(const __u8 *pl, __u32 plen,
      * split-ClientHello case. */
     if (rec_len < c.left)
         c.left = rec_len;
-    if (!bcur_take8(&c, &hs_type) || hs_type != 0x01)    /* ClientHello */
+    if (!bcur_take8(skb, &c, &hs_type) || hs_type != 0x01)    /* ClientHello */
         return 0;
-    if (!bcur_take24(&c, &hs_len))
+    if (!bcur_take24(skb, &c, &hs_len))
         return 0;
     /* The ClientHello must be whole in this segment; a handshake split
      * across TCP segments gets no verdict (documented gap). */
@@ -865,43 +869,43 @@ static __always_inline int tls_sni_extract(const __u8 *pl, __u32 plen,
         return 0;
     if (hs_len < c.left)                                 /* bound to the   */
         c.left = hs_len;                                 /* handshake body */
-    if (!bcur_take16(&c, &ver))                          /* client version */
+    if (!bcur_take16(skb, &c, &ver))                     /* client version */
         return 0;
     if (!bcur_skip(&c, 32))                              /* random */
         return 0;
-    if (!bcur_take8(&c, &sid_len) || !bcur_skip(&c, sid_len))
+    if (!bcur_take8(skb, &c, &sid_len) || !bcur_skip(&c, sid_len))
         return 0;
-    if (!bcur_take16(&c, &cs_len) || !bcur_skip(&c, cs_len))
+    if (!bcur_take16(skb, &c, &cs_len) || !bcur_skip(&c, cs_len))
         return 0;
-    if (!bcur_take8(&c, &comp_len) || !bcur_skip(&c, comp_len))
+    if (!bcur_take8(skb, &c, &comp_len) || !bcur_skip(&c, comp_len))
         return 0;
-    if (!bcur_take16(&c, &ext_len) || ext_len > c.left)  /* ext block must
-                                                            end the body */
+    if (!bcur_take16(skb, &c, &ext_len) || ext_len > c.left)  /* ext block must
+                                                                 end the body */
         return 0;
     c.left = ext_len;                                    /* walk ends where the
                                                             extension block ends */
     for (ext_i = 0; ext_i < 32; ext_i++) {
         __u16 et, el;
-        if (!bcur_take16(&c, &et) || !bcur_take16(&c, &el))
+        if (!bcur_take16(skb, &c, &et) || !bcur_take16(skb, &c, &el))
             return 0;
         if (el > c.left)
             return 0;
         if (et == 0x0000) {                              /* server_name */
-            struct bcur e = { c.p, el };
+            struct bcur e = { c.off, el };
             __u16 list_len, nl;
             __u8 name_type;
-            if (!bcur_take16(&e, &list_len))
+            if (!bcur_take16(skb, &e, &list_len))
                 return 0;
             /* the name list must fill the extension exactly (single
              * HostName entry, as every real client encodes it) — this
              * also pins the name inside the declared list */
             if (list_len != el - 2)
                 return 0;
-            if (!bcur_take8(&e, &name_type) || name_type != 0)
+            if (!bcur_take8(skb, &e, &name_type) || name_type != 0)
                 return 0;
-            if (!bcur_take16(&e, &nl) || nl == 0 || nl > e.left)
+            if (!bcur_take16(skb, &e, &nl) || nl == 0 || nl > e.left)
                 return 0;
-            *out = e.p;
+            *out_off = e.off;
             *out_len = nl;
             return 1;
         }
@@ -914,67 +918,117 @@ static __always_inline int tls_sni_extract(const __u8 *pl, __u32 plen,
 /* Extract the Host header value from an outbound HTTP/1.x request: a
  * bounded scan of the first HTTP_HOST_SCAN_MAX bytes for a line starting
  * with "Host:" (case-insensitive, preceded by a newline or at offset 0).
- * Strips any :port suffix and one trailing dot. */
-#define HTTP_HOST_SCAN_MAX 512
+ * Strips any :port suffix and one trailing dot. Reads go through
+ * bpf_skb_load_bytes (see struct bcur). */
+#define HTTP_HOST_SCAN_MAX 128
 
-static __always_inline int http_host_extract(const __u8 *pl, __u32 plen,
-                                             const __u8 **out, __u32 *out_len) {
+static __always_inline int http_host_extract(struct __sk_buff *skb, __u32 pbase,
+                                             __u32 plen, __u32 *out_off, __u32 *out_len) {
     __u32 scan = plen < HTTP_HOST_SCAN_MAX ? plen : HTTP_HOST_SCAN_MAX;
-    __u32 i;
+    __u32 i, hit = 0, vstart, vend, k;
+    int found = 0;
+    __u8 b;
 
+    /* Pass 1: locate the first line starting with "Host:". The value
+     * extraction is deliberately NOT nested inside this loop: the verifier
+     * explores the bounded scan for every position, and nesting the
+     * extraction walks inside it multiplies the processed-insn budget past
+     * the kernel's 1M limit. */
     for (i = 0; i < scan; i++) {
-        __u32 vstart, vend, k;
-
         if (i + 5 > plen)
             break;
-        if (i != 0 && pl[i - 1] != '\n')
-            continue;                                    /* not a line start */
-        if ((pl[i] | 32) != 'h' || (pl[i + 1] | 32) != 'o' ||
-            (pl[i + 2] | 32) != 's' || (pl[i + 3] | 32) != 't' ||
-            pl[i + 4] != ':')
-            continue;
-
-        vstart = i + 5;                                  /* skip spaces/tabs */
-        for (k = 0; k < 16; k++) {
-            __u32 idx = vstart + k;
-            if (idx >= plen || (pl[idx] != ' ' && pl[idx] != '\t'))
-                break;
+        if (i != 0) {
+            if (bpf_skb_load_bytes(skb, pbase + i - 1, &b, 1))
+                return 0;
+            if (b != '\n')
+                continue;                                /* not a line start */
         }
-        vstart += k;
-
-        vend = vstart;                                   /* read to end of line */
-        for (k = 0; k < DOMAIN_NAME_MAX + 8; k++) {
-            __u32 idx = vstart + k;
-            if (idx >= plen || pl[idx] == '\r' || pl[idx] == '\n')
-                break;
-            vend = idx + 1;
+        {
+            __u8 h[5];
+            if (bpf_skb_load_bytes(skb, pbase + i, h, 5))
+                return 0;
+            /* Single-branch match test: fold the five byte compares into
+             * one scalar (0 only on an exact "Host:" match). A chained
+             * short-circuit compare over unknown bytes forks the verifier
+             * 2^5 ways per scan position and blows the 1M insn budget. */
+            __u32 mm = ((__u32)(h[0] | 32) ^ 'h') | ((__u32)(h[1] | 32) ^ 'o') |
+                       ((__u32)(h[2] | 32) ^ 's') | ((__u32)(h[3] | 32) ^ 't') |
+                       ((__u32)h[4] ^ ':');
+            if (mm)
+                continue;
         }
-
-        for (k = 0; k < DOMAIN_NAME_MAX + 8 && vstart + k < vend; k++) {
-            if (pl[vstart + k] == ':') {                 /* strip :port */
-                vend = vstart + k;
-                break;
-            }
-        }
-        if (vend == vstart)
-            continue;
-        if (pl[vend - 1] == '.' && vend - vstart > 1)
-            vend--;                                      /* strip trailing dot */
-
-        *out = pl + vstart;
-        *out_len = vend - vstart;
-        return 1;
+        hit = i;
+        found = 1;
+        break;
     }
-    return 0;
+    if (!found)
+        return 0;
+
+    /* Pass 2: extract the value on the matched line (executes once). */
+    vstart = hit + 5;                                    /* skip spaces/tabs */
+    for (k = 0; k < 16; k++) {
+        __u32 idx = vstart + k;
+        if (idx >= plen)
+            break;
+        if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
+            return 0;
+        if (b != ' ' && b != '\t')
+            break;
+    }
+    vstart += k;
+
+    vend = vstart;                                       /* read to end of line */
+    for (k = 0; k < DOMAIN_NAME_MAX + 8; k++) {
+        __u32 idx = vstart + k;
+        if (idx >= plen)
+            break;
+        if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
+            return 0;
+        if (b == '\r' || b == '\n')
+            break;
+        vend = idx + 1;
+    }
+
+    for (k = 0; k < DOMAIN_NAME_MAX + 8 && vstart + k < vend; k++) {
+        __u32 idx = vstart + k;
+        if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
+            return 0;
+        if (b == ':') {                                  /* strip :port */
+            vend = vstart + k;
+            break;
+        }
+    }
+    if (vend == vstart)
+        return 0;
+    if (vend - vstart > 1) {                             /* strip trailing dot */
+        if (bpf_skb_load_bytes(skb, pbase + vend - 1, &b, 1))
+            return 0;
+        if (b == '.')
+            vend--;
+    }
+
+    *out_off = pbase + vstart;
+    *out_len = vend - vstart;
+    return 1;
 }
 
-/* Payload bounds for an outbound TCP packet. parse_packet stops its cursor
+/* Payload position for an outbound TCP packet. parse_packet stops its cursor
  * right after the fixed 20-byte TCP header (it is shared with the XDP
  * datapath and must not change), so this re-walks L2/L3 locally and uses
  * the header's real data offset to find the first payload byte. Returns 1
- * with (*pl, *plen) set, 0 when there is no payload. */
+ * with (*off_out, *plen_out) set to the payload start (offset from `data`)
+ * and length, 0 when there is no payload.
+ *
+ * The offsets are u32 and pinned through volatile locals: the payload
+ * offset varies with the IP/TCP header lengths, a packet pointer with a
+ * variable offset cannot be range-verified beyond a single byte, and the
+ * scalar forms LLVM generates when reassociating these pointer differences
+ * trip the verifier ("R3 pointer arithmetic with <<= operator prohibited";
+ * "math between pkt pointer and register with unbounded min value").
+ * Volatile makes the results opaque to those rewrites; the callers read
+ * the stream by skb offset (bpf_skb_load_bytes) instead. */
 static __always_inline int domain_tcp_payload(void *data, void *data_end,
-                                              const __u8 **pl, __u32 *plen) {
+                                              __u32 *off_out, __u32 *plen_out) {
     struct hdr_cursor c = { data };
     struct ethhdr *eth;
     struct iphdr *ip;
@@ -992,10 +1046,14 @@ static __always_inline int domain_tcp_payload(void *data, void *data_end,
     hlen = (__u32)tcp->doff * 4;
     if (hlen < sizeof(*tcp) || hlen > 60)
         return 0;
-    if ((void *)tcp + hlen >= data_end)
+    volatile __u32 off_v = (__u32)((void *)tcp - (void *)data) + hlen;
+    volatile __u32 plen_v = (__u32)((void *)data_end - (void *)tcp) - hlen;
+    __u32 off = off_v;
+    __u32 plen = plen_v;
+    if (plen == 0)
         return 0;
-    *pl = (const __u8 *)tcp + hlen;
-    *plen = (__u32)((void *)data_end - (void *)tcp - hlen);
+    *off_out = off;
+    *plen_out = plen;
     return 1;
 }
 
@@ -1046,19 +1104,25 @@ int firewall_tc_egress(struct __sk_buff *skb) {
      * is observable on its own. A dropped stream writes no conntrack
      * state (state is only ever written after a PASS). */
     if ((flags & RULE_DOMAIN_PRESENT) && !(info.tcp_flags & TCP_SYN)) {
-        const __u8 *pl;
-        __u32 plen;
-        const __u8 *name;
-        __u32 name_len = 0;
+        __u32 off, plen;
         int blocked = 0;
 
-        if (domain_tcp_payload(data, data_end, &pl, &plen)) {
+        /* The stage addresses the stream by skb offset (bpf_skb_load_bytes)
+         * instead of packet pointers: the payload offset varies with the
+         * IP/TCP header lengths and no packet pointer with a variable
+         * offset can be range-verified (see domain_tcp_payload). Helper
+         * loads are runtime-checked, so a malformed stream, a split
+         * ClientHello or a non-linear skb simply fails open. */
+        if (domain_tcp_payload(data, data_end, &off, &plen)) {
+            __u32 name_off = 0;
+            __u32 name_len = 0;
+
             if (info.dport == bpf_htons(443))
-                blocked = tls_sni_extract(pl, plen, &name, &name_len) &&
-                          domain_block_action(name, name_len);
+                blocked = tls_sni_extract(skb, off, plen, &name_off, &name_len) &&
+                          domain_block_action(skb, name_off, name_len);
             else if (info.dport == bpf_htons(80))
-                blocked = http_host_extract(pl, plen, &name, &name_len) &&
-                          domain_block_action(name, name_len);
+                blocked = http_host_extract(skb, off, plen, &name_off, &name_len) &&
+                          domain_block_action(skb, name_off, name_len);
         }
         if (blocked) {
             count_egress(XDP_DROP, pkt_len);

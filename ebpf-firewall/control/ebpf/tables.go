@@ -313,9 +313,14 @@ func newDomainTable(m, presence *ebpf.Map, bit uint32) domainTable {
 // are truncated identically on both sides of the map.
 const domainNameMax = 63
 
-// domainKeyOf normalizes a hostname into the map key.
-func domainKeyOf(name string) (firewallDomainKey, error) {
-	var key firewallDomainKey
+// domainKeyOf normalizes a hostname into the reversed LPM map key. The
+// datapath stores and probes names reversed so a parent suffix is a byte
+// prefix of the reversed name; one longest-prefix-match lookup then covers
+// subdomains (see lpm_domain_key in bpf/maps.h). Normalization: lowercase,
+// truncated to the kernel's 63-byte contract (DOMAIN_NAME_MAX in
+// bpf/firewall.c); prefixlen carries the effective length in bits.
+func domainKeyOf(name string) (firewallLpmDomainKey, error) {
+	var key firewallLpmDomainKey
 	name = strings.ToLower(strings.TrimSpace(name))
 	if name == "" {
 		return key, fmt.Errorf("empty domain name")
@@ -323,8 +328,9 @@ func domainKeyOf(name string) (firewallDomainKey, error) {
 	if len(name) > domainNameMax {
 		name = name[:domainNameMax] // same truncation contract as the datapath
 	}
+	key.Prefixlen = uint32(len(name) * 8)
 	for i := 0; i < len(name); i++ {
-		key.Name[i] = int8(name[i])
+		key.Name[len(name)-1-i] = name[i]
 	}
 	return key, nil
 }
@@ -375,17 +381,18 @@ func (t domainTable) Contains(name string) (bool, error) {
 func (t domainTable) List() ([]string, error) {
 	names := make([]string, 0, 8)
 	var (
-		key   firewallDomainKey
+		key   firewallLpmDomainKey
 		value ruleValue
 	)
 	iter := t.m.Iterate()
 	for iter.Next(&key, &value) {
-		name := make([]byte, 0, domainNameMax)
-		for _, b := range key.Name {
-			if b == 0 {
-				break
-			}
-			name = append(name, byte(b))
+		n := int(key.Prefixlen / 8) // effective name length in bytes
+		if n > len(key.Name) {
+			n = len(key.Name)
+		}
+		name := make([]byte, n)
+		for i := 0; i < n; i++ {
+			name[i] = key.Name[n-1-i] // keys are stored reversed
 		}
 		names = append(names, string(name))
 	}
@@ -399,8 +406,8 @@ func (t domainTable) List() ([]string, error) {
 // cidrTable).
 func (t domainTable) Clear() error {
 	var (
-		keys  []firewallDomainKey
-		key   firewallDomainKey
+		keys  []firewallLpmDomainKey
+		key   firewallLpmDomainKey
 		value ruleValue
 	)
 	iter := t.m.Iterate()
