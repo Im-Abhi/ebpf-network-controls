@@ -1,0 +1,89 @@
+# Build and publish prebuilt release binaries.
+#
+# The compiled eBPF object is embedded in the Go binary by bpf2go
+# (`make generate`), so the published tarballs need no build toolchain on the
+# user's machine — see ebpf-firewall/packaging/PACKAGING.md.
+#
+# Triggered by pushing a v* tag (publishes a GitHub Release) or manually via
+# workflow_dispatch (uploads dist/ as a build artifact for testing).
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: ebpf-firewall
+
+jobs:
+  build:
+    name: Build linux release binaries
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ebpf-firewall/go.mod
+
+      - name: Install eBPF toolchain (clang, llvm, libbpf, bpftool)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev bpftool
+
+      # Compiles bpf/firewall.c with the runner kernel's BTF (ubuntu-24.04 has
+      # BTF) and generates the Go bindings that embed the object. CO-RE makes
+      # the embedded program portable to the target machine's kernel.
+      - name: Generate eBPF bindings
+        run: make generate
+
+      - name: Resolve release tag
+        id: tag
+        working-directory: .
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v0.0.0-dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build linux/amd64
+        run: ./packaging/build-release.sh "${{ steps.tag.outputs.tag }}" amd64
+
+      - name: Build linux/arm64
+        run: ./packaging/build-release.sh "${{ steps.tag.outputs.tag }}" arm64
+
+      # Lines are "<hash>  <filename>" (no path prefix) so install.sh can
+      # verify straight from a directory containing the tarballs.
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ebpf-firewall-*.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Upload build artifacts (workflow_dispatch runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ebpf-firewall-dist
+          path: |
+            ebpf-firewall/dist/*.tar.gz
+            ebpf-firewall/dist/checksums.txt
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ebpf-firewall/dist/*.tar.gz
+            ebpf-firewall/dist/checksums.txt
+          generate_release_notes: true

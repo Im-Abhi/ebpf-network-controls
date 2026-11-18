@@ -1,5 +1,13 @@
 # Installation Guide
 
+> **Installing from a release?** You don't need this page. The release
+> binaries embed the compiled eBPF program, so there is nothing to build:
+> grab a tarball from
+> [Releases](https://github.com/Im-Abhi/ebpf-network-controls/releases) or use
+> [`ebpf-firewall/packaging/install.sh`](ebpf-firewall/packaging/install.sh),
+> then follow [`ebpf-firewall/packaging/INSTALL.md`](ebpf-firewall/packaging/INSTALL.md).
+> This page is only for **building from source**.
+
 This page documents everything needed to build and run the eBPF firewall from
 scratch on a Linux machine. All packages are installed via your distro's
 package manager, so nothing here hard-codes a distribution-specific path.

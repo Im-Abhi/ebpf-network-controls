@@ -153,9 +153,9 @@ Two shared-state notes specific to the egress hook:
 Start the daemon on an interface, then drive it with `firewallctl`:
 
 ```bash
-sudo ./bin/firewall -i wlp0s20f3        # your interface; default is wlp0s20f3
-sudo ./bin/firewall -i wlp0s20f3 -http-addr 127.0.0.1:8081  # HTTP API on a non-default port
-sudo ./bin/firewall -i wlp0s20f3 -dir both   # also attach the TC egress hook (kernel >= 6.6)
+sudo ./bin/firewall -i <iface>        # -i is required: pick your interface (e.g. eth0)
+sudo ./bin/firewall -i <iface> -http-addr 127.0.0.1:8081  # HTTP API on a non-default port
+sudo ./bin/firewall -i <iface> -dir both   # also attach the TC egress hook (kernel >= 6.6)
 ```
 
 In another terminal:
@@ -205,7 +205,7 @@ allowed a TCP connection (e.g. `ssh` to a host with a `--action pass` rule),
 then `firewallctl default deny` before stopping it and reconnecting — the
 established flow should keep working while a fresh connection is dropped.
 
-> Alert: the default interface is your **Wi-Fi** (`wlp0s20f3`). A `default deny` or a
+> Alert: `-i` is a **required** flag — pick the interface deliberately. A `default deny` or a
 > block rule matching your own IP will cut your own inbound traffic — run policy
 > experiments on a disposable test interface instead.
 
