@@ -75,15 +75,6 @@
  * unfragmented packet may set DF. */
 #define IP_FRAG_MASK 0x3FFF
 
-/* TC classifier action codes (linux/pkt_cls.h UAPI macros, not in vmlinux.h).
- * The egress program maps XDP verdicts onto these: DROP -> SHOT, PASS -> OK. */
-#ifndef TC_ACT_OK
-#define TC_ACT_OK 0
-#endif
-#ifndef TC_ACT_SHOT
-#define TC_ACT_SHOT 2
-#endif
-
 /* Minimal parsed view of an IPv4 packet, sufficient for the current
  * IP/CIDR policy plus protocol/port rules. Extended later with direction
  * for richer rules without touching the datapath control flow. */
@@ -96,16 +87,22 @@ struct packet_info {
     __u8  tcp_flags; /* TCP_FIN/SYN/RST/ACK bits (0 if not TCP) */
 };
 
-static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
-                                                       void *data_end,
-                                                       int *ok) {
+static __always_inline struct packet_info parse_packet_x(struct hdr_cursor *nh,
+                                                         void *data_end,
+                                                         int *ok, bool l2) {
     struct packet_info info = {};
     *ok = 0;
 
-    struct ethhdr *eth;
-    int eth_type = parse_ethhdr(nh, data_end, &eth);
-    if (eth_type < 0) {
-        return info;
+    /* L2 (XDP) frames start at the Ethernet header; the cgroup/skb egress
+     * hook hands the program an skb whose data points at the L3 (IP)
+     * header, so the Ethernet step is skipped there. */
+    int eth_type = bpf_htons(ETH_P_IP);
+    if (l2) {
+        struct ethhdr *eth;
+        eth_type = parse_ethhdr(nh, data_end, &eth);
+        if (eth_type < 0) {
+            return info;
+        }
     }
 
     /* Only IPv4 is policy-relevant in the current implementation. */
@@ -152,6 +149,13 @@ static __always_inline struct packet_info parse_packet(struct hdr_cursor *nh,
 
     *ok = 1;
     return info;
+}
+
+/* L3-context variant for the cgroup/skb egress hook (skb->data = IP header). */
+static __always_inline struct packet_info parse_packet_l3(struct hdr_cursor *nh,
+                                                          void *data_end,
+                                                          int *ok) {
+    return parse_packet_x(nh, data_end, ok, false);
 }
 
 /* Policy lookup for the IP blocklist. Returns the rule_value stored for the
@@ -407,7 +411,7 @@ int firewall_prog(struct xdp_md *ctx) {
 
     /* 1. parse */
     int ok;
-    struct packet_info info = parse_packet(&nh, data_end, &ok);
+    struct packet_info info = parse_packet_x(&nh, data_end, &ok, true);
     if (!ok) {
         /* Unparseable or non-IPv4: apply the default policy. */
         int verdict = default_policy() == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
@@ -477,12 +481,29 @@ int firewall_prog(struct xdp_md *ctx) {
     return XDP_PASS;
 }
 
-/* ══ TC egress datapath ────────────────────────────────────────────────
- * Second hook: a SCHED_CLS classifier attached to the tc egress (clsact)
- * direction, filtering host-generated outbound traffic. The XDP program
- * (firewall_prog) is receive-side only and stays byte-for-byte unchanged;
- * this program is a separate SEC("classifier") section in the same object so
- * both directions share the policy and conntrack maps.
+/* ══ Cgroup egress datapath ───────────────────────────────────────────
+ * Second hook: a cgroup/skb (BPF_CGROUP_INET_EGRESS) program filtering
+ * host-generated outbound traffic. The XDP program (firewall_prog) is
+ * receive-side only and stays byte-for-byte unchanged; this program is a
+ * separate SEC("cgroup_skb/egress") section in the same object so both
+ * directions share the policy and conntrack maps.
+ *
+ * Why cgroup/skb and not TC (clsact/tcx): on the development kernel,
+ * TC egress hooks never fire for TCP data packets (SYN/ACK/FIN and
+ * ICMP/UDP do), which silently disabled URL filtering — the blocklist
+ * needs the GET/ClientHello payload. The cgroup egress hook runs at L3
+ * (ip_output) and sees every packet, TCP data included, on every kernel
+ * (no TCX 6.6 floor either). Verified by experiment: 2 curls — tc egress
+ * counters moved by 0 data bytes; cgroup egress counted 6 >100B packets
+ * (the GETs and 200-OKs).
+ *
+ * Hook semantics (different from the old TC classifier):
+ *   - the hook sees the WHOLE host's outbound traffic, so the datapath
+ *     gates every packet on skb->ifindex (egress_meta entry 0, written
+ *     by the daemon at attach) to stay scoped to -i <iface>; other
+ *     interfaces pass untouched at zero policy cost beyond the gate;
+ *   - verdicts are 1 = pass, 0 = drop (cgroup semantics), not the TC
+ *     action codes.
  *
  * Direction semantics (deliberately different from ingress):
  *   - egress_blocked_ips  -> matches the packet DESTINATION only; the source
@@ -523,8 +544,10 @@ static __always_inline void ct_build_reverse_key(struct ct_key *key,
     key->protocol = info->protocol;
 }
 
-static __always_inline int tc_action(int verdict) {
-    return verdict == XDP_DROP ? TC_ACT_SHOT : TC_ACT_OK;
+/* cgroup/skb verdict mapping: 1 = pass, 0 = drop. The datapath reasons in
+ * XDP verdicts internally (XDP_DROP/XDP_PASS) and maps at the exits. */
+static __always_inline int cg_action(int verdict) {
+    return verdict == XDP_DROP ? 0 : 1;
 }
 
 static __always_inline enum default_policy egress_default_policy(void) {
@@ -712,7 +735,7 @@ static __always_inline void count_egress(int verdict, __u64 bytes) {
  * Host header on port 80 — and this stage extracts it and probes the map.
  *
  * Scope decisions (all deliberate):
- *   - Egress only: the stage lives in firewall_tc_egress; the XDP
+ *   - Egress only: the stage lives in firewall_cgroup_egress; the XDP
  *     (ingress) datapath is untouched.
  *   - A hit is an unconditional DROP that precedes the rule/default
  *     decision: the blocklist is an explicit deny, not a priority
@@ -751,6 +774,8 @@ struct bcur {
     __u32 off;     /* absolute skb offset of the next byte */
     __u32 left;
 };
+
+
 
 static __always_inline int bcur_take8(struct __sk_buff *skb, struct bcur *c, __u8 *out) {
     if (c->left < 1)
@@ -847,11 +872,12 @@ static __always_inline int tls_sni_extract(struct __sk_buff *skb, __u32 pbase,
     __u32 hs_len;
 
     if (!bcur_take8(skb, &c, &content) || content != 0x16)   /* handshake record */
-        return 0;
+    return 0;
     if (!bcur_take16(skb, &c, &ver))                     /* record version */
         return 0;
-    if (!bcur_take16(skb, &c, &rec_len) || rec_len < 4)
+    if (!bcur_take16(skb, &c, &rec_len) || rec_len < 4) {
         return 0;
+    }
     /* Bound what follows to the record's declared body: bytes beyond
      * rec_len belong to another record and must never be parsed as part
      * of this handshake. A record claiming more than the packet carries
@@ -859,14 +885,20 @@ static __always_inline int tls_sni_extract(struct __sk_buff *skb, __u32 pbase,
      * split-ClientHello case. */
     if (rec_len < c.left)
         c.left = rec_len;
-    if (!bcur_take8(skb, &c, &hs_type) || hs_type != 0x01)    /* ClientHello */
+    if (!bcur_take8(skb, &c, &hs_type) || hs_type != 0x01) {  /* ClientHello */
         return 0;
+    }
     if (!bcur_take24(skb, &c, &hs_len))
-        return 0;
-    /* The ClientHello must be whole in this segment; a handshake split
-     * across TCP segments gets no verdict (documented gap). */
-    if (hs_len > c.left)
-        return 0;
+    return 0;
+    /* The handshake body may legitimately span TCP segments (a modern
+     * ClientHello with post-quantum key shares exceeds the MSS), so a
+     * hs_len larger than this segment's remainder is NOT an abort: the
+     * extension walk below is bounded by the segment's bytes, and the
+     * SNI — almost always the FIRST extension — sits well inside the
+     * first segment. Clamping to the shorter of the two keeps a short
+     * record from reading into the next one; a record truncated at the
+     * segment boundary fails the bcur reads later (fail open, never a
+     * false drop). */
     if (hs_len < c.left)                                 /* bound to the   */
         c.left = hs_len;                                 /* handshake body */
     if (!bcur_take16(skb, &c, &ver))                     /* client version */
@@ -888,29 +920,33 @@ static __always_inline int tls_sni_extract(struct __sk_buff *skb, __u32 pbase,
         __u16 et, el;
         if (!bcur_take16(skb, &c, &et) || !bcur_take16(skb, &c, &el))
             return 0;
-        if (el > c.left)
+        if (el > c.left) {
             return 0;
+        }
         if (et == 0x0000) {                              /* server_name */
             struct bcur e = { c.off, el };
             __u16 list_len, nl;
             __u8 name_type;
-            if (!bcur_take16(skb, &e, &list_len))
+            if (!bcur_take16(skb, &e, &list_len)) {
                 return 0;
+            }
             /* the name list must fill the extension exactly (single
              * HostName entry, as every real client encodes it) — this
              * also pins the name inside the declared list */
             if (list_len != el - 2)
+            return 0;
+            if (!bcur_take8(skb, &e, &name_type) || name_type != 0) {
                 return 0;
-            if (!bcur_take8(skb, &e, &name_type) || name_type != 0)
+            }
+            if (!bcur_take16(skb, &e, &nl) || nl == 0 || nl > e.left) {
                 return 0;
-            if (!bcur_take16(skb, &e, &nl) || nl == 0 || nl > e.left)
-                return 0;
+            }
             *out_off = e.off;
             *out_len = nl;
             return 1;
         }
         if (!bcur_skip(&c, el))
-            return 0;
+        return 0;
     }
     return 0;
 }
@@ -919,34 +955,87 @@ static __always_inline int tls_sni_extract(struct __sk_buff *skb, __u32 pbase,
  * bounded scan of the first HTTP_HOST_SCAN_MAX bytes for a line starting
  * with "Host:" (case-insensitive, preceded by a newline or at offset 0).
  * Strips any :port suffix and one trailing dot. Reads go through
- * bpf_skb_load_bytes (see struct bcur). */
+ * bpf_skb_load_bytes (see struct bcur); the value walk runs under
+ * bpf_loop (host_value_cb), which needs kernel >= 5.17 — well below the
+ * TCX (>= 6.6) this stage's hook already requires.
+ *
+ * Verifier structural rules (each was a real 1M processed-insn failure):
+ *   - No comparison against plen inside any loop. An `idx >= plen` guard
+ *     refines plen's minimum every iteration (taking the body proves
+ *     plen > idx), so no two iterations share a state, nothing prunes and
+ *     every position is simulated from scratch. Loop bounds are static
+ *     constants; out-of-stream reads are the helper's own runtime check.
+ *   - The value extraction stays OUTSIDE the scan and the match breaks.
+ *     A match at position i otherwise lets the verifier reach the full
+ *     extraction from every one of the HTTP_HOST_SCAN_MAX positions (the
+ *     five compare bytes are independent unknowns), multiplying the whole
+ *     walk by the scan length.
+ *   - The walk itself runs under bpf_loop so its per-byte branches are
+ *     verified once, not once per reaching path (see host_value_cb).
+ * A load past the stream ends the scan/walk (fail open when nothing was
+ * found) where the old guards returned or broke at the plen boundary; on
+ * a fragmented skb the helper fails before plen, so the walk stops early
+ * instead of aborting an already-found match — strictly more enforcement,
+ * never less. */
 #define HTTP_HOST_SCAN_MAX 128
 
+/* Value-extraction walk for the Host header, driven through bpf_loop():
+ * the helper verifies the callback body ONCE, so the whole walk costs a
+ * constant ~30 processed insns regardless of trip count. This is what
+ * keeps the extractor inside the kernel's 1M processed-insn budget: the
+ * scan can match at any of the HTTP_HOST_SCAN_MAX positions and every
+ * match reaches the walk carrying its own (hit) state — with a plain
+ * loop the walk's per-byte branches were re-explored 128 times (measured:
+ * 1000001 insns, max_states_per_insn 131). The callback skips leading
+ * blanks, reads to the end of the line (CR/LF or payload end) and records
+ * the first ':' (port separator) branchlessly. Trip cap: 16 blank slots
+ * plus DOMAIN_NAME_MAX value bytes; the datapath probe truncates names to
+ * DOMAIN_NAME_MAX anyway (domain_block_action), so the LPM lookup key is
+ * identical to the old longer walk. */
+struct host_val_ctx {
+    struct __sk_buff *skb;
+    __u32 pbase;     /* payload start (absolute skb offset) */
+    __u32 vstart;    /* value start, relative to pbase (advances past blanks) */
+    __u32 vlen;      /* value length (0 = still skipping blanks) */
+    __u32 colon;     /* first ':' offset within the value, +1 (0 = none) */
+};
+
+static u64 host_value_cb(u64 index, u64 ctx_u64)
+{
+    struct host_val_ctx *c = (struct host_val_ctx *)(unsigned long)ctx_u64;
+    __u8 b;
+
+    if (bpf_skb_load_bytes(c->skb, c->pbase + c->vstart + c->vlen, &b, 1))
+        return 1;                                    /* payload ended */
+    if (c->vlen == 0 && ((b == ' ') || (b == '\t'))) {
+        c->vstart += 1;                              /* skip leading blank */
+        return 0;
+    }
+    if (b == '\r' || b == '\n')
+        return 1;                                    /* end of line */
+    c->colon |= (__u32)(b == ':') * (__u32)(c->colon == 0) * (c->vlen + 1);
+    c->vlen += 1;
+    return 0;
+}
+
 static __always_inline int http_host_extract(struct __sk_buff *skb, __u32 pbase,
-                                             __u32 plen, __u32 *out_off, __u32 *out_len) {
-    __u32 scan = plen < HTTP_HOST_SCAN_MAX ? plen : HTTP_HOST_SCAN_MAX;
-    __u32 i, hit = 0, vstart, vend, k;
+                                             __u32 *out_off, __u32 *out_len) {
+    __u32 i, hit = 0, vstart, vlen, k;
     int found = 0;
     __u8 b;
 
-    /* Pass 1: locate the first line starting with "Host:". The value
-     * extraction is deliberately NOT nested inside this loop: the verifier
-     * explores the bounded scan for every position, and nesting the
-     * extraction walks inside it multiplies the processed-insn budget past
-     * the kernel's 1M limit. */
-    for (i = 0; i < scan; i++) {
-        if (i + 5 > plen)
-            break;
+    /* Pass 1: locate the first line starting with "Host:". */
+    for (i = 0; i < HTTP_HOST_SCAN_MAX; i++) {
         if (i != 0) {
             if (bpf_skb_load_bytes(skb, pbase + i - 1, &b, 1))
-                return 0;
+                break;                               /* past the stream */
             if (b != '\n')
-                continue;                                /* not a line start */
+                continue;                            /* not a line start */
         }
         {
             __u8 h[5];
             if (bpf_skb_load_bytes(skb, pbase + i, h, 5))
-                return 0;
+                break;                               /* past the stream */
             /* Single-branch match test: fold the five byte compares into
              * one scalar (0 only on an exact "Host:" match). A chained
              * short-circuit compare over unknown bytes forks the verifier
@@ -964,51 +1053,40 @@ static __always_inline int http_host_extract(struct __sk_buff *skb, __u32 pbase,
     if (!found)
         return 0;
 
-    /* Pass 2: extract the value on the matched line (executes once). */
-    vstart = hit + 5;                                    /* skip spaces/tabs */
-    for (k = 0; k < 16; k++) {
-        __u32 idx = vstart + k;
-        if (idx >= plen)
-            break;
-        if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
-            return 0;
-        if (b != ' ' && b != '\t')
-            break;
-    }
-    vstart += k;
+    /* Pass 2: extract the value with one bpf_loop() walk (see
+     * host_value_cb). Leading blanks are skipped inside the walk, the
+     * value runs to the line's end, and the first ':' is recorded for the
+     * port strip. An out-of-payload load ends the walk (fail open when
+     * nothing was found); a fragment boundary now also stops the walk
+     * instead of aborting a found match — strictly more enforcement,
+     * never less. */
+    {
+        struct host_val_ctx ctx = {
+            .skb = skb,
+            .pbase = pbase,
+            .vstart = hit + 5,
+            .vlen = 0,
+            .colon = 0,
+        };
 
-    vend = vstart;                                       /* read to end of line */
-    for (k = 0; k < DOMAIN_NAME_MAX + 8; k++) {
-        __u32 idx = vstart + k;
-        if (idx >= plen)
-            break;
-        if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
-            return 0;
-        if (b == '\r' || b == '\n')
-            break;
-        vend = idx + 1;
-    }
+        bpf_loop(16 + DOMAIN_NAME_MAX, host_value_cb, &ctx, 0);
 
-    for (k = 0; k < DOMAIN_NAME_MAX + 8 && vstart + k < vend; k++) {
-        __u32 idx = vstart + k;
-        if (bpf_skb_load_bytes(skb, pbase + idx, &b, 1))
-            return 0;
-        if (b == ':') {                                  /* strip :port */
-            vend = vstart + k;
-            break;
-        }
+        vlen = ctx.vlen;
+        if (ctx.colon != 0)                          /* strip :port */
+            vlen = ctx.colon - 1;
+        vstart = ctx.vstart;
     }
-    if (vend == vstart)
+    if (vlen == 0)
         return 0;
-    if (vend - vstart > 1) {                             /* strip trailing dot */
-        if (bpf_skb_load_bytes(skb, pbase + vend - 1, &b, 1))
+    if (vlen > 1) {                                  /* strip trailing dot */
+        if (bpf_skb_load_bytes(skb, pbase + vstart + vlen - 1, &b, 1))
             return 0;
         if (b == '.')
-            vend--;
+            vlen--;
     }
 
     *out_off = pbase + vstart;
-    *out_len = vend - vstart;
+    *out_len = vlen;
     return 1;
 }
 
@@ -1027,7 +1105,8 @@ static __always_inline int http_host_extract(struct __sk_buff *skb, __u32 pbase,
  * "math between pkt pointer and register with unbounded min value").
  * Volatile makes the results opaque to those rewrites; the callers read
  * the stream by skb offset (bpf_skb_load_bytes) instead. */
-static __always_inline int domain_tcp_payload(void *data, void *data_end,
+static __always_inline int domain_tcp_payload(struct __sk_buff *skb, bool l2,
+                                              void *data, void *data_end,
                                               __u32 *off_out, __u32 *plen_out) {
     struct hdr_cursor c = { data };
     struct ethhdr *eth;
@@ -1035,7 +1114,7 @@ static __always_inline int domain_tcp_payload(void *data, void *data_end,
     struct tcphdr *tcp;
     __u32 hlen;
 
-    if (parse_ethhdr(&c, data_end, &eth) != bpf_htons(ETH_P_IP))
+    if (l2 && parse_ethhdr(&c, data_end, &eth) != bpf_htons(ETH_P_IP))
         return 0;
     if (parse_iphdr(&c, data_end, &ip) < 0)
         return 0;
@@ -1047,7 +1126,13 @@ static __always_inline int domain_tcp_payload(void *data, void *data_end,
     if (hlen < sizeof(*tcp) || hlen > 60)
         return 0;
     volatile __u32 off_v = (__u32)((void *)tcp - (void *)data) + hlen;
-    volatile __u32 plen_v = (__u32)((void *)data_end - (void *)tcp) - hlen;
+    /* The payload length must come from skb->len, NOT data_end: outbound
+     * TCP data skbs are non-linear (tcp_sendmsg puts the payload in paged
+     * fragments), so the linear area typically ends right after the
+     * headers and data_end - (tcp + hlen) is 0 for every data packet.
+     * bpf_skb_load_bytes reads fragments, so the stream itself is fully
+     * reachable; skb->len spans it. */
+    volatile __u32 plen_v = skb->len - off_v;
     __u32 off = off_v;
     __u32 plen = plen_v;
     if (plen == 0)
@@ -1057,8 +1142,8 @@ static __always_inline int domain_tcp_payload(void *data, void *data_end,
     return 1;
 }
 
-SEC("classifier")
-int firewall_tc_egress(struct __sk_buff *skb) {
+SEC("cgroup_skb/egress")
+int firewall_cgroup_egress(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
     __u64 pkt_len = (__u64)(data_end - data);
@@ -1066,9 +1151,23 @@ int firewall_tc_egress(struct __sk_buff *skb) {
     int ok;
     int verdict;
 
-    /* 1. parse (shared with the XDP datapath). */
+    /* 0. scope: the cgroup egress hook sees the whole host's outbound
+     * traffic; keep the policy on the daemon's -i interface only
+     * (egress_meta entry 0, written by the daemon at attach time). An
+     * unwritten (0) scope processes every interface — the state before
+     * attach and under BPF_PROG_TEST_RUN, whose synthetic skbs carry
+     * ifindex 0; the daemon publishes the ifindex before the link goes
+     * live, so no real packet runs with an unset scope. */
+    {
+        __u32 zero = 0;
+        __u32 *ifidx = bpf_map_lookup_elem(&egress_meta, &zero);
+        if (ifidx && *ifidx != 0 && skb->ifindex != *ifidx)
+            return 1;
+    }
+
+    /* 1. parse (L3: the cgroup/skb context starts at the IP header). */
     nh.pos = data;
-    struct packet_info info = parse_packet(&nh, data_end, &ok);
+    struct packet_info info = parse_packet_l3(&nh, data_end, &ok);
 
     /* Unparseable or non-IPv4: apply the egress default policy only, exactly
      * like firewall_prog does for ingress. Without this early return a zeroed
@@ -1079,7 +1178,47 @@ int firewall_tc_egress(struct __sk_buff *skb) {
     if (!ok) {
         verdict = egress_default_policy() == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
         count_egress(verdict, pkt_len);
-        return tc_action(verdict);
+        return cg_action(verdict);
+    }
+
+    /* 1.5 retransmission fence: a flow whose ClientHello matched the
+     * domain blocklist is dropped wholesale (see blocked_flows in
+     * maps.h) — retransmitted segments of the dropped ClientHello may be
+     * re-segmented differently, and per-packet SNI parsing fails open on
+     * mid-record continuations, which would otherwise let the blocked
+     * handshake complete. The fence must not black-hole the flow's own
+     * teardown: a bare FIN or an RST carries no deliverable payload and
+     * is let through, and an RST also clears the entry — an undelivered
+     * teardown leaves the peer's acceptor wedged forever on a stream
+     * that can never complete (a serial TLS server stuck in SSL_accept
+     * starves every connection behind it), and the client socket would
+     * linger in FIN_WAIT_1. */
+    if (ok) {
+        struct ct_key fk;
+        ct_build_key(&fk, &info);
+        if (info.tcp_flags & (TCP_SYN | TCP_RST)) {
+            /* SYN: a fresh connection attempt on this tuple (the failed
+             * connection never established, so its port returns to the
+             * pool immediately) — un-fence so the new attempt is judged
+             * on its own merits by the domain stage below. RST: the flow
+             * is aborting; nothing follows it on this socket, so the
+             * fence entry dies with the connection. */
+            bpf_map_delete_elem(&blocked_flows, &fk);
+        } else if (bpf_map_lookup_elem(&blocked_flows, &fk)) {
+            __u32 off, plen;
+            int bare_fin = (info.tcp_flags & TCP_FIN) &&
+                           !domain_tcp_payload(skb, false, data, data_end,
+                                               &off, &plen);
+            if (!bare_fin) {
+                /* Data, pure ACKs and FIN-with-payload stay dropped: a
+                 * FIN can piggyback retransmitted ClientHello bytes. A
+                 * bare FIN falls through to the normal pipeline (and its
+                 * pass accounting) with the fence still armed for any
+                 * data retransmits that follow it. */
+                count_egress(XDP_DROP, pkt_len);
+                return cg_action(XDP_DROP);
+            }
+        }
     }
 
     /* 2. egress policy, gated by the egress presence bits. */
@@ -1113,21 +1252,26 @@ int firewall_tc_egress(struct __sk_buff *skb) {
          * offset can be range-verified (see domain_tcp_payload). Helper
          * loads are runtime-checked, so a malformed stream, a split
          * ClientHello or a non-linear skb simply fails open. */
-        if (domain_tcp_payload(data, data_end, &off, &plen)) {
+        if (domain_tcp_payload(skb, false, data, data_end, &off, &plen)) {
             __u32 name_off = 0;
             __u32 name_len = 0;
 
-            if (info.dport == bpf_htons(443))
+            if (info.dport == bpf_htons(443)) {
                 blocked = tls_sni_extract(skb, off, plen, &name_off, &name_len) &&
                           domain_block_action(skb, name_off, name_len);
-            else if (info.dport == bpf_htons(80))
-                blocked = http_host_extract(skb, off, plen, &name_off, &name_len) &&
+            } else if (info.dport == bpf_htons(80)) {
+                blocked = http_host_extract(skb, off, &name_off, &name_len) &&
                           domain_block_action(skb, name_off, name_len);
+            }
         }
         if (blocked) {
+            struct ct_key fk;
+            __u8 one = 1;
+            ct_build_key(&fk, &info);
+            bpf_map_update_elem(&blocked_flows, &fk, &one, BPF_ANY);
             count_egress(XDP_DROP, pkt_len);
             incr_egress_counter(COUNTER_EGRESS_DOMAIN_DROP, pkt_len);
-            return tc_action(XDP_DROP);
+            return cg_action(XDP_DROP);
         }
     }
 
@@ -1147,7 +1291,7 @@ int firewall_tc_egress(struct __sk_buff *skb) {
 
     if (verdict == XDP_DROP) {
         count_egress(XDP_DROP, pkt_len);
-        return tc_action(XDP_DROP);
+        return cg_action(XDP_DROP);
     }
 
     /* 4. accepted: record/refresh TCP state when a direction could need it. */
@@ -1157,7 +1301,7 @@ int firewall_tc_egress(struct __sk_buff *skb) {
 
     /* 5. passed. */
     count_egress(XDP_PASS, pkt_len);
-    return tc_action(XDP_PASS);
+    return cg_action(XDP_PASS);
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";

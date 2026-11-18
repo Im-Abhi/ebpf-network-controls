@@ -59,6 +59,18 @@ struct {
     __uint(max_entries, 1);
 } egress_config SEC(".maps");
 
+/* Egress attach metadata: entry 0 carries the target interface's ifindex.
+ * The egress classifier runs at the cgroup/skb hook, which sees outbound
+ * traffic of the WHOLE host, so the datapath gates every packet on
+ * skb->ifindex to keep the policy scoped to the daemon's -i interface.
+ * Written once by the daemon (control/ebpf/tc.go) at attach time. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1);
+} egress_meta SEC(".maps");
+
 /* ── Policy maps ────────────────────────────────────────────────────── */
 /* Ingress policy (consumed by the XDP datapath). See ipv4_lpm_key below. */
 
@@ -100,7 +112,7 @@ enum counter_index {
     COUNTER_EGRESS_DROP  = 4,
     COUNTER_EGRESS_PASS  = 5,
     COUNTER_EGRESS_DOMAIN_DROP = 6,   /* egress: TCP stream dropped on a blocked domain */
-    COUNTER_MAX          = 7,
+    COUNTER_MAX          = 8,
 };
 
 struct counter_value {
@@ -211,7 +223,7 @@ struct {
  * rule_value for layout consistency; entries loaded from the blocklist
  * file always carry ACTION_DROP, and the datapath treats a hit as an
  * unconditional DROP before the rule/default decision (see
- * firewall_tc_egress in bpf/firewall.c). */
+ * firewall_cgroup_egress in bpf/firewall.c). */
 struct lpm_domain_key {
     __u32 prefixlen;   /* name length in bits (len * 8) */
     __u8  name[64];    /* lowercase hostname, reversed, zero padded */
@@ -224,6 +236,30 @@ struct {
     __type(value, struct rule_value);
     __uint(max_entries, 65536);
 } domain_blocklist SEC(".maps");
+
+/* ── Blocked-flow fence (URL filtering) ────────────────────────────── */
+/* Flows whose ClientHello matched the domain blocklist. The SNI-bearing
+ * segment is dropped per-packet, but TCP retransmissions may be re-segmented
+ * differently — a continuation that per-packet parsing fails open on would
+ * otherwise deliver the SNI and complete the handshake. Once a flow is
+ * fenced here, every subsequent packet of the flow is dropped without
+ * re-parsing, so the connection can never complete.
+ *
+ * Lifecycle: the entry is written when the ClientHello matches, and dies
+ * with the connection — a SYN on the tuple (fresh attempt; a failed
+ * connection never established, so its port can be recycled at once) or an
+ * RST (abort; nothing follows it on that socket) clears it, and a bare FIN
+ * is passed through with the fence still armed so the peer can reclaim the
+ * socket. No expiry on purpose: a TTL short enough to reap stale entries
+ * would also let a patient client's retransmitted ClientHello through and
+ * complete the blocked handshake; the LRU bound (8192 flows) is the only
+ * capacity limit needed. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, struct ct_key);
+    __type(value, __u8);
+} blocked_flows SEC(".maps");
 
 /* ── Conntrack map ──────────────────────────────────────────────────── */
 /* TCP-only state table consulted only when the default policy is DENY, so

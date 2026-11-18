@@ -8,16 +8,16 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// TC verdicts (linux/pkt_cls.h). firewall_tc_egress returns TC_ACT_OK (pass)
-// or TC_ACT_SHOT (drop); the XDP program is exercised separately through
-// mustVerdict/runPacket with the XDP verdicts.
+// cgroup/skb verdicts: firewall_cgroup_egress returns 1 (pass) or 0 (drop);
+// the XDP program is exercised separately through mustVerdict/runPacket with
+// the XDP verdicts.
 const (
-	testTC_OK   = 0
-	testTC_SHOT = 2
+	testTC_OK   = 1
+	testTC_SHOT = 0
 )
 
-// These tests exercise the TC egress datapath (bpf/firewall.c
-// firewall_tc_egress) by injecting packets through BPF_PROG_TEST_RUN on the
+// These tests exercise the egress datapath (bpf/firewall.c
+// firewall_cgroup_egress) by injecting packets through BPF_PROG_TEST_RUN on the
 // classifier itself, asserting the returned TC verdict, and cross-checking the
 // XDP ingress path where the two hooks share state (conntrack). Requirements
 // match datapath_integration_test.go: Linux with eBPF, generated bindings
@@ -31,9 +31,13 @@ const (
 
 func runEgressPacket(t *testing.T, fw *Firewall, pkt []byte) int {
 	t.Helper()
-	ret, err := fw.tc.prog.Run(&ebpf.RunOptions{Data: pkt})
+	// The packet builders produce L2 frames; the kernel's TEST_RUN harness
+	// for cgroup/skb programs runs eth_type_trans on the injected data, so
+	// the program's skb->data ends up at the L3 header — exactly like the
+	// live cgroup egress hook. Inject the frame as built.
+	ret, err := fw.egress.prog.Run(&ebpf.RunOptions{Data: pkt})
 	if err != nil {
-		t.Fatalf("tc egress prog.Run: %v", err)
+		t.Fatalf("egress prog.Run: %v", err)
 	}
 	return int(ret)
 }
@@ -135,7 +139,7 @@ func TestEgressDatapath_HooksAreSeparate(t *testing.T) {
 
 // arpPkt builds a minimal Ethernet/ARP frame: an Ethernet II header with the
 // ARP ethertype followed by a 28-byte ARP payload. The datapath rejects it as
-// non-IPv4, so firewall_tc_egress must apply only the egress default policy.
+// non-IPv4, so firewall_cgroup_egress must apply only the egress default policy.
 func arpPkt() []byte {
 	pkt := make([]byte, 14+28)
 	pkt[12] = 0x08 // h_proto = ETH_P_ARP (0x0806)
@@ -148,7 +152,7 @@ func TestEgressDatapath_NonIPv4FollowsDefaultPolicy(t *testing.T) {
 
 	// Prime the egress IP presence bit AND make the zeroed key used when
 	// parsing fails (0.0.0.0/32) resolve to an actual DROP rule. Before the
-	// non-IPv4 early return in firewall_tc_egress this exact setup dropped
+	// non-IPv4 early return in firewall_cgroup_egress this exact setup dropped
 	// ARP/IPv6 frames even under an egress default of allow; the regression
 	// is that parse failures now take only the egress default policy, never
 	// the rule tables.

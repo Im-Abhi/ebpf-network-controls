@@ -11,7 +11,7 @@ import (
 // plane. It coordinates:
 //
 //   - the XDP program lifecycle      (prog, XDPProgram)
-//   - the TC egress hook lifecycle   (tc, TCProgram)
+//   - the cgroup egress hook lifecycle (egress, EgressProgram)
 //   - five rule tables               (ingress/egress × CIDR/port, plus the
 //     egress domain blocklist — see tables.go)
 //   - the conntrack table            (ctMgr)
@@ -22,7 +22,7 @@ import (
 // one of them.
 type Firewall struct {
 	prog *XDPProgram
-	tc   *TCProgram
+	egress *EgressProgram
 
 	ingressIPs    cidrTable   // blocked_ips           (XDP)
 	ingressPorts  portTable   // port_policy           (XDP)
@@ -47,7 +47,7 @@ func NewFirewall(ifaceName string) (*Firewall, error) {
 	presence := prog.RulePresence()
 	return &Firewall{
 		prog:          prog,
-		tc:            NewTCProgram(prog.EgressProgram(), prog.ifaceIndex),
+		egress:        NewEgressProgram(prog.EgressProgram(), prog.EgressMeta(), prog.ifaceIndex),
 		ingressIPs:    newCidrTable(prog.BlockedIps(), presence, rulePresenceIP),
 		ingressPorts:  newPortTable(prog.PortPolicy(), presence, rulePresencePort),
 		egressIPs:     newCidrTable(prog.EgressBlockedIps(), presence, rulePresenceEgressIP),
@@ -67,7 +67,7 @@ func (f *Firewall) Start() error {
 
 // Stop detaches the TC egress hook (if attached) and then the XDP program,
 // closing all kernel resources. Detaching egress first is required so no
-// stale classifier link survives a Stop: a TCX link holds its own
+// stale classifier link survives a Stop: the cgroup link holds its own
 // reference to the loaded program, so closing the XDP objects alone would
 // leave the egress hook live.
 func (f *Firewall) Stop() error {
@@ -181,20 +181,20 @@ func (f *Firewall) ClearPortRules() error {
 // egress datapath in bpf/firewall.c for the direction semantics).
 
 // StartEgress attaches the TC egress classifier to the interface's egress
-// path. It is a no-op when already attached. Requires kernel >= 6.6 (TCX).
+// path. It is a no-op when already attached.
 func (f *Firewall) StartEgress() error {
-	return f.tc.Start()
+	return f.egress.Start()
 }
 
 // StopEgress detaches the TC egress classifier, leaving the XDP program (and
 // policy state) untouched.
 func (f *Firewall) StopEgress() error {
-	return f.tc.Close()
+	return f.egress.Close()
 }
 
 // EgressAttached reports whether the TC egress classifier is attached.
 func (f *Firewall) EgressAttached() bool {
-	return f.tc.Attached()
+	return f.egress.Attached()
 }
 
 // BlockEgressWithActionPriority adds a destination IP/CIDR rule to the egress

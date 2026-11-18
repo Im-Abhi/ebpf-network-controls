@@ -111,11 +111,39 @@ EOF
 # servers inside the netns; the domain stage only fires on dport 80/443
 $NS python3 -m http.server 80 --bind "$NS_IP" > "$DIR/http.out" 2>&1 &
 SRV_PID=$!
-if command -v openssl >/dev/null 2>&1; then
+if command -v openssl >/dev/null 2>&1 && python3 -c 'import ssl' 2>/dev/null; then
     openssl req -x509 -newkey rsa:2048 -nodes -keyout "$DIR/key.pem" \
         -out "$DIR/cert.pem" -days 1 -subj "/CN=$GOOD" 2>/dev/null
-    $NS openssl s_server -accept 443 -cert "$DIR/cert.pem" -key "$DIR/key.pem" \
-        -www > "$DIR/tls.out" 2>&1 &
+    # Threaded TLS server, handshake in the worker thread: a connection whose
+    # ClientHello never arrives (a blocklist-fenced flow is black-holed, so
+    # its FIN/RST cannot deliver the teardown either) wedges only its own
+    # thread. A serial acceptor (openssl s_server) would instead block in
+    # SSL_accept forever and starve every connection behind it — which is a
+    # property of the server, not of the firewall under test.
+    cat > "$DIR/tlssrv.py" <<'PYEOF'
+import http.server, ssl, sys
+cert, key, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(cert, key)
+class Handler(http.server.BaseHTTPRequestHandler):
+    def setup(self):
+        self.request = ctx.wrap_socket(self.request, server_side=True)
+        super().setup()
+    def do_GET(self):
+        body = b'<html><body>ok</body></html>\n'
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+Server(('', port), Handler).serve_forever()
+PYEOF
+    $NS python3 "$DIR/tlssrv.py" "$DIR/cert.pem" "$DIR/key.pem" 443 \
+        > "$DIR/tls.out" 2>&1 &
     TLS_PID=$!
 fi
 sleep 0.3

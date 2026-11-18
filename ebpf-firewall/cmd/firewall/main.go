@@ -46,7 +46,7 @@ func main() {
 	// Attach the TC egress hook unless the operator opted into ingress-only
 	// operation. Defaults to ingress-only so a kernel older than 6.6 does not
 	// break the plain firewall path; `-dir out|both` is the explicit opt-in
-	// and fails loudly when the kernel lacks TCX support.
+	// cgroup/skb egress sees every outbound packet on any kernel.
 	wantEgress := dir == "out" || dir == "both"
 	if dir != "in" && dir != "out" && dir != "both" {
 		log.Fatalf("Invalid -dir %q: use in, out, or both", dir)
@@ -81,13 +81,13 @@ func main() {
 	}
 	log.Printf("XDP (%s) attached to %s", fw.AttachMode(), ifname)
 
-	// Attach the TC egress classifier (TCX, kernel >= 6.6).
+	// Attach the egress classifier (cgroup/skb).
 	if wantEgress {
 		if err := fw.StartEgress(); err != nil {
 			fw.Stop()
-			log.Fatalf("Failed to attach TC egress: %v", err)
+			log.Fatalf("Failed to attach egress: %v", err)
 		}
-		log.Printf("TC egress (tcx) attached to %s", ifname)
+		log.Printf("Egress (cgroup/skb) attached for %s", ifname)
 	}
 
 	// Populate the blocked IP's into the kernel map. `-block` seeds both
@@ -212,7 +212,7 @@ func main() {
 	defer srv.Close()     // runs FIRST: socket closes before program detaches
 
 	if wantEgress {
-		log.Printf("Successfully attached XDP (%s) + TC egress (tcx) to %s", fw.AttachMode(), ifname)
+		log.Printf("Successfully attached XDP (%s) + egress (cgroup/skb) for %s", fw.AttachMode(), ifname)
 	} else {
 		log.Printf("Successfully attached XDP (%s) to %s", fw.AttachMode(), ifname)
 	}
