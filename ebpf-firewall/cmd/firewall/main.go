@@ -82,7 +82,7 @@ func main() {
 	// nothing.
 	if urlBlocklist != "" && !wantEgress {
 		wantEgress = true
-		log.Printf("-url-blocklist requires the egress hook; attaching TC egress")
+		log.Printf("-url-blocklist requires the egress hook; attaching cgroup/skb egress")
 	}
 
 	// Remove resource limits for kernels <5.11.
