@@ -91,6 +91,11 @@ type cliOptions struct {
 	priority  uint
 }
 
+// version is stamped at link time for release builds via
+// -ldflags "-X main.version=vX.Y.Z" (see packaging/PACKAGING.md); a plain
+// `go build` or `make build` reports "dev".
+var version = "dev"
+
 // extractOptions pulls the -sock/-protocol/-dport/-sport/-dir options out of
 // the raw arguments (also accepting --x and x=value forms) so they work in
 // any position relative to the command. Go's flag package stops at the first
@@ -105,6 +110,9 @@ func extractOptions(raw []string) (args []string, opts cliOptions, err error) {
 		switch {
 		case arg == "-h" || arg == "--help":
 			usage()
+			os.Exit(0)
+		case arg == "-version" || arg == "--version":
+			fmt.Println("firewallctl", version)
 			os.Exit(0)
 		case arg == "-sock" || arg == "--sock":
 			if i+1 >= len(raw) {
@@ -417,5 +425,6 @@ Options:
                    match a packet the highest priority wins. At equal
                    priority the more specific port rule wins and a tie
                    between an IP rule and a port rule resolves to drop
+  -version         print the firewallctl version and exit
 `)
 }

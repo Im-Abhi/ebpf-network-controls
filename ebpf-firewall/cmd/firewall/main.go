@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -20,7 +21,13 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
+// version is stamped at link time for release builds via
+// -ldflags "-X main.version=vX.Y.Z" (see packaging/PACKAGING.md); a plain
+// `go build` or `make build` reports "dev".
+var version = "dev"
+
 func main() {
+	var showVersion bool
 	var ifname string
 	var blockList string
 	var urlBlocklist string
@@ -28,16 +35,33 @@ func main() {
 	var ctTimeout time.Duration
 	var httpAddr string
 	var dir string
-	flag.StringVar(&ifname, "i", "wlp0s20f3", "Network interface name where the eBPF programs will be attached")
+	flag.StringVar(&ifname, "i", "", "Network interface to attach the eBPF programs to (required, e.g. -i eth0)")
 	flag.StringVar(&blockList, "block", "", "Comma-separated list of IPs/CIDRs to block (e.g. '192.168.1.5, 10.0.0.0/8')")
 	flag.StringVar(&urlBlocklist, "url-blocklist", "", "Text file of domains/URLs to block on egress: one entry per line, # comments. A bare IPv4 goes to the egress IP table; a URL's host goes to the domain blocklist. Implies the egress hook (-dir out), since URL filtering only exists there")
 	flag.StringVar(&sockPath, "sock", "/var/run/ebpf-firewall.sock", "unix socket path for control")
 	flag.DurationVar(&ctTimeout, "ct-timeout", 5*time.Minute, "idle timeout for conntrack entries (0 disables the reaper)")
 	flag.StringVar(&httpAddr, "http-addr", "127.0.0.1:8080", "read-only HTTP stats API listen address (0 or empty disables)")
 	flag.StringVar(&dir, "dir", "in", "which datapath(s) to attach and manage: in (XDP), out (TC egress), or both")
+	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
 	flag.Parse()
 
+	if showVersion {
+		fmt.Println("firewall", version)
+		return
+	}
+
 	log := log.New(os.Stdout, "[firewall] ", log.LstdFlags)
+
+	// The attach interface is deliberately required: silently falling back to
+	// a guessed device would attach a kernel-level packet filter to the wrong
+	// interface.
+	if ifname == "" {
+		fmt.Fprintln(os.Stderr, "firewall: -i <interface> is required (e.g. sudo firewall -i eth0)")
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	log.Printf("ebpf-firewall %s", version)
 
 	// Signal handling / context.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

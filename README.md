@@ -218,7 +218,7 @@ It is intentionally loopback-bound by default and should stay that way:
 no authentication. Example:
 
 ```bash
-sudo ./bin/firewall -i wlp0s20f3 -http-addr 127.0.0.1:8080
+sudo ./bin/firewall -i eth0 -http-addr 127.0.0.1:8080
 curl -s localhost:8080/stats
 curl -s localhost:8080/conntrack
 ```
@@ -286,6 +286,25 @@ These are **planned**, not yet implemented:
 ---
 
 ## Getting Started & Installation
+
+### Install from a release (no build toolchain needed)
+
+The release binaries embed the compiled eBPF program — users need only Linux
+and root, not clang/libbpf/Go:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Im-Abhi/ebpf-network-controls/master/ebpf-firewall/packaging/install.sh | sudo bash -s -- --iface eth0
+```
+
+Or download `ebpf-firewall-<tag>-linux-<amd64|arm64>.tar.gz` from
+[Releases](https://github.com/Im-Abhi/ebpf-network-controls/releases) and
+follow [`ebpf-firewall/packaging/INSTALL.md`](ebpf-firewall/packaging/INSTALL.md)
+(manual install + systemd service). Requirements: a BTF-enabled kernel
+(≥ 5.15 for XDP ingress, ≥ 6.6 for TCX egress) and root privileges. See
+[`ebpf-firewall/packaging/PACKAGING.md`](ebpf-firewall/packaging/PACKAGING.md)
+for how releases are built.
+
+### Build from source
 
 For full environment setup, required Linux kernel headers, build tools, and dependencies, refer to:
 👉 **[INSTALLATION.md](INSTALLATION.md)**

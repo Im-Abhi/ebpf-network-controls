@@ -1,5 +1,13 @@
 # Installation Guide
 
+> **Installing from a release?** You don't need this page. The release
+> binaries embed the compiled eBPF program, so there is nothing to build:
+> grab a tarball from
+> [Releases](https://github.com/Im-Abhi/ebpf-network-controls/releases) or use
+> [`ebpf-firewall/packaging/install.sh`](ebpf-firewall/packaging/install.sh),
+> then follow [`ebpf-firewall/packaging/INSTALL.md`](ebpf-firewall/packaging/INSTALL.md).
+> This page is only for **building from source**.
+
 This page documents everything needed to build and run the eBPF firewall from
 scratch on a Linux machine. All packages are installed via your distro's
 package manager, so nothing here hard-codes a distribution-specific path.
@@ -27,9 +35,8 @@ sudo apt install -y \
     llvm \
     libbpf-dev \
     linux-tools-common \
-    linux-tools-$(uname -r) \
-    linux-headers-$(uname -r) \
-    bpftool
+    linux-tools-generic \
+    linux-headers-$(uname -r)
 ```
 
 ### Fedora / RHEL
@@ -81,12 +88,15 @@ sudo apk add \
 | **clang / llvm**              | Compiles the BPF C program to a `.bpf.o` object                |
 | **libbpf-dev / libbpf-devel** | BPF helper headers (`bpf/bpf_helpers.h`, `bpf/bpf_endian.h`)   |
 | **linux-headers**             | Kernel UAPI headers for the running kernel                     |
-| **linux-tools / bpftool**     | `bpftool` — generates `vmlinux.h` from kernel BTF              |
+| **linux-tools-generic**       | Provides the versioned `bpftool` binary (`bpftool` generates `vmlinux.h` from kernel BTF) |
 | **linux-tools-common**        | Provides the `bpftool`/perf wrappers on Debian/Ubuntu          |
 
-> Note: on Debian/Ubuntu the `bpftool` package name can vary by release. If
-> `bpftool` is not found after install, the `linux-tools-$(uname -r)` package
-> provides it as a wrapper; ensure the running kernel version matches.
+> Note: on Ubuntu ≤ 24.04 there is **no installable `bpftool` package** — it is
+> a virtual package provided by the `linux-tools-*` bundles, so
+> `linux-tools-common` + `linux-tools-generic` (or `linux-tools-$(uname -r)`
+> on a stock distro kernel) are what provide the `bpftool` command. A
+> standalone `bpftool` package exists on Debian, Ubuntu 25.04+, Fedora/RHEL,
+> Arch, and Alpine.
 
 ## Verify the toolchain
 
