@@ -41,6 +41,12 @@ type firewallIpv4LpmKey struct {
 	Data      uint32
 }
 
+type firewallLpmDomainKey struct {
+	_         structs.HostLayout
+	Prefixlen uint32
+	Name      [64]uint8
+}
+
 type firewallPortRuleKey struct {
 	_        structs.HostLayout
 	Protocol uint8
@@ -61,17 +67,20 @@ type firewallRuleValue struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	firewallMapBlockedIps        = "blocked_ips"
-	firewallMapConntrack         = "conntrack"
-	firewallMapCounters          = "counters"
-	firewallMapEgressBlockedIps  = "egress_blocked_ips"
-	firewallMapEgressConfig      = "egress_config"
-	firewallMapEgressPortPolicy  = "egress_port_policy"
-	firewallMapFirewallConfig    = "firewall_config"
-	firewallMapPortPolicy        = "port_policy"
-	firewallMapRulePresence      = "rule_presence"
-	firewallProgFirewallProg     = "firewall_prog"
-	firewallProgFirewallTcEgress = "firewall_tc_egress"
+	firewallMapBlockedFlows          = "blocked_flows"
+	firewallMapBlockedIps            = "blocked_ips"
+	firewallMapConntrack             = "conntrack"
+	firewallMapCounters              = "counters"
+	firewallMapDomainBlocklist       = "domain_blocklist"
+	firewallMapEgressBlockedIps      = "egress_blocked_ips"
+	firewallMapEgressConfig          = "egress_config"
+	firewallMapEgressMeta            = "egress_meta"
+	firewallMapEgressPortPolicy      = "egress_port_policy"
+	firewallMapFirewallConfig        = "firewall_config"
+	firewallMapPortPolicy            = "port_policy"
+	firewallMapRulePresence          = "rule_presence"
+	firewallProgFirewallCgroupEgress = "firewall_cgroup_egress"
+	firewallProgFirewallProg         = "firewall_prog"
 )
 
 // loadFirewall returns the embedded CollectionSpec for firewall.
@@ -116,19 +125,22 @@ type firewallSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type firewallProgramSpecs struct {
-	FirewallProg     *ebpf.ProgramSpec `ebpf:"firewall_prog"`
-	FirewallTcEgress *ebpf.ProgramSpec `ebpf:"firewall_tc_egress"`
+	FirewallCgroupEgress *ebpf.ProgramSpec `ebpf:"firewall_cgroup_egress"`
+	FirewallProg         *ebpf.ProgramSpec `ebpf:"firewall_prog"`
 }
 
 // firewallMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type firewallMapSpecs struct {
+	BlockedFlows     *ebpf.MapSpec `ebpf:"blocked_flows"`
 	BlockedIps       *ebpf.MapSpec `ebpf:"blocked_ips"`
 	Conntrack        *ebpf.MapSpec `ebpf:"conntrack"`
 	Counters         *ebpf.MapSpec `ebpf:"counters"`
+	DomainBlocklist  *ebpf.MapSpec `ebpf:"domain_blocklist"`
 	EgressBlockedIps *ebpf.MapSpec `ebpf:"egress_blocked_ips"`
 	EgressConfig     *ebpf.MapSpec `ebpf:"egress_config"`
+	EgressMeta       *ebpf.MapSpec `ebpf:"egress_meta"`
 	EgressPortPolicy *ebpf.MapSpec `ebpf:"egress_port_policy"`
 	FirewallConfig   *ebpf.MapSpec `ebpf:"firewall_config"`
 	PortPolicy       *ebpf.MapSpec `ebpf:"port_policy"`
@@ -161,11 +173,14 @@ func (o *firewallObjects) Close() error {
 //
 // It can be passed to loadFirewallObjects or ebpf.CollectionSpec.LoadAndAssign.
 type firewallMaps struct {
+	BlockedFlows     *ebpf.Map `ebpf:"blocked_flows"`
 	BlockedIps       *ebpf.Map `ebpf:"blocked_ips"`
 	Conntrack        *ebpf.Map `ebpf:"conntrack"`
 	Counters         *ebpf.Map `ebpf:"counters"`
+	DomainBlocklist  *ebpf.Map `ebpf:"domain_blocklist"`
 	EgressBlockedIps *ebpf.Map `ebpf:"egress_blocked_ips"`
 	EgressConfig     *ebpf.Map `ebpf:"egress_config"`
+	EgressMeta       *ebpf.Map `ebpf:"egress_meta"`
 	EgressPortPolicy *ebpf.Map `ebpf:"egress_port_policy"`
 	FirewallConfig   *ebpf.Map `ebpf:"firewall_config"`
 	PortPolicy       *ebpf.Map `ebpf:"port_policy"`
@@ -174,11 +189,14 @@ type firewallMaps struct {
 
 func (m *firewallMaps) Close() error {
 	return _FirewallClose(
+		m.BlockedFlows,
 		m.BlockedIps,
 		m.Conntrack,
 		m.Counters,
+		m.DomainBlocklist,
 		m.EgressBlockedIps,
 		m.EgressConfig,
+		m.EgressMeta,
 		m.EgressPortPolicy,
 		m.FirewallConfig,
 		m.PortPolicy,
@@ -196,14 +214,14 @@ type firewallVariables struct {
 //
 // It can be passed to loadFirewallObjects or ebpf.CollectionSpec.LoadAndAssign.
 type firewallPrograms struct {
-	FirewallProg     *ebpf.Program `ebpf:"firewall_prog"`
-	FirewallTcEgress *ebpf.Program `ebpf:"firewall_tc_egress"`
+	FirewallCgroupEgress *ebpf.Program `ebpf:"firewall_cgroup_egress"`
+	FirewallProg         *ebpf.Program `ebpf:"firewall_prog"`
 }
 
 func (p *firewallPrograms) Close() error {
 	return _FirewallClose(
+		p.FirewallCgroupEgress,
 		p.FirewallProg,
-		p.FirewallTcEgress,
 	)
 }
 

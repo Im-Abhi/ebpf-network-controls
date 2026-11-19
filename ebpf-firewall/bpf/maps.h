@@ -59,6 +59,18 @@ struct {
     __uint(max_entries, 1);
 } egress_config SEC(".maps");
 
+/* Egress attach metadata: entry 0 carries the target interface's ifindex.
+ * The egress classifier runs at the cgroup/skb hook, which sees outbound
+ * traffic of the WHOLE host, so the datapath gates every packet on
+ * skb->ifindex to keep the policy scoped to the daemon's -i interface.
+ * Written once by the daemon (control/ebpf/tc.go) at attach time. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1);
+} egress_meta SEC(".maps");
+
 /* ── Policy maps ────────────────────────────────────────────────────── */
 /* Ingress policy (consumed by the XDP datapath). See ipv4_lpm_key below. */
 
@@ -99,7 +111,8 @@ enum counter_index {
     COUNTER_EGRESS_TOTAL = 3,
     COUNTER_EGRESS_DROP  = 4,
     COUNTER_EGRESS_PASS  = 5,
-    COUNTER_MAX          = 6,
+    COUNTER_EGRESS_DOMAIN_DROP = 6,   /* egress: TCP stream dropped on a blocked domain */
+    COUNTER_MAX          = 8,
 };
 
 struct counter_value {
@@ -111,16 +124,17 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, __u32);
     __type(value, struct counter_value);
-    __uint(max_entries, 6);
+    __uint(max_entries, 7);
 } counters SEC(".maps");
 
 /* ── Rule-presence flags ─────────────────────────────────────────────── */
 /* Single-entry array the daemon uses to tell the datapath whether each
- * policy map currently holds at least one rule. Entry 0 packs four bits:
+ * policy map currently holds at least one rule. Entry 0 packs five bits:
  *   bit 0 (RULE_IP_PRESENT)          -> blocked_ips has >= 1 entry
  *   bit 1 (RULE_PORT_PRESENT)        -> port_policy has >= 1 entry
  *   bit 2 (RULE_EGRESS_IP_PRESENT)   -> egress_blocked_ips has >= 1 entry
  *   bit 3 (RULE_EGRESS_PORT_PRESENT) -> egress_port_policy has >= 1 entry
+ *   bit 4 (RULE_DOMAIN_PRESENT)      -> domain_blocklist has >= 1 entry
  * When a bit is clear the datapath skips the (LPM/hash) lookups for that
  * map entirely, since an empty map cannot match. This preserves the exact
  * same verdicts: a lookup against an empty map can only miss, and the
@@ -133,11 +147,12 @@ struct {
  *
  * Each datapath only tests the bits for maps it consumes: the XDP program
  * reads flags but only acts on bits 0-1, the TC egress program only on
- * bits 2-3, so both stay independent. */
+ * bits 2-4, so both stay independent. */
 #define RULE_IP_PRESENT          (1U << 0)
 #define RULE_PORT_PRESENT        (1U << 1)
 #define RULE_EGRESS_IP_PRESENT   (1U << 2)
 #define RULE_EGRESS_PORT_PRESENT (1U << 3)
+#define RULE_DOMAIN_PRESENT      (1U << 4)
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -191,6 +206,60 @@ struct {
     __type(value, struct rule_value);
     __uint(max_entries, 65535);
 } egress_port_policy SEC(".maps");
+
+/* ── Domain blocklist (URL filtering) ───────────────────────────────── */
+/* Hostname rules consulted ONLY by the TC egress datapath: when the host
+ * sends a TLS ClientHello to port 443 (SNI) or an HTTP request to port 80
+ * (Host header), the datapath extracts the announced name into an
+ * lpm_domain_key and probes this map. The key is the lowercase hostname
+ * REVERSED with its length in bits, so a domain's parent suffix is a byte
+ * PREFIX of the reversed name: "sub.example.com" reversed is
+ * "moc.elpmaxe.bus", whose 11-byte prefix "moc.elpmaxe" is the stored
+ * "example.com" — one longest-prefix-match lookup then implements the
+ * documented subdomain coverage (blocking example.com also matches its
+ * subdomains) without data-dependent probing, which the verifier's state
+ * budget cannot afford. Names longer than 63 chars are truncated
+ * identically by the userspace loader and the datapath. The value reuses
+ * rule_value for layout consistency; entries loaded from the blocklist
+ * file always carry ACTION_DROP, and the datapath treats a hit as an
+ * unconditional DROP before the rule/default decision (see
+ * firewall_cgroup_egress in bpf/firewall.c). */
+struct lpm_domain_key {
+    __u32 prefixlen;   /* name length in bits (len * 8) */
+    __u8  name[64];    /* lowercase hostname, reversed, zero padded */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);   /* required for LPMTrie */
+    __type(key, struct lpm_domain_key);
+    __type(value, struct rule_value);
+    __uint(max_entries, 65536);
+} domain_blocklist SEC(".maps");
+
+/* ── Blocked-flow fence (URL filtering) ────────────────────────────── */
+/* Flows whose ClientHello matched the domain blocklist. The SNI-bearing
+ * segment is dropped per-packet, but TCP retransmissions may be re-segmented
+ * differently — a continuation that per-packet parsing fails open on would
+ * otherwise deliver the SNI and complete the handshake. Once a flow is
+ * fenced here, every subsequent packet of the flow is dropped without
+ * re-parsing, so the connection can never complete.
+ *
+ * Lifecycle: the entry is written when the ClientHello matches, and dies
+ * with the connection — a SYN on the tuple (fresh attempt; a failed
+ * connection never established, so its port can be recycled at once) or an
+ * RST (abort; nothing follows it on that socket) clears it, and a bare FIN
+ * is passed through with the fence still armed so the peer can reclaim the
+ * socket. No expiry on purpose: a TTL short enough to reap stale entries
+ * would also let a patient client's retransmitted ClientHello through and
+ * complete the blocked handshake; the LRU bound (8192 flows) is the only
+ * capacity limit needed. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, struct ct_key);
+    __type(value, __u8);
+} blocked_flows SEC(".maps");
 
 /* ── Conntrack map ──────────────────────────────────────────────────── */
 /* TCP-only state table consulted only when the default policy is DENY, so

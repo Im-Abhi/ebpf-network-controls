@@ -38,9 +38,9 @@ sudo ./benchmark/run-bench.sh --backend xdp --scenario single --iterations 5 --d
 | `--tc` / `--dir out` | (flag; no value) | ingress (`--dir in`) |
 
 `--tc` (alias `--dir out`) switches the harness to the **egress datapath**
-(TC egress hook / nft OUTPUT chain) instead of the default ingress (XDP /
-INPUT chain). Directions and the extra `stateful` scenario are documented in
-[Egress mode](#egress-mode-tc).
+(cgroup/skb egress hook / nft OUTPUT chain) instead of the default ingress
+(XDP / INPUT chain). Directions and the extra `stateful` scenario are
+documented in [Egress mode](#egress-mode-tc).
 
 Environment knobs (no flag equivalent): `ITERS` iterations, `DURATION`
 seconds per pass, `UDP_BW` iperf3 UDP rate for the saturated pass (`0` default =
@@ -67,20 +67,20 @@ identical for both backends.
 `stateful` requires `--tc`/`--dir out`: it asserts a default-deny egress policy
 and whitelists the sandbox LAN (`HOST_IP`/`NS_IP`) so a real flow is traced by
 conntrack instead of being blocked. For the XDP backend the firewall daemon
-runs `-dir out` (TC egress) with `default deny --dir out` and two
+runs `-dir out` (cgroup/skb egress) with `default deny --dir out` and two
 `--action pass` rules; for nftables the mirror is an OUTPUT chain with policy
 `drop` plus the two `accept` rules. The measured rows are the usual UDP/TCP/RTT
 metrics under a stateful pass path (no `flood_sent`/`drop_pps` — nothing is
 dropped). `stateful` is not part of `--scenario all`; pass it explicitly.
 
-Note on L2 bootstrap: the TC egress datapath applies the egress *default*
-policy to non-IPv4 frames as well, so under `default deny --dir out` an ARP
-exchange on the veth is dropped and neighbour resolution dead-locks the link
-(the nft mirror is unaffected — an `inet` OUTPUT chain never sees ARP). The
-scenario therefore pins **permanent neighbour entries on both veth peers**
-(`ip neigh replace ... nud permanent`) before measuring, so the IPv4 flow needs
-no ARP; this surfaces a real datapath limitation (there is currently no ARP /
-non-IPv4 exception knob for egress default-deny).
+Note on L2 bootstrap: the cgroup/skb egress hook only ever sees IP packets, so
+ARP passes the firewall untouched and the nft mirror is likewise unaffected
+(an `inet` OUTPUT chain never sees ARP). (The TC-era egress datapath this
+benchmark originally measured applied the egress *default* to non-IPv4 frames
+too, which dead-locked neighbour resolution under `default deny --dir out`.)
+The scenario nevertheless pins **permanent neighbour entries on both veth
+peers** (`ip neigh replace ... nud permanent`) before measuring, so the IPv4
+flow needs no ARP; this keeps the harness deterministic regardless of backend.
 
 Fairness: the C datapath matches a network on **source, then destination**, so
 the nftables backend installs both `ip saddr <net> drop` and `ip daddr <net> drop`
@@ -123,9 +123,9 @@ path that a `server → client` (`-R`) test would measure.
 
 With `--tc` the roles swap: the iperf3 server runs inside `benchns` and the
 client on the host, so bulk DATA flows **host → netns** and is filtered by the
-TC egress hook (firewall `-dir out`) or the nft OUTPUT chain. `tcp_bps`/`udp_bps`
-then measure the egress forwarding datapath; the row's `dir` column (`in`/`out`)
-records which direction each run measured.
+egress hook (firewall `-dir out`, cgroup/skb) or the nft OUTPUT chain.
+`tcp_bps`/`udp_bps` then measure the egress forwarding datapath; the row's
+`dir` column (`in`/`out`) records which direction each run measured.
 
 **The UDP load is dual.** The saturated pass (`UDP_BW`, default `-b 0`
 unthrottled) stresses the receive path, while a controlled pass (`UDP_CTL_BW`,
@@ -198,15 +198,15 @@ offload-capable NIC is available.
 **egress datapath**, producing an egress-vs-egress comparison instead of the
 default ingress one:
 
-- the firewall daemon starts with `-dir out`, attaching the TCX egress
-  classifier on `bench-v0` (requires kernel ≥ 6.6; `-dir out` also attaches the
-  XDP program, which is why the daemon accepts both in one process);
+- the firewall daemon starts with `-dir out`, attaching the cgroup/skb egress
+  program on `bench-v0` (`-dir out` also attaches the XDP program, which is
+  why the daemon accepts both in one process);
 - `firewallctl block`/`default`/`clear` are issued with `--dir out` so rules
   and the default policy target the egress tables;
 - nftables mirrors the egress path with an **OUTPUT** chain
   (`type filter hook output priority 0`), same rule forms as the INPUT mirror;
 - iperf3 server listens inside `benchns`, the client runs on the host, so bulk
-  DATA flows host → netns across the TC egress hook / OUTPUT chain;
+  DATA flows host → netns across the egress hook / OUTPUT chain;
 - hook-side counters come from the daemon's `egress_stats` (same keys as the
   ingress `fc_stats`, so `xdp_drop_delta`/`log_xdp_delta` apply unchanged);
 - every summary row gains a trailing `dir` column (`in` or `out`) and
@@ -219,7 +219,7 @@ sudo ./benchmark/run-bench.sh --tc --scenario stateful --iterations 3  # statefu
 sudo ./benchmark/run-bench.sh --dir out --backend xdp --scenario drop  # egress drop, XDP backend only
 ```
 
-The XDP egress `drop` cell is drivable: a TC egress verdict drops the skb
+The XDP egress `drop` cell is drivable: an egress verdict drops the skb
 after the socket has queued it, so the flood's `sendto` succeeds and hook-side
 drops are counted (`flood_sent` ≈ `drop_pps`). The nft egress `drop` cell is
 **void by design**: an nftables OUTPUT-chain drop refuses the locally-generated
@@ -497,6 +497,11 @@ requires kernel ≥ 6.6 — each run's `meta.txt` records the kernel, XDP attach
 mode and toolchain; quote them alongside this section. Rows carry the trailing
 `dir` column and `meta.txt` records `direction: out`. Raw per-iteration data:
 `results/20261008-224735/` and `results/20261009-122318/` (gitignored).
+
+> Historical note: these captures were taken while egress rode the TCX
+> classifier. The firewall's egress hook has since been replaced by
+> cgroup/skb (TC egress never fired for TCP data packets on the development
+> kernel — see ARCHITECTURE.md); the harness commands are unchanged.
 
 ### Egress matrix (medians, n=5)
 

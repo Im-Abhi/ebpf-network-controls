@@ -64,7 +64,7 @@ files; everything policy-related on the Go side funnels through one facade.
 
 | Concept | File | Role |
 |---|---|---|
-| Datapath (ingress + egress) | `bpf/firewall.c` | Per-packet parse → lookup → decide, both hooks (`SEC("xdp")`, `SEC("classifier")`) |
+| Datapath (ingress + egress) | `bpf/firewall.c` | Per-packet parse → lookup → decide, both hooks (`SEC("xdp")`, `SEC("cgroup_skb/egress")`) |
 | Map definitions | `bpf/maps.h` | Every BPF map, its key/value layout, and the presence-bit contract |
 | Packet parsing helpers | `bpf/helpers.h` | Ethernet/IP/TCP/UDP header stepping |
 | Generated C↔Go bridge | `control/ebpf/firewall_bpf.go` | bpf2go output: embedded ELF + typed maps (regenerate via `make generate`) |
@@ -72,7 +72,7 @@ files; everything policy-related on the Go side funnels through one facade.
 | Facade | `control/ebpf/facade.go` | `Firewall`: the single handle wiring four table instances, conntrack, counters, config, and both program lifecycles |
 | Conntrack | `control/ebpf/conntrack.go` | Flow table listing/clearing and the idle-flow reaper |
 | Counters / default policy | `control/ebpf/counters.go`, `config.go` | Reading the counter map; setting the per-direction fallback policy |
-| Program lifecycle | `control/ebpf/xdp.go`, `tc.go` | Load/attach/detach of XDP (driver→generic fallback) and TCX egress |
+| Program lifecycle | `control/ebpf/xdp.go`, `tc.go` | Load/attach/detach of XDP (driver→generic fallback) and cgroup/skb egress |
 | Control server | `control/server/server.go` | Unix-socket JSON API; one `handle*` method per command |
 | Wire protocol | `control/server/protocol.go` | Request/Response JSON shapes |
 | HTTP observability | `control/api/api.go` | Read-only `GET /health /status /stats /rules /conntrack` |
@@ -120,6 +120,56 @@ packet:
 
 4. **Act.** **DROP** throws the packet away right there, before the network
    stack ever sees it. **PASS** lets it continue into the stack normally.
+
+## Egress: cgroup/skb and the domain blocklist
+
+Egress enforcement does **not** ride a TC/TCX classifier: on the development
+kernel TC egress never fires for TCP data packets (verified live — only
+control packets reached the hook), so a TC-based egress stage silently passes
+the very traffic it must filter. The egress program is therefore a
+`BPF_CGROUP_INET_EGRESS` cgroup/skb program attached at the root cgroup and
+scoped to the daemon's `-i` interface through the `egress_meta` map (an
+unwritten 0 processes every interface — the state before attach, and under
+`BPF_PROG_TEST_RUN`, whose synthetic skbs carry ifindex 0).
+
+Two consequences of the hook shape shape the datapath:
+
+- **The cgroup/skb context is L3** — `skb->data` starts at the IP header, no
+  Ethernet — so egress parses with the L3 cursor variants.
+- **Outbound TCP payload lives in paged fragments**, so
+  `data_end - tcp - hlen` reads 0 for data packets; the payload length comes
+  from `skb->len` and the stream is read through `bpf_skb_load_bytes`.
+
+### Domain stage (URL filtering)
+
+Web-bound TCP streams carry their destination name in the clear: the HTTP
+`Host` header (port 80) and the TLS SNI extension (port 443, ClientHello).
+The egress program extracts the name and probes the **domain blocklist**, an
+LPM trie keyed by the *reversed* hostname with its length in bits — so a
+parent suffix is a byte prefix of the reversed name and one longest-prefix
+lookup covers subdomains (`sub.example.com` matches a stored
+`example.com`). The extraction walks run over `bpf_loop()` to fit the
+verifier's 1M instruction budget, and a ClientHello split across TCP segments
+(modern ones are ~2 KB with post-quantum key shares) is parsed as a fragment:
+the SNI sits in segment 1.
+
+A hit is an unconditional DROP, before rules, priorities and the default
+policy. Full URL *path* filtering is impossible without TLS termination
+(MITM) — hostnames are the clear-text ceiling, and ECH / QUIC (HTTP/3) fail
+open by design.
+
+### Retransmission fence
+
+Dropping the SNI segment is not enough: TCP retransmits the ClientHello
+re-segmented, and the continuations fail per-packet parsing open — the blocked
+handshake would complete anyway. When a ClientHello matches the blocklist the
+flow is recorded in the `blocked_flows` LRU map and every later packet of that
+flow is dropped without re-parsing. The fence dies with the connection: a SYN
+on the tuple (fresh attempt on a recycled port) or an RST clears it, a bare
+FIN passes with the fence armed, and there is **no expiry on purpose** — a TTL
+would let a patient client's retransmitted ClientHello complete the blocked
+handshake. Teardown is passed through so the peer can reclaim its socket (an
+undelivered FIN/RST wedges a serial acceptor in `SSL_accept` forever).
 
 ---
 

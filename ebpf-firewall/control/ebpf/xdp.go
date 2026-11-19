@@ -120,11 +120,17 @@ func (x *XDPProgram) PortPolicy() *ebpf.Map {
 	return x.objs.PortPolicy
 }
 
-// EgressProgram returns the TC egress classifier program handle. It is loaded
+// EgressProgram returns the egress classifier program handle. It is loaded
 // in the same object as the XDP program but NOT attached by LoadXDP; wire it
-// up with TCProgram when the egress path is enabled.
+// up with EgressAttach (see tc.go) when the egress path is enabled.
 func (x *XDPProgram) EgressProgram() *ebpf.Program {
-	return x.objs.FirewallTcEgress
+	return x.objs.FirewallCgroupEgress
+}
+
+// EgressMeta returns the map carrying the egress hook's target ifindex
+// (see egress_meta in bpf/maps.h).
+func (x *XDPProgram) EgressMeta() *ebpf.Map {
+	return x.objs.EgressMeta
 }
 
 // EgressBlockedIps returns the eBPF map holding the egress destination
@@ -141,6 +147,12 @@ func (x *XDPProgram) EgressConfig() *ebpf.Map {
 // EgressPortPolicy returns the eBPF map holding egress protocol/port rules.
 func (x *XDPProgram) EgressPortPolicy() *ebpf.Map {
 	return x.objs.EgressPortPolicy
+}
+
+// DomainBlocklist returns the eBPF map holding the hostname blocklist
+// (URL filtering; consumed only by the TC egress datapath).
+func (x *XDPProgram) DomainBlocklist() *ebpf.Map {
+	return x.objs.DomainBlocklist
 }
 
 // Config returns the eBPF map holding the default policy configuration.

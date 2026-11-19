@@ -41,8 +41,9 @@ MTP2+ are the thesis-level extensions built on top of it.
       `IP+priority` in `ldm_bindings.h`) — unit + integration tests green,
       full decision table covered live by `integration/fw-smoke.sh` (check 2)
 - [x] Direction-aware rules (INGRESS / EGRESS) — per-rule `--dir in|out|both`;
-      egress runs the same engine on outbound traffic via TCX (kernel >= 6.6),
-      with dst-only IP/CIDR + remote-dst port rules, separate maps/counters/
+      egress runs the same engine on outbound traffic via cgroup/skb
+      (BPF_CGROUP_INET_EGRESS, scoped to the daemon's interface), with
+      dst-only IP/CIDR + remote-dst port rules, separate maps/counters/
       status/HTTP state, and live coverage in `integration/fw-smoke.sh` (check 6)
 
 ### MTP1-F: Fast-path optimization
@@ -133,9 +134,16 @@ MTP2+ are the thesis-level extensions built on top of it.
 
 ## MTP2 — Advanced Controls
 
+- [x] Egress URL/domain blocklist — HTTP Host + TLS SNI extraction
+      (`bpf_loop` walks, split-ClientHello tolerance), LPM trie over reversed
+      names for subdomain coverage, retransmission fence against
+      re-segmented retries; unconditional DROP before rules/policy. Live
+      coverage in `integration/url-smoke.sh` (7/7). Fail-open limits: ECH,
+      QUIC/HTTP-3; URL *path* filtering needs MITM (out of scope)
 - [ ] TC ingress
-- [x] TC egress — see MTP1-C "Direction-aware rules"; TCX hook requires
-      kernel >= 6.6 (cilium/ebpf v0.22.0)
+- [x] cgroup/skb egress — see MTP1-C "Direction-aware rules"; the TC/TCX
+      egress hook was replaced by BPF_CGROUP_INET_EGRESS (TC egress never
+      fires for TCP data packets on the development kernel — verified live)
 - [ ] SYN-flood detection
 - [ ] Quarantine
 - [ ] Automated remediation

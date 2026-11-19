@@ -50,7 +50,7 @@ generate: $(VMLINUX_H)
 ## generate-debug: Same as generate but compiles in bpf_printk debugging
 generate-debug: $(VMLINUX_H)
 	@echo "==> Generating eBPF Go bindings (debug)..."
-	cd $(EBPF_DIR) && $(GO) run github.com/cilium/ebpf/cmd/bpf2go -target bpf firewall ../../bpf/firewall.c -- -I../../bpf -D FIREWALL_DEBUG
+	cd $(EBPF_DIR) && GOPACKAGE=ebpf $(GO) run github.com/cilium/ebpf/cmd/bpf2go -target bpf firewall ../../bpf/firewall.c -- -I../../bpf -D FIREWALL_DEBUG
 
 ## build: Build the firewall binary and firewallctl client
 build:
