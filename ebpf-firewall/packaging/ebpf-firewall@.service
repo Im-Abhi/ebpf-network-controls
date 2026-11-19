@@ -3,7 +3,7 @@
 #   sudo systemctl enable --now ebpf-firewall@eth0
 #
 # The instance name (%i) is the network interface the XDP ingress hook (and,
-# with a drop-in, the TC egress hook) attaches to.
+# with a drop-in, the cgroup/skb egress hook) attaches to.
 #
 # Overriding daemon flags is done with a drop-in, e.g.:
 #
