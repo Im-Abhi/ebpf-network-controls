@@ -21,7 +21,7 @@ import (
 // Unblock/List/Clear operation on either direction goes through exactly
 // one of them.
 type Firewall struct {
-	prog *XDPProgram
+	prog   *XDPProgram
 	egress *EgressProgram
 
 	ingressIPs    cidrTable   // blocked_ips           (XDP)
@@ -280,6 +280,25 @@ func (f *Firewall) BlockDomain(name string) error {
 // ListDomains returns the blocklisted hostnames.
 func (f *Firewall) ListDomains() ([]string, error) {
 	return f.egressDomains.List()
+}
+
+// UnblockDomain removes a hostname from the URL blocklist. Subdomain
+// coverage ends with it (LPM suffix semantics).
+func (f *Firewall) UnblockDomain(name string) error {
+	if err := f.egressDomains.Remove(name); err != nil {
+		return fmt.Errorf("unblocking domain %q: %w", name, err)
+	}
+	return nil
+}
+
+// ClearDomains removes every hostname from the URL blocklist. Separate from
+// Clear/ClearEgress by design: the domain blocklist is its own surface and
+// must not be wiped accidentally by a generic clear.
+func (f *Firewall) ClearDomains() error {
+	if err := f.egressDomains.Clear(); err != nil {
+		return fmt.Errorf("clearing domain blocklist: %w", err)
+	}
+	return nil
 }
 
 // ── Conntrack, counters, default policies ────────────────────────────────

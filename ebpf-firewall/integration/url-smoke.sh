@@ -192,6 +192,49 @@ case "$d1" in ''|*[!0-9]*) d1=0;; esac
 if [ "$d1" -gt 0 ]; then P "egress drop counter moved ($d1 drops)"
 else F "egress drop counter is 0 after blocked attempts"; fi
 
+# ---- runtime domain commands (firewallctl ↔ control socket) ----------------
+ctl() { "$REPO/bin/firewallctl" -sock "$SOCK" "$@"; }
+
+if ctl list-domains 2>/dev/null | grep -q "$BAD"; then
+    P "list-domains shows the startup blocklist entries"
+else
+    F "list-domains does not show '$BAD'"
+fi
+
+if ctl block-domain runtime.bad.example >/dev/null 2>&1; then
+    rt_rc=0; http_try "runtime.bad.example" >/dev/null 2>&1 || rt_rc=$?
+    if [ "$rt_rc" -ne 0 ]; then
+        P "runtime block-domain fences HTTP immediately (curl rc=$rt_rc)"
+    else
+        F "runtime block-domain did not fence HTTP (curl rc=0)"
+    fi
+else
+    F "block-domain rejected a valid name"
+fi
+
+if ctl unblock-domain runtime.bad.example >/dev/null 2>&1; then
+    rt_rc=0; http_try "runtime.bad.example" >/dev/null 2>&1 || rt_rc=$?
+    if [ "$rt_rc" -eq 0 ]; then
+        P "unblock-domain restores HTTP (curl rc=0)"
+    else
+        F "unblock-domain did not restore HTTP (curl rc=$rt_rc)"
+    fi
+else
+    F "unblock-domain failed"
+fi
+
+# clear-domains wipes everything, including the startup file's entries —
+# the fenced name from the file passes again afterwards.
+ctl clear-domains >/dev/null 2>&1
+if ctl list-domains 2>/dev/null | grep -q "no blocked domains"; then
+    P "clear-domains empties the blocklist"
+else
+    F "clear-domains left entries behind"
+fi
+code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://$NS_IP/" -H "Host: $BAD")
+if [ "$code" = "200" ]; then P "previously blocked '$BAD' passes after clear-domains (200)"
+else F "'$BAD' still fenced after clear-domains (code=$code)"; fi
+
 SUCCEEDED=1
 echo "--- $pass passed, $fail failed ---"
 exit 0

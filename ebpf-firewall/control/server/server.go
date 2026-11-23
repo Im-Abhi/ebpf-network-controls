@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -40,6 +41,13 @@ type Policy interface {
 	UnblockEgressPortRule(dst, protocol string, dport, sport uint16) error
 	ListEgressPortRules() ([]PortRule, error)
 	ClearEgress() error
+
+	// Egress domain blocklist (URL filtering). Domains are egress-only;
+	// Direction on requests is ignored for these commands.
+	BlockDomain(name string) error
+	UnblockDomain(name string) error
+	ListDomains() ([]string, error)
+	ClearDomains() error
 
 	// Shared state.
 	Interface() string
@@ -242,6 +250,14 @@ func (s *Server) handle(req Request) Response {
 		return s.handleDefault(req, dirs, echoDir)
 	case CmdClear:
 		return s.handleClear(dirs, echoDir)
+	case CmdBlockDomain:
+		return s.handleBlockDomain(req)
+	case CmdUnblockDomain:
+		return s.handleUnblockDomain(req)
+	case CmdListDomains:
+		return s.handleListDomains()
+	case CmdClearDomains:
+		return s.handleClearDomains()
 	case CmdConntrack:
 		return s.handleConntrack()
 	case CmdStats:
@@ -447,6 +463,50 @@ func (s *Server) handleConntrack() Response {
 		return Response{OK: false, Error: err.Error()}
 	}
 	return Response{OK: true, Conntrack: entries, Count: len(entries), Direction: "in"}
+}
+
+// Domain-blocklist handlers. Domains are an egress-only surface: the
+// direction field is ignored, and they are intentionally not part of
+// CmdClear — wiping them requires the explicit clear-domains command.
+
+func (s *Server) handleBlockDomain(req Request) Response {
+	name := strings.TrimSpace(req.Value)
+	if name == "" {
+		return Response{OK: false, Error: "block-domain requires a domain name"}
+	}
+	if err := s.policy.BlockDomain(name); err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	return Response{OK: true, Direction: dirOut}
+}
+
+func (s *Server) handleUnblockDomain(req Request) Response {
+	name := strings.TrimSpace(req.Value)
+	if name == "" {
+		return Response{OK: false, Error: "unblock-domain requires a domain name"}
+	}
+	if err := s.policy.UnblockDomain(name); err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	return Response{OK: true, Direction: dirOut}
+}
+
+func (s *Server) handleListDomains() Response {
+	domains, err := s.policy.ListDomains()
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	if domains == nil {
+		domains = []string{} // empty table serializes as [], not null
+	}
+	return Response{OK: true, Domains: domains, Count: len(domains), Direction: dirOut}
+}
+
+func (s *Server) handleClearDomains() Response {
+	if err := s.policy.ClearDomains(); err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	return Response{OK: true, Direction: dirOut}
 }
 
 func (s *Server) handleStats() Response {

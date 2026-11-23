@@ -50,6 +50,16 @@ func main() {
 		req = server.Request{Command: server.CmdStatus}
 	case "clear":
 		req = server.Request{Command: server.CmdClear, Direction: opts.direction}
+	case "block-domain", "unblock-domain":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "firewallctl: %s requires a domain name\n", cmd)
+			os.Exit(2)
+		}
+		req = server.Request{Command: server.Command(cmd), Value: args[1]}
+	case "list-domains":
+		req = server.Request{Command: server.CmdListDomains}
+	case "clear-domains":
+		req = server.Request{Command: server.CmdClearDomains}
 	case "stats":
 		req = server.Request{Command: server.CmdStats}
 	case "conntrack":
@@ -290,6 +300,15 @@ func printResponse(resp server.Response) {
 		if len(resp.PortRules) == 0 && len(resp.EgressPortRules) == 0 {
 			fmt.Println("no port rules")
 		}
+	case resp.Domains != nil:
+		if len(resp.Domains) > 0 {
+			fmt.Printf("blocked domains (%d):\n", len(resp.Domains))
+			for _, d := range resp.Domains {
+				fmt.Printf("  %s\n", d)
+			}
+		} else {
+			fmt.Println("no blocked domains")
+		}
 	case resp.Conntrack != nil:
 		if resp.Count == 0 {
 			fmt.Println("no tracked flows")
@@ -392,6 +411,11 @@ Commands:
   status                 show firewall status
   list                   list blocked IPs/CIDRs (per --dir)
   listports              list protocol/port rules (per --dir)
+  block-domain <name>    add a hostname to the egress URL blocklist (subdomains
+                         covered; immediate, not persisted across restarts)
+  unblock-domain <name>  remove it again
+  list-domains           show the URL blocklist
+  clear-domains          remove every blocked domain (separate from clear)
   block <ip/cidr>        block an IP/CIDR, or with --protocol/--dport a port rule
   unblock <ip/cidr>      unblock an IP/CIDR or port rule
   default allow|deny     set the default (fallback) policy on no match
@@ -403,9 +427,12 @@ Commands:
 
 Direction:
   -dir d         which policy to operate on: in (XDP ingress, default),
-                 out (TC egress), or both. Egress rules match the remote
+                 out (egress), or both. Egress rules match the remote
                  destination being contacted (dst-only for IP/CIDR rules).
-                 Requires a kernel >= 6.6 for the TC egress hook.
+
+  Domains are an egress-only surface: -dir is ignored for the
+  block-domain/unblock-domain/list-domains/clear-domains commands, and
+  they are not part of plain clear (use clear-domains).
 
 Options:
   -sock path       control socket path (default /var/run/ebpf-firewall.sock)

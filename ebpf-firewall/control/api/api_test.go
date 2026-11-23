@@ -125,6 +125,16 @@ func (f *fakePolicy) ListEgressPortRules() ([]server.PortRule, error) {
 	return append([]server.PortRule(nil), f.epors...), nil
 }
 func (f *fakePolicy) ClearEgress() error { return errors.New("unexpected write") }
+func (f *fakePolicy) BlockDomain(string) error {
+	return errors.New("unexpected write")
+}
+func (f *fakePolicy) UnblockDomain(string) error {
+	return errors.New("unexpected write")
+}
+func (f *fakePolicy) ListDomains() ([]string, error) {
+	return nil, errors.New("unexpected write")
+}
+func (f *fakePolicy) ClearDomains() error { return errors.New("unexpected write") }
 func (f *fakePolicy) SetEgressDefault(string) error {
 	return errors.New("unexpected write")
 }
@@ -207,6 +217,16 @@ func (p *errPolicy) ListEgressPortRules() ([]server.PortRule, error) {
 	return nil, errors.New("boom")
 }
 func (p *errPolicy) ClearEgress() error { return errors.New("boom") }
+func (p *errPolicy) BlockDomain(string) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) UnblockDomain(string) error {
+	return errors.New("boom")
+}
+func (p *errPolicy) ListDomains() ([]string, error) {
+	return nil, errors.New("boom")
+}
+func (p *errPolicy) ClearDomains() error { return errors.New("boom") }
 func (p *errPolicy) SetEgressDefault(string) error {
 	return errors.New("boom")
 }

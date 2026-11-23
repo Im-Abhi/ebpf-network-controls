@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ type fakePolicy struct {
 	rules     map[string]PortRule
 	ct        map[string]ConntrackEntry
 	eips      map[string]BlockedRule
+	domains   map[string]bool
 	erules    map[string]PortRule
 	call      bool
 	stat      Stats
@@ -30,13 +32,14 @@ type fakePolicy struct {
 
 func newFakePolicy() *fakePolicy {
 	return &fakePolicy{
-		ips:    make(map[string]BlockedRule),
-		rules:  make(map[string]PortRule),
-		ct:     make(map[string]ConntrackEntry),
-		eips:   make(map[string]BlockedRule),
-		erules: make(map[string]PortRule),
-		def:    "allow",
-		edef:   "allow",
+		ips:     make(map[string]BlockedRule),
+		rules:   make(map[string]PortRule),
+		ct:      make(map[string]ConntrackEntry),
+		eips:    make(map[string]BlockedRule),
+		domains: make(map[string]bool),
+		erules:  make(map[string]PortRule),
+		def:     "allow",
+		edef:    "allow",
 	}
 }
 
@@ -200,6 +203,40 @@ func (f *fakePolicy) ClearEgress() error {
 	defer f.mu.Unlock()
 	f.eips = make(map[string]BlockedRule)
 	f.erules = make(map[string]PortRule)
+	return nil
+}
+
+// ── domain blocklist (URL filtering) ────────────────────────────────────
+
+func (f *fakePolicy) BlockDomain(name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.domains[name] = true
+	return nil
+}
+
+func (f *fakePolicy) UnblockDomain(name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.domains, name)
+	return nil
+}
+
+func (f *fakePolicy) ListDomains() ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.domains))
+	for d := range f.domains {
+		out = append(out, d)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (f *fakePolicy) ClearDomains() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.domains = make(map[string]bool)
 	return nil
 }
 
@@ -705,6 +742,10 @@ func (p *errPolicy) UnblockEgressPortRule(string, string, uint16, uint16) error 
 }
 func (p *errPolicy) ListEgressPortRules() ([]PortRule, error) { return nil, errors.New("boom") }
 func (p *errPolicy) ClearEgress() error                       { return errors.New("boom") }
+func (p *errPolicy) BlockDomain(string) error                 { return errors.New("boom") }
+func (p *errPolicy) UnblockDomain(string) error               { return errors.New("boom") }
+func (p *errPolicy) ListDomains() ([]string, error)           { return nil, errors.New("boom") }
+func (p *errPolicy) ClearDomains() error                      { return errors.New("boom") }
 func (p *errPolicy) SetEgressDefault(string) error            { return errors.New("boom") }
 func (p *errPolicy) EgressDefault() (string, error)           { return "", errors.New("boom") }
 func (p *errPolicy) EgressStats() (Stats, error)              { return Stats{}, errors.New("boom") }
@@ -733,4 +774,82 @@ func TestStartClose_SocketRemoved(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	cancel()
+}
+
+func TestDomainCommands_RoundTrip(t *testing.T) {
+	fake := newFakePolicy()
+	s := New(filepath.Join(t.TempDir(), "t.sock"), fake)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Close()
+
+	send := func(req Request) Response {
+		t.Helper()
+		return s.handle(req)
+	}
+
+	// block-domain accepts a name and list-domains shows it (sorted).
+	if r := send(Request{Command: CmdBlockDomain, Value: "badsite.com"}); !r.OK {
+		t.Fatalf("block-domain: %s", r.Error)
+	}
+	if r := send(Request{Command: CmdBlockDomain, Value: "  ads.example.com  "}); !r.OK {
+		t.Fatalf("block-domain (whitespace-padded): %s", r.Error)
+	}
+	r := send(Request{Command: CmdListDomains})
+	if !r.OK {
+		t.Fatalf("list-domains: %s", r.Error)
+	}
+	if want := []string{"ads.example.com", "badsite.com"}; !reflect.DeepEqual(r.Domains, want) {
+		t.Errorf("list-domains = %v, want %v", r.Domains, want)
+	}
+	if r.Count != 2 {
+		t.Errorf("Count = %d, want 2", r.Count)
+	}
+	if r.Direction != dirOut {
+		t.Errorf("Direction = %q, want %q (domains are egress-only)", r.Direction, dirOut)
+	}
+
+	// unblock-domain removes exactly the requested name.
+	if r := send(Request{Command: CmdUnblockDomain, Value: "badsite.com"}); !r.OK {
+		t.Fatalf("unblock-domain: %s", r.Error)
+	}
+	r = send(Request{Command: CmdListDomains})
+	if !r.OK || len(r.Domains) != 1 || r.Domains[0] != "ads.example.com" {
+		t.Errorf("list-domains after unblock = %v, want [ads.example.com]", r.Domains)
+	}
+
+	// clear-domains empties the table; a following list is [] (not null).
+	if r := send(Request{Command: CmdClearDomains}); !r.OK {
+		t.Fatalf("clear-domains: %s", r.Error)
+	}
+	r = send(Request{Command: CmdListDomains})
+	if !r.OK {
+		t.Fatalf("list-domains after clear: %s", r.Error)
+	}
+	if r.Domains == nil || len(r.Domains) != 0 {
+		t.Errorf("list-domains after clear = %v, want non-nil empty slice", r.Domains)
+	}
+}
+
+func TestDomainCommands_RejectEmptyName(t *testing.T) {
+	fake := newFakePolicy()
+	s := New(filepath.Join(t.TempDir(), "t.sock"), fake)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Close()
+
+	for _, value := range []string{"", "   "} {
+		if r := s.handle(Request{Command: CmdBlockDomain, Value: value}); r.OK {
+			t.Errorf("block-domain(%q): expected error, got ok", value)
+		}
+		if r := s.handle(Request{Command: CmdUnblockDomain, Value: value}); r.OK {
+			t.Errorf("unblock-domain(%q): expected error, got ok", value)
+		}
+	}
 }

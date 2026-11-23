@@ -34,7 +34,7 @@ func main() {
 	flag.StringVar(&sockPath, "sock", "/var/run/ebpf-firewall.sock", "unix socket path for control")
 	flag.DurationVar(&ctTimeout, "ct-timeout", 5*time.Minute, "idle timeout for conntrack entries (0 disables the reaper)")
 	flag.StringVar(&httpAddr, "http-addr", "127.0.0.1:8080", "read-only HTTP stats API listen address (0 or empty disables)")
-	flag.StringVar(&dir, "dir", "in", "which datapath(s) to attach and manage: in (XDP), out (TC egress), or both")
+	flag.StringVar(&dir, "dir", "in", "which datapath(s) to attach and manage: in (XDP), out (egress), or both")
 	flag.Parse()
 
 	log := log.New(os.Stdout, "[firewall] ", log.LstdFlags)
@@ -52,13 +52,13 @@ func main() {
 		log.Fatalf("Invalid -dir %q: use in, out, or both", dir)
 	}
 
-	// The domain blocklist is consumed only by the TC egress datapath, so
+	// The domain blocklist is consumed only by the egress datapath, so
 	// asking for URL filtering implies the egress hook even under the
 	// default -dir in: loading rules nothing reads would silently enforce
 	// nothing.
 	if urlBlocklist != "" && !wantEgress {
 		wantEgress = true
-		log.Printf("-url-blocklist requires the egress hook; attaching TC egress")
+		log.Printf("-url-blocklist requires the egress hook; attaching egress (cgroup/skb)")
 	}
 
 	// Remove resource limits for kernels <5.11.
