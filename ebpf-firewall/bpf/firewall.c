@@ -79,13 +79,18 @@
  * IP/CIDR policy plus protocol/port rules. Extended later with direction
  * for richer rules without touching the datapath control flow. */
 struct packet_info {
-    __u32 saddr;   /* network byte order */
-    __u32 daddr;   /* network byte order */
+    __u32 saddr;   /* network byte order (IPv4 only; 0 for IPv6) */
+    __u32 daddr;   /* network byte order (IPv4 only; 0 for IPv6) */
     __u8  protocol;
+    __u8  family;  /* 4 = IPv4, 6 = IPv6 (egress domain stage only), 0 = unknown */
     __u16 dport;   /* destination port, network byte order (0 if not TCP/UDP) */
     __u16 sport;   /* source port, network byte order (0 if not TCP/UDP) */
     __u8  tcp_flags; /* TCP_FIN/SYN/RST/ACK bits (0 if not TCP) */
 };
+
+static __always_inline struct packet_info parse_packet_l3_v6(struct hdr_cursor *nh,
+                                                             void *data_end,
+                                                             int *ok);
 
 static __always_inline struct packet_info parse_packet_x(struct hdr_cursor *nh,
                                                          void *data_end,
@@ -103,10 +108,18 @@ static __always_inline struct packet_info parse_packet_x(struct hdr_cursor *nh,
         if (eth_type < 0) {
             return info;
         }
-    }
-
-    /* Only IPv4 is policy-relevant in the current implementation. */
-    if (eth_type != bpf_htons(ETH_P_IP)) {
+        /* IPv6 frames at ingress stay non-policy-relevant (default
+         * policy): the domain stage is egress-only, and the v4 tables
+         * never matched v6 anyway. */
+        if (eth_type != bpf_htons(ETH_P_IP)) {
+            return info;
+        }
+    } else if ((void *)nh->pos + 1 <= data_end &&
+               ((*(__u8 *)nh->pos) >> 4) == 6) {
+        /* L3 context, IPv6: the egress domain stage covers v6 TCP. */
+        return parse_packet_l3_v6(nh, data_end, ok);
+    } else if ((void *)nh->pos + 1 > data_end ||
+               ((*(__u8 *)nh->pos) >> 4) != 4) {
         return info;
     }
 
@@ -119,6 +132,7 @@ static __always_inline struct packet_info parse_packet_x(struct hdr_cursor *nh,
     info.saddr = ip->saddr;
     info.daddr = ip->daddr;
     info.protocol = protocol;
+    info.family = 4;
 
     /* Fragmented IPv4: only the first piece carries a real L4 header, so a
      * port/state decision here would be inconsistent across the pieces.
@@ -147,6 +161,89 @@ static __always_inline struct packet_info parse_packet_x(struct hdr_cursor *nh,
         }
     }
 
+    *ok = 1;
+    return info;
+}
+
+/* Walk an IPv6 header chain (L3 context): returns 1 with the payload offset
+ * (from the start of the IPv6 header) and the final protocol when the chain
+ * ends in TCP or UDP; 0 for fragments, AH, no-next, unknown next-headers and
+ * truncated chains — none of which are policy-relevant (default policy).
+ * Bounded to 8 extension headers. The headers themselves are always in the
+ * linear area, so direct reads are safe; the STREAM is read separately via
+ * helper loads (see domain_tcp_payload). */
+static __always_inline int l3_v6_walk(void *data, void *data_end,
+                                      __u32 *off_out, __u8 *proto_out) {
+    __u32 off = sizeof(struct ipv6hdr);
+    __u8 nhdr;
+
+    if (data + sizeof(struct ipv6hdr) > data_end)
+        return 0;
+    nhdr = ((__u8 *)data)[6]; /* next-header byte of the fixed header */
+
+    for (int i = 0; i < 8; i++) {
+        if (nhdr == IPPROTO_TCP || nhdr == IPPROTO_UDP) {
+            *off_out = off;
+            *proto_out = nhdr;
+            return 1;
+        }
+        /* hop-by-hop(0), routing(43), destination options(60) */
+        if (nhdr != 0 && nhdr != 43 && nhdr != 60)
+            return 0;
+        if (data + off + 8 > data_end)
+            return 0;
+        {
+            __u8 nxt = ((__u8 *)data)[off];
+            __u8 elen = ((__u8 *)data)[off + 1];
+            __u32 size = 8 + (__u32)elen * 8;
+            if (data + off + size > data_end)
+                return 0;
+            nhdr = nxt;
+            off += size;
+        }
+    }
+    return 0;
+}
+
+/* IPv6 L3 parse for the cgroup/skb egress hook. Policy scope for v6 is the
+ * domain stage only: the IP/CIDR and port tables (and conntrack) have
+ * IPv4-shaped keys, so v6 packets carry no addresses into the policy
+ * stages — the domain stage and the default policy decide. Ports and TCP
+ * flags are read from the (always linear) L4 header after the bounded
+ * extension-header walk. */
+static __always_inline struct packet_info parse_packet_l3_v6(struct hdr_cursor *nh,
+                                                             void *data_end,
+                                                             int *ok) {
+    struct packet_info info = {};
+    __u32 off = 0;
+    __u8 proto = 0;
+    __u8 *l4;
+
+    *ok = 0;
+    if (!l3_v6_walk(nh->pos, data_end, &off, &proto)) {
+        return info;
+    }
+    info.family = 6;
+    info.protocol = proto;
+
+    l4 = (__u8 *)nh->pos + off;
+    if (proto == IPPROTO_TCP) {
+        if ((void *)l4 + 20 > data_end) {
+            return info;
+        }
+        info.dport = ((__u16)l4[2] << 8) | (__u16)l4[3];
+        info.sport = ((__u16)l4[0] << 8) | (__u16)l4[1];
+        info.tcp_flags = ((l4[13] & 0x01) ? TCP_FIN : 0) |
+                         ((l4[13] & 0x02) ? TCP_SYN : 0) |
+                         ((l4[13] & 0x04) ? TCP_RST : 0) |
+                         ((l4[13] & 0x10) ? TCP_ACK : 0);
+    } else if (proto == IPPROTO_UDP) {
+        if ((void *)l4 + 8 > data_end) {
+            return info;
+        }
+        info.dport = ((__u16)l4[2] << 8) | (__u16)l4[3];
+        info.sport = ((__u16)l4[0] << 8) | (__u16)l4[1];
+    }
     *ok = 1;
     return info;
 }
@@ -1114,6 +1211,33 @@ static __always_inline int domain_tcp_payload(struct __sk_buff *skb, bool l2,
     struct tcphdr *tcp;
     __u32 hlen;
 
+    /* IPv6 (L3 context only — the domain stage is egress-only): walk the
+     * header chain numerically, then address the stream by skb offset
+     * exactly like the v4 path. The v6/TCP headers are always linear; the
+     * stream is read via helper loads by the extractors. */
+    if (!l2 && data + 1 <= data_end && ((*(__u8 *)data) >> 4) == 6) {
+        __u32 off6 = 0;
+        __u8 proto6 = 0;
+        __u8 doff_byte = 0;
+        volatile __u32 off_v, plen_v;
+
+        if (!l3_v6_walk(data, data_end, &off6, &proto6) || proto6 != IPPROTO_TCP)
+            return 0;
+        if (data + off6 + 20 > data_end)
+            return 0;                                        /* truncated TCP header */
+        doff_byte = ((__u8 *)data)[off6 + 12];
+        hlen = (__u32)(doff_byte >> 4) * 4;
+        if (hlen < 20 || hlen > 60)
+            return 0;
+        off_v = off6 + hlen;
+        plen_v = skb->len - off_v;
+        if (plen_v == 0)
+            return 0;
+        *off_out = off_v;
+        *plen_out = plen_v;
+        return 1;
+    }
+
     if (l2 && parse_ethhdr(&c, data_end, &eth) != bpf_htons(ETH_P_IP))
         return 0;
     if (parse_iphdr(&c, data_end, &ip) < 0)
@@ -1142,6 +1266,44 @@ static __always_inline int domain_tcp_payload(struct __sk_buff *skb, bool l2,
     return 1;
 }
 
+/* QUIC detector: is this a UDP datagram addressed to port 443? Works on
+ * v4 and v6 via helper loads (non-linear-safe), reading only the fixed
+ * header fields. IPv6 QUIC flows carry no extension headers, so a direct
+ * nexthdr == UDP test is exact for the v6 case; anything else is not
+ * treated as QUIC. */
+static __always_inline int is_quic_443(struct __sk_buff *skb, void *data,
+                                       void *data_end) {
+    __u8 first = 0, proto = 0, port_b[2] = { 0, 0 };
+    __u32 l4_off;
+
+    if (data + 1 > data_end)
+        return 0;
+    first = *(__u8 *)data;
+    switch (first >> 4) {
+    case 4:
+        if (bpf_skb_load_bytes(skb, 9, &proto, 1))
+            return 0;
+        if (proto != IPPROTO_UDP)
+            return 0;
+        if ((first & 0xf) < 5)
+            return 0;
+        l4_off = (__u32)(first & 0xf) * 4;
+        break;
+    case 6:
+        if (bpf_skb_load_bytes(skb, 6, &proto, 1))
+            return 0;
+        if (proto != IPPROTO_UDP)
+            return 0;
+        l4_off = sizeof(struct ipv6hdr);
+        break;
+    default:
+        return 0;
+    }
+    if (bpf_skb_load_bytes(skb, l4_off + 2, port_b, 2))
+        return 0;
+    return (((__u16)port_b[0] << 8) | (__u16)port_b[1]) == bpf_htons(443);
+}
+
 SEC("cgroup_skb/egress")
 int firewall_cgroup_egress(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;
@@ -1163,6 +1325,33 @@ int firewall_cgroup_egress(struct __sk_buff *skb) {
         __u32 *ifidx = bpf_map_lookup_elem(&egress_meta, &zero);
         if (ifidx && *ifidx != 0 && skb->ifindex != *ifidx)
             return 1;
+    }
+
+    /* 0.5 presence + QUIC fence: one presence read feeds both the fence
+     * and the policy stages below. The QUIC fence closes the biggest URL
+     * filtering gap: the domain stage only sees names in TCP payloads
+     * (SNI / Host), while browsers happily speak QUIC/HTTP-3 (UDP/443),
+     * which encrypts the name from the first byte. With the blocklist
+     * loaded, UDP/443 is dropped — browsers fall back to TCP (their
+     * designed fallback), where the blocklist applies. Protocol-agnostic
+     * (v4 + v6); -allow-quic sets EGRESS_FLAG_ALLOW_QUIC in
+     * egress_config[1] to opt out. Zero cost when no blocklist is loaded
+     * or the packet is not UDP/443-shaped. */
+    {
+        __u32 zero = 0;
+        __u32 *presence = bpf_map_lookup_elem(&rule_presence, &zero);
+        __u32 flags = presence ? *presence : 0;
+
+        if (flags & RULE_DOMAIN_PRESENT) {
+            __u32 one = 1;
+            __u32 *eflags = bpf_map_lookup_elem(&egress_config, &one);
+            if (!(eflags && (*eflags & EGRESS_FLAG_ALLOW_QUIC)) &&
+                is_quic_443(skb, data, data_end)) {
+                count_egress(XDP_DROP, pkt_len);
+                incr_egress_counter(COUNTER_EGRESS_QUIC_DROP, pkt_len);
+                return cg_action(XDP_DROP);
+            }
+        }
     }
 
     /* 1. parse (L3: the cgroup/skb context starts at the IP header). */
@@ -1192,8 +1381,10 @@ int firewall_cgroup_egress(struct __sk_buff *skb) {
      * teardown leaves the peer's acceptor wedged forever on a stream
      * that can never complete (a serial TLS server stuck in SSL_accept
      * starves every connection behind it), and the client socket would
-     * linger in FIN_WAIT_1. */
-    if (ok) {
+     * linger in FIN_WAIT_1. IPv4-only for now: the fence key is the v4
+     * conntrack tuple, and a re-segmented v6 ClientHello fails open
+     * (documented gap). */
+    if (ok && info.family == 4) {
         struct ct_key fk;
         ct_build_key(&fk, &info);
         if (info.tcp_flags & (TCP_SYN | TCP_RST)) {
@@ -1221,17 +1412,20 @@ int firewall_cgroup_egress(struct __sk_buff *skb) {
         }
     }
 
-    /* 2. egress policy, gated by the egress presence bits. */
+    /* 2. egress policy, gated by the egress presence bits. The IP/CIDR
+     * and port tables have IPv4-shaped keys, so they are v4-only — the
+     * v6 policy surface is the domain stage below plus the default
+     * policy. */
     __u32 zero = 0;
     __u32 *presence = bpf_map_lookup_elem(&rule_presence, &zero);
     __u32 flags = presence ? *presence : 0;
 
     struct rule_value ip_rule = {}, port_rule = {};
     int ip_matched = 0, port_matched = 0;
-    if (flags & RULE_EGRESS_IP_PRESENT) {
+    if (info.family == 4 && (flags & RULE_EGRESS_IP_PRESENT)) {
         ip_matched = egress_ip_block_action(&info, &ip_rule);
     }
-    if (flags & RULE_EGRESS_PORT_PRESENT) {
+    if (info.family == 4 && (flags & RULE_EGRESS_PORT_PRESENT)) {
         port_matched = egress_port_rule_action(&info, &port_rule);
     }
 
@@ -1265,10 +1459,15 @@ int firewall_cgroup_egress(struct __sk_buff *skb) {
             }
         }
         if (blocked) {
-            struct ct_key fk;
-            __u8 one = 1;
-            ct_build_key(&fk, &info);
-            bpf_map_update_elem(&blocked_flows, &fk, &one, BPF_ANY);
+            if (info.family == 4) {
+                /* v4 only: the fence key is the IPv4 conntrack tuple. A
+                 * re-segmented v6 ClientHello fails open (documented
+                 * gap, see the fence note above). */
+                struct ct_key fk;
+                __u8 one = 1;
+                ct_build_key(&fk, &info);
+                bpf_map_update_elem(&blocked_flows, &fk, &one, BPF_ANY);
+            }
             count_egress(XDP_DROP, pkt_len);
             incr_egress_counter(COUNTER_EGRESS_DOMAIN_DROP, pkt_len);
             return cg_action(XDP_DROP);
@@ -1278,12 +1477,14 @@ int firewall_cgroup_egress(struct __sk_buff *skb) {
     /* 3. decision: same priority table as ingress; on no rule match the
      * shared stateful fast path (ESTABLISHED, or a CLOSED flow draining out)
      * is consulted when this hook's default is DENY, then the egress default
-     * applies. */
+     * applies. v6 skips the stateful path (conntrack is v4-keyed) and the
+     * v4-only rule tables, so the domain stage above and the default policy
+     * decide. */
     enum default_policy def_egress = egress_default_policy();
     if (ip_matched || port_matched) {
         verdict = decide(ip_matched, &ip_rule, port_matched, &port_rule);
-    } else if (def_egress == DEFAULT_DENY && info.protocol == IPPROTO_TCP &&
-               ct_is_passable_egress(&info)) {
+    } else if (info.family == 4 && def_egress == DEFAULT_DENY &&
+               info.protocol == IPPROTO_TCP && ct_is_passable_egress(&info)) {
         verdict = XDP_PASS;
     } else {
         verdict = def_egress == DEFAULT_DENY ? XDP_DROP : XDP_PASS;
@@ -1294,8 +1495,9 @@ int firewall_cgroup_egress(struct __sk_buff *skb) {
         return cg_action(XDP_DROP);
     }
 
-    /* 4. accepted: record/refresh TCP state when a direction could need it. */
-    if (ct_active_egress(&info, def_egress)) {
+    /* 4. accepted: record/refresh TCP state when a direction could need it.
+     * v4 only — the conntrack key is an IPv4 tuple. */
+    if (info.family == 4 && ct_active_egress(&info, def_egress)) {
         ct_update_egress(&info);
     }
 

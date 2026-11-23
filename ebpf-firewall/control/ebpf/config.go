@@ -27,6 +27,14 @@ func ParseDefaultPolicy(s string) (DefaultPolicy, error) {
 	}
 }
 
+// Egress flag bits (egress_config entry 1), mirroring EGRESS_FLAG_* in
+// bpf/maps.h.
+const (
+	// EgressFlagAllowQuic opts out of the QUIC fence (UDP/443 drops) that
+	// the egress datapath applies while the domain blocklist is loaded.
+	EgressFlagAllowQuic uint32 = 1 << 0
+)
+
 // String returns the canonical name for a DefaultPolicy.
 func (p DefaultPolicy) String() string {
 	if p == DefaultDeny {
@@ -35,8 +43,8 @@ func (p DefaultPolicy) String() string {
 	return "allow"
 }
 
-// ConfigManager reads and writes the single-entry config map that holds the
-// default policy. Key 0 holds the default policy value.
+// ConfigManager reads and writes the config map that holds the default
+// policy (key 0) and the egress flag word (key 1, egress map only).
 type ConfigManager struct {
 	config *ebpf.Map
 }
@@ -50,6 +58,12 @@ func NewConfigManager(m *ebpf.Map) *ConfigManager {
 func (cm *ConfigManager) SetDefaultPolicy(p DefaultPolicy) error {
 	var key uint32 = 0
 	return cm.config.Put(key, uint32(p))
+}
+
+// SetWord writes a raw u32 word at the given config-map key (used for the
+// egress flag word at key 1; see EGRESS_FLAG_* in bpf/maps.h).
+func (cm *ConfigManager) SetWord(key, value uint32) error {
+	return cm.config.Put(key, value)
 }
 
 // DefaultPolicy reads the default policy from the config map, treating a

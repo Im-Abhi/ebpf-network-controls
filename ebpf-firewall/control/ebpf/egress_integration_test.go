@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"net"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -327,4 +328,142 @@ func TestEgressDatapath_CountersSeparate(t *testing.T) {
 	if st.TotalPackets != 0 {
 		t.Errorf("ingress TotalPackets = %d, want 0 (separate egress counters)", st.TotalPackets)
 	}
+}
+
+// ── IPv6 egress (cgroup/skb): the domain stage covers v6 TCP; the v4-only
+// tables (IP/CIDR, ports) and conntrack do not apply to v6, whose policy
+// surface is the domain stage plus the default policy. ─────────────────────
+
+func ipv6Header(src, dst net.IP, proto uint8, l4len int) []byte {
+	h := make([]byte, 40)
+	h[0] = 0x60 // version 6, traffic class 0, flow label 0
+	h[4] = byte(l4len >> 8)
+	h[5] = byte(l4len)
+	h[6] = proto // next header
+	h[7] = 64    // hop limit
+	copy(h[8:24], src.To16())
+	copy(h[24:40], dst.To16())
+	return h
+}
+
+func ip6(s string) net.IP {
+	return net.ParseIP(s).To16()
+}
+
+func v6Packet(src, dst net.IP, proto uint8, sport, dport uint16) []byte {
+	var l4 []byte
+	switch proto {
+	case 6:
+		l4 = tcpHeaderFlags(sport, dport, tcpFlagACK) // data-shaped: the domain gate excludes SYN
+	case 17:
+		l4 = udpHeader(sport, dport)
+	}
+	eth := ethHeaderEthertype(0x86DD)
+	hdr := ipv6Header(src, dst, proto, len(l4))
+	pkt := append(eth, hdr...)
+	return append(pkt, l4...)
+}
+
+func tcp6Pkt(src, dst string, sport, dport uint16) []byte {
+	return v6Packet(ip6(src), ip6(dst), 6, sport, dport)
+}
+
+func udp6Pkt(src, dst string, sport, dport uint16) []byte {
+	return v6Packet(ip6(src), ip6(dst), 17, sport, dport)
+}
+
+// tlsClientHello builds a minimal TLS ClientHello record whose SNI extension
+// carries the given name — byte-for-byte the shape tls_sni_extract() walks.
+func tlsClientHello(sni string) []byte {
+	name := []byte(sni)
+	extLen := 5 + len(name)                          // list_len(2) + name_type(1) + nl(2) + name
+	hsLen := 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extLen // ver + random + sid + suites + comp + exts
+	recLen := 4 + hsLen
+
+	rec := []byte{0x16, 0x03, 0x01, byte(recLen >> 8), byte(recLen)}
+	hs := []byte{0x01, byte(hsLen >> 16), byte(hsLen >> 8), byte(hsLen)}
+	body := []byte{0x03, 0x03} // client version
+	for i := 0; i < 32; i++ {  // random
+		body = append(body, byte(i))
+	}
+	body = append(body, 0x00)                   // session id len = 0
+	body = append(body, 0x00, 0x02, 0x13, 0x01) // one cipher suite
+	body = append(body, 0x01, 0x00)             // one compression method
+	body = append(body, byte(extLen>>8), byte(extLen))
+	body = append(body, 0x00, 0x00)              // ext type: server_name
+	body = append(body, 0x00, byte(5+len(name))) // ext length
+	body = append(body, 0x00, byte(3+len(name))) // list length
+	body = append(body, 0x00)                    // name_type: hostname
+	body = append(body, 0x00, byte(len(name)))
+	body = append(body, name...)
+	return append(append(rec, hs...), body...)
+}
+
+func tcp6PktWithPayload(src, dst string, sport, dport uint16, payload []byte) []byte {
+	eth := ethHeaderEthertype(0x86DD)
+	hdr := ipv6Header(ip6(src), ip6(dst), 6, 20+len(payload))
+	l4 := tcpHeaderFlags(sport, dport, tcpFlagACK)
+	pkt := append(eth, hdr...)
+	pkt = append(pkt, l4...)
+	return append(pkt, payload...)
+}
+
+func TestEgressDatapath_V6_DefaultAllow_Passes(t *testing.T) {
+	fw := loadTestFirewall(t)
+	mustEgressVerdict(t, fw, tcp6Pkt("2001:db8::1", "2001:db8::2", 12345, 443), testTC_OK)
+	mustEgressVerdict(t, fw, udp6Pkt("2001:db8::1", "2001:db8::2", 1000, 53), testTC_OK)
+}
+
+func TestEgressDatapath_V6_DefaultDeny_Drops(t *testing.T) {
+	fw := loadTestFirewall(t)
+	if err := fw.SetEgressDefault("deny"); err != nil {
+		t.Fatalf("SetEgressDefault: %v", err)
+	}
+	mustEgressVerdict(t, fw, tcp6Pkt("2001:db8::1", "2001:db8::2", 12345, 22), testTC_SHOT)
+
+	// v6 does not touch conntrack (the key is an IPv4 tuple).
+	if entries, err := fw.ListConntrack(); err != nil || len(entries) != 0 {
+		t.Errorf("v6 default-deny wrote conntrack state: %v entries (err %v)", entries, err)
+	}
+}
+
+func TestEgressDatapath_V6_IPRule_DoesNotApply(t *testing.T) {
+	fw := loadTestFirewall(t)
+	if err := fw.BlockEgressWithAction("1.2.3.4", "drop"); err != nil {
+		t.Fatalf("BlockEgressWithAction: %v", err)
+	}
+	// The IP tables are IPv4-shaped: a v6 destination is unaffected (v1
+	// scope — the v6 policy surface is the domain stage + default policy).
+	mustEgressVerdict(t, fw, tcp6Pkt("2001:db8::1", "2001:db8::2", 12345, 80), testTC_OK)
+}
+
+func TestEgressDatapath_V6_DomainBlock_Drops(t *testing.T) {
+	fw := loadTestFirewall(t)
+	if err := fw.BlockDomain("bad.example.com"); err != nil {
+		t.Fatalf("BlockDomain: %v", err)
+	}
+
+	// Blocked SNI over v6: the ClientHello stream is dropped.
+	mustEgressVerdict(t, fw, tcp6PktWithPayload("2001:db8::1", "2001:db8::2", 12345, 443,
+		tlsClientHello("bad.example.com")), testTC_SHOT)
+	// Subdomain covered by the reversed-LPM suffix semantics.
+	mustEgressVerdict(t, fw, tcp6PktWithPayload("2001:db8::1", "2001:db8::2", 12345, 443,
+		tlsClientHello("sub.bad.example.com")), testTC_SHOT)
+	// A different name passes.
+	mustEgressVerdict(t, fw, tcp6PktWithPayload("2001:db8::1", "2001:db8::2", 12345, 443,
+		tlsClientHello("good.example.com")), testTC_OK)
+	// Port 80 Host header over v6: blocked via the Host scan.
+	hostReq := []byte("GET / HTTP/1.1\r\nHost: bad.example.com\r\n\r\n")
+	mustEgressVerdict(t, fw, tcp6PktWithPayload("2001:db8::1", "2001:db8::2", 12345, 80, hostReq), testTC_SHOT)
+}
+
+func TestEgressDatapath_DomainBlock_V4_Drops(t *testing.T) {
+	fw := loadTestFirewall(t)
+	if err := fw.BlockDomain("bad.example.com"); err != nil {
+		t.Fatalf("BlockDomain: %v", err)
+	}
+	// Same verdict on the v4 path, for symmetry.
+	pkt := v4PacketFlags(ip("10.0.0.1"), ip("10.0.0.2"), 6, 12345, 443, tcpFlagACK)
+	pkt = append(pkt, tlsClientHello("bad.example.com")...)
+	mustEgressVerdict(t, fw, pkt, testTC_SHOT)
 }

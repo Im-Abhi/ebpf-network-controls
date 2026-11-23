@@ -366,6 +366,21 @@ func (f *Firewall) SetEgressDefault(s string) error {
 	return nil
 }
 
+// SetEgressQuicAllowed toggles the datapath's QUIC fence opt-out. While the
+// domain blocklist is loaded, the egress datapath drops UDP/443 (both
+// families) so browsers fall back to TCP, where the name is visible;
+// -allow-quic sets this bit to opt out and let HTTP/3 through unfenced.
+func (f *Firewall) SetEgressQuicAllowed(allowed bool) error {
+	var flags uint32
+	if allowed {
+		flags = EgressFlagAllowQuic
+	}
+	if err := f.egressCfgMgr.SetWord(1, flags); err != nil {
+		return fmt.Errorf("setting egress flags: %w", err)
+	}
+	return nil
+}
+
 // EgressDefault returns the current egress fallback policy ("allow" or "deny").
 func (f *Firewall) EgressDefault() (string, error) {
 	p, err := f.egressCfgMgr.DefaultPolicy()

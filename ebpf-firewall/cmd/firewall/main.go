@@ -24,6 +24,7 @@ func main() {
 	var ifname string
 	var blockList string
 	var urlBlocklist string
+	var allowQuic bool
 	var sockPath string
 	var ctTimeout time.Duration
 	var httpAddr string
@@ -31,6 +32,7 @@ func main() {
 	flag.StringVar(&ifname, "i", "wlp0s20f3", "Network interface name where the eBPF programs will be attached")
 	flag.StringVar(&blockList, "block", "", "Comma-separated list of IPs/CIDRs to block (e.g. '192.168.1.5, 10.0.0.0/8')")
 	flag.StringVar(&urlBlocklist, "url-blocklist", "", "Text file of domains/URLs to block on egress: one entry per line, # comments. A bare IPv4 goes to the egress IP table; a URL's host goes to the domain blocklist. Implies the egress hook (-dir out), since URL filtering only exists there")
+	flag.BoolVar(&allowQuic, "allow-quic", false, "Do not fence QUIC/HTTP-3 (UDP 443) while the URL blocklist is loaded. By default QUIC is dropped so browsers fall back to TCP, where domain blocking applies; with this flag, HTTP/3 traffic bypasses URL filtering")
 	flag.StringVar(&sockPath, "sock", "/var/run/ebpf-firewall.sock", "unix socket path for control")
 	flag.DurationVar(&ctTimeout, "ct-timeout", 5*time.Minute, "idle timeout for conntrack entries (0 disables the reaper)")
 	flag.StringVar(&httpAddr, "http-addr", "127.0.0.1:8080", "read-only HTTP stats API listen address (0 or empty disables)")
@@ -148,6 +150,18 @@ func main() {
 			ips++
 		}
 		log.Printf("url blocklist: %d domain(s) + %d ip rule(s) loaded from %s", domains, ips, urlBlocklist)
+	}
+
+	// The QUIC fence is active by default while the URL blocklist is loaded
+	// (UDP/443 dropped so browsers fall back to TCP); -allow-quic opts out.
+	if allowQuic {
+		if err := fw.SetEgressQuicAllowed(true); err != nil {
+			log.Printf("allow-quic: %v", err)
+		} else {
+			log.Printf("QUIC fence disabled (-allow-quic); HTTP/3 traffic bypasses URL blocking")
+		}
+	} else if urlBlocklist != "" {
+		log.Printf("QUIC fence active: UDP/443 is dropped while the URL blocklist is loaded (-allow-quic to opt out)")
 	}
 
 	// Conntrack is a plain (non-LRU) hash map, so a userspace reaper bounds its

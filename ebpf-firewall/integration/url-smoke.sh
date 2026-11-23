@@ -30,6 +30,7 @@ NS="ip netns exec $NS_NAME"
 FW_PID=
 SRV_PID=
 TLS_PID=
+SRV6_PID=
 
 pass=0
 fail=0
@@ -49,6 +50,7 @@ cleanup() {
     [ -n "$FW_PID" ]  && kill "$FW_PID" 2>/dev/null
     [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
     [ -n "$TLS_PID" ] && kill "$TLS_PID" 2>/dev/null
+    [ -n "$SRV6_PID" ] && kill "$SRV6_PID" 2>/dev/null
     ip netns pids "$NS_NAME" 2>/dev/null | while read -r p; do kill "$p" 2>/dev/null; done
     sleep 0.3
     ip netns del "$NS_NAME" 2>/dev/null
@@ -234,6 +236,68 @@ fi
 code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://$NS_IP/" -H "Host: $BAD")
 if [ "$code" = "200" ]; then P "previously blocked '$BAD' passes after clear-domains (200)"
 else F "'$BAD' still fenced after clear-domains (code=$code)"; fi
+
+# ---- IPv6 + QUIC fence -------------------------------------------------------
+# Re-arm the blocklist first: the runtime-command checks above ended with
+# clear-domains, and both the domain stage and the QUIC fence gate on the
+# domain presence bit.
+ctl block-domain "$BAD" >/dev/null 2>&1
+
+# The sandbox setup disabled IPv6 on the veths (v4-counter determinism);
+# re-enable it and hand out sandbox addresses for the v6 checks.
+sysctl -q -w net.ipv6.conf.$V0.disable_ipv6=0 || true
+$NS sysctl -q -w net.ipv6.conf.$V1.disable_ipv6=0 || true
+ip -6 addr add fd00:99::1/64 dev "$V0" 2>/dev/null || true
+$NS ip -6 addr add fd00:99::2/64 dev "$V1" 2>/dev/null || true
+
+$NS python3 -m http.server 80 --bind fd00:99::2 > "$DIR/http6.out" 2>&1 &
+SRV6_PID=$!
+sleep 0.2
+
+code=$(curl -6 -gs -m 3 -o /dev/null -w '%{http_code}' "http://[fd00:99::2]/" -H "Host: $BAD")
+if [ "$code" = "000" ]; then
+    P "v6 HTTP Host '$BAD' is dropped"
+else
+    F "v6 HTTP Host '$BAD' reached the server (code=$code)"
+fi
+code=$(curl -6 -gs -m 3 -o /dev/null -w '%{http_code}' "http://[fd00:99::2]/" -H "Host: $GOOD")
+if [ "$code" = "200" ]; then
+    P "v6 HTTP Host '$GOOD' passes (200)"
+else
+    F "v6 HTTP Host '$GOOD' did not pass (code=$code)"
+fi
+
+if [ -n "$TLS_PID" ]; then
+    sni6_rc=0; curl -6ks -m 3 --resolve "$BAD:443:[fd00:99::2]" "https://$BAD/" -o /dev/null 2>/dev/null || sni6_rc=$?
+    if [ "$sni6_rc" -ne 0 ]; then
+        P "v6 TLS SNI '$BAD' is dropped (curl rc=$sni6_rc)"
+    else
+        F "v6 TLS SNI '$BAD' reached the server"
+    fi
+fi
+
+# QUIC fence: UDP/443 datagrams (v4 and v6) are dropped while the blocklist
+# is loaded; a browser sees this as "no HTTP/3" and falls back to TCP.
+q1=$(edrop_cnt); q1=${q1:-0}
+case "$q1" in ''|*[!0-9]*) q1=0;; esac
+python3 - "$NS_IP" <<'PYEOF'
+import socket, sys
+for fam, addr in ((socket.AF_INET6, "fd00:99::2"), (socket.AF_INET, sys.argv[1])):
+    try:
+        s = socket.socket(fam, socket.SOCK_DGRAM)
+        s.sendto(b"\xc0" * 64, (addr, 443))  # QUIC-shaped initial datagram
+        s.close()
+    except OSError:
+        pass
+PYEOF
+sleep 0.2
+q2=$(edrop_cnt); q2=${q2:-0}
+case "$q2" in ''|*[!0-9]*) q2=0;; esac
+if [ "$((q2 - q1))" -ge 2 ]; then
+    P "QUIC fence: UDP/443 dropped on both families (counter +$((q2 - q1)))"
+else
+    F "QUIC fence: UDP/443 was not dropped (delta $((q2 - q1)))"
+fi
 
 SUCCEEDED=1
 echo "--- $pass passed, $fail failed ---"

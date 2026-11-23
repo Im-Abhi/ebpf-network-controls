@@ -50,13 +50,23 @@ struct {
     __uint(max_entries, 1);
 } firewall_config SEC(".maps");
 
-/* Egress (TC) default policy. Key/layout identical to firewall_config so the
- * same Go manager code can address either map. */
+/* Egress flag bits (egress_config entry 1). */
+#define EGRESS_FLAG_ALLOW_QUIC (1U << 0)   /* do NOT fence UDP/443 while the
+                                              domain blocklist is loaded */
+
+/* Egress (cgroup/skb) configuration: entry 0 holds the default policy
+ * (enum default_policy — key/layout identical to firewall_config so the same
+ * Go manager code can address either map); entry 1 holds the EGRESS_FLAG_*
+ * bitmap:
+ *   bit 0 (EGRESS_FLAG_ALLOW_QUIC) — do NOT fence UDP/443 while the domain
+ *          blocklist is loaded (the daemon's -allow-quic opt-out).
+ * The QUIC fence reads the flags only while the domain blocklist is loaded,
+ * so an unwritten entry (0) means "fence QUIC" — the URL-filtering default. */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, __u32);
     __type(value, __u32);
-    __uint(max_entries, 1);
+    __uint(max_entries, 2);
 } egress_config SEC(".maps");
 
 /* Egress attach metadata: entry 0 carries the target interface's ifindex.
@@ -112,6 +122,7 @@ enum counter_index {
     COUNTER_EGRESS_DROP  = 4,
     COUNTER_EGRESS_PASS  = 5,
     COUNTER_EGRESS_DOMAIN_DROP = 6,   /* egress: TCP stream dropped on a blocked domain */
+    COUNTER_EGRESS_QUIC_DROP   = 7,   /* egress: UDP/443 fenced while URL filtering is active */
     COUNTER_MAX          = 8,
 };
 
@@ -124,7 +135,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, __u32);
     __type(value, struct counter_value);
-    __uint(max_entries, 7);
+    __uint(max_entries, 8);
 } counters SEC(".maps");
 
 /* ── Rule-presence flags ─────────────────────────────────────────────── */
