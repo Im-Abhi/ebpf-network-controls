@@ -30,6 +30,7 @@ NS="ip netns exec $NS_NAME"
 FW_PID=
 SRV_PID=
 TLS_PID=
+TLS6_PID=
 SRV6_PID=
 
 pass=0
@@ -50,6 +51,7 @@ cleanup() {
     [ -n "$FW_PID" ]  && kill "$FW_PID" 2>/dev/null
     [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null
     [ -n "$TLS_PID" ] && kill "$TLS_PID" 2>/dev/null
+    [ -n "$TLS6_PID" ] && kill "$TLS6_PID" 2>/dev/null
     [ -n "$SRV6_PID" ] && kill "$SRV6_PID" 2>/dev/null
     ip netns pids "$NS_NAME" 2>/dev/null | while read -r p; do kill "$p" 2>/dev/null; done
     sleep 0.3
@@ -123,8 +125,9 @@ if command -v openssl >/dev/null 2>&1 && python3 -c 'import ssl' 2>/dev/null; th
     # SSL_accept forever and starve every connection behind it — which is a
     # property of the server, not of the firewall under test.
     cat > "$DIR/tlssrv.py" <<'PYEOF'
-import http.server, ssl, sys
+import http.server, socket, ssl, sys
 cert, key, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+bind = sys.argv[4] if len(sys.argv) > 4 else ''
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(cert, key)
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -142,7 +145,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
-Server(('', port), Handler).serve_forever()
+    # A v6 literal bind gets an AF_INET6 socket on that address; the
+    # default '' keeps the historical IPv4 wildcard socket.
+    address_family = socket.AF_INET6 if ':' in bind else socket.AF_INET
+Server((bind, port), Handler).serve_forever()
 PYEOF
     $NS python3 "$DIR/tlssrv.py" "$DIR/cert.pem" "$DIR/key.pem" 443 \
         > "$DIR/tls.out" 2>&1 &
@@ -244,15 +250,76 @@ else F "'$BAD' still fenced after clear-domains (code=$code)"; fi
 ctl block-domain "$BAD" >/dev/null 2>&1
 
 # The sandbox setup disabled IPv6 on the veths (v4-counter determinism);
-# re-enable it and hand out sandbox addresses for the v6 checks.
-sysctl -q -w net.ipv6.conf.$V0.disable_ipv6=0 || true
-$NS sysctl -q -w net.ipv6.conf.$V1.disable_ipv6=0 || true
-ip -6 addr add fd00:99::1/64 dev "$V0" 2>/dev/null || true
-$NS ip -6 addr add fd00:99::2/64 dev "$V1" 2>/dev/null || true
+# re-enable it and hand out sandbox addresses for the v6 checks. Every
+# step is verified with its own error visible: a silent failure here used
+# to read as "unreachable", which the checks below report as vacuous
+# PASSes (drop-looking results with nothing to drop) and one misleading
+# fence FAIL. The v6 section is the last one, so aborting on a sandbox
+# failure loses nothing.
+v6err=""
+sysctl -q -w net.ipv6.conf.$V0.disable_ipv6=0 || v6err="$v6err host-sysctl"
+ip -6 addr add fd00:99::1/64 dev "$V0" || v6err="$v6err host-addr"
+$NS sysctl -q -w net.ipv6.conf.$V1.disable_ipv6=0 || v6err="$v6err ns-sysctl"
+$NS ip -6 addr add fd00:99::2/64 dev "$V1" || v6err="$v6err ns-addr"
+if [ -n "$v6err" ]; then
+    F "v6 sandbox setup failed:$v6err (command errors printed above)"
+    exit 1
+fi
+
+# Wait for the addresses to settle (DAD/tentative state, neighbor
+# discovery): ping is answered by the peer kernel, so this proves the v6
+# route without any server running.
+v6up=""
+for _ in $(seq 1 20); do
+    if ping -6 -c1 -W1 fd00:99::2 >/dev/null 2>&1; then v6up=1; break; fi
+    sleep 0.3
+done
+if [ -z "$v6up" ]; then
+    F "v6 sandbox unreachable: fd00:99::2 never answered ping6"
+    exit 1
+fi
 
 $NS python3 -m http.server 80 --bind fd00:99::2 > "$DIR/http6.out" 2>&1 &
 SRV6_PID=$!
-sleep 0.2
+if [ -n "$TLS_PID" ]; then
+    # Second TLS instance on the sandbox v6 address: the v4 server binds
+    # the IPv4 wildcard only, and with no v6 listener the v6 SNI check
+    # would pass vacuously (connection refused, not datapath-dropped).
+    $NS python3 "$DIR/tlssrv.py" "$DIR/cert.pem" "$DIR/key.pem" 443 fd00:99::2 \
+        > "$DIR/tls6.out" 2>&1 &
+    TLS6_PID=$!
+fi
+
+# Control probe before the real checks: a neutral Host (the URL literal,
+# not on the blocklist) must get a 200 over v6. This proves the whole v6
+# round-trip (egress hook, ingress hook, server) so the verdicts of the
+# checks below reflect the datapath, not the sandbox.
+ok6=""
+for _ in $(seq 1 10); do
+    c=$(curl -6 -gs -m 2 -o /dev/null -w '%{http_code}' "http://[fd00:99::2]/" 2>/dev/null)
+    [ "$c" = "200" ] && { ok6=1; break; }
+    sleep 0.3
+done
+if [ -z "$ok6" ]; then
+    F "v6 control probe failed: server not reachable over v6 (http6.out below)"
+    tail -5 "$DIR/http6.out" 2>/dev/null
+    exit 1
+fi
+if [ -n "$TLS6_PID" ]; then
+    ok6t=""
+    for _ in $(seq 1 10); do
+        ct=$(curl -6ks -m 2 --resolve "$GOOD:443:[fd00:99::2]" "https://$GOOD/" \
+             -o /dev/null -w '%{http_code}' 2>/dev/null)
+        [ "$ct" = "200" ] && { ok6t=1; break; }
+        sleep 0.3
+    done
+    if [ -z "$ok6t" ]; then
+        F "v6 TLS control probe failed (tls6.out below)"
+        tail -5 "$DIR/tls6.out" 2>/dev/null
+        exit 1
+    fi
+fi
+echo "-- v6 sandbox ready (route, servers, round-trip verified)"
 
 code=$(curl -6 -gs -m 3 -o /dev/null -w '%{http_code}' "http://[fd00:99::2]/" -H "Host: $BAD")
 if [ "$code" = "000" ]; then
@@ -278,25 +345,36 @@ fi
 
 # QUIC fence: UDP/443 datagrams (v4 and v6) are dropped while the blocklist
 # is loaded; a browser sees this as "no HTTP/3" and falls back to TCP.
+# Both probes must actually leave the host — a skipped probe (no v6 route)
+# used to read as a one-family fence failure. Skips are reported on stderr.
 q1=$(edrop_cnt); q1=${q1:-0}
 case "$q1" in ''|*[!0-9]*) q1=0;; esac
-python3 - "$NS_IP" <<'PYEOF'
+qout=$(python3 - "$NS_IP" <<'PYEOF'
 import socket, sys
-for fam, addr in ((socket.AF_INET6, "fd00:99::2"), (socket.AF_INET, sys.argv[1])):
+sent = []
+for name, fam, addr in (("v6", socket.AF_INET6, "fd00:99::2"),
+                        ("v4", socket.AF_INET, sys.argv[1])):
     try:
         s = socket.socket(fam, socket.SOCK_DGRAM)
         s.sendto(b"\xc0" * 64, (addr, 443))  # QUIC-shaped initial datagram
+        sent.append(name)
         s.close()
-    except OSError:
-        pass
+    except OSError as exc:
+        sys.stderr.write("probe %s skipped: %s\n" % (name, exc))
+print(",".join(sent))
 PYEOF
-sleep 0.2
-q2=$(edrop_cnt); q2=${q2:-0}
-case "$q2" in ''|*[!0-9]*) q2=0;; esac
-if [ "$((q2 - q1))" -ge 2 ]; then
-    P "QUIC fence: UDP/443 dropped on both families (counter +$((q2 - q1)))"
+)
+if [ "$qout" != "v6,v4" ]; then
+    F "QUIC fence untested: probes sent: '${qout:-none}'"
 else
-    F "QUIC fence: UDP/443 was not dropped (delta $((q2 - q1)))"
+    sleep 0.2
+    q2=$(edrop_cnt); q2=${q2:-0}
+    case "$q2" in ''|*[!0-9]*) q2=0;; esac
+    if [ "$((q2 - q1))" -ge 2 ]; then
+        P "QUIC fence: UDP/443 dropped on both families (counter +$((q2 - q1)))"
+    else
+        F "QUIC fence: UDP/443 was not dropped (delta $((q2 - q1)))"
+    fi
 fi
 
 SUCCEEDED=1
