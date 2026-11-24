@@ -376,7 +376,14 @@ func udp6Pkt(src, dst string, sport, dport uint16) []byte {
 // carries the given name — byte-for-byte the shape tls_sni_extract() walks.
 func tlsClientHello(sni string) []byte {
 	name := []byte(sni)
-	extLen := 5 + len(name)                          // list_len(2) + name_type(1) + nl(2) + name
+	// extLen counts the whole extension block: this builder emits a single
+	// server_name extension, whose wire form is type(2) + len(2) + value,
+	// where the value is list_len(2) + name_type(1) + name_len(2) + name.
+	// Under-declaring it by the 4-byte header makes the handshake
+	// internally inconsistent, and the datapath's SNI extractor (which
+	// validates the declared lengths, failing open on mismatch) rejects
+	// such a ClientHello instead of extracting the name.
+	extLen := 4 + 5 + len(name)
 	hsLen := 2 + 32 + 1 + 2 + 2 + 1 + 1 + 2 + extLen // ver + random + sid + suites + comp + exts
 	recLen := 4 + hsLen
 
