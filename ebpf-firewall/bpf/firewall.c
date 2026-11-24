@@ -88,10 +88,6 @@ struct packet_info {
     __u8  tcp_flags; /* TCP_FIN/SYN/RST/ACK bits (0 if not TCP) */
 };
 
-static __always_inline struct packet_info parse_packet_l3_v6(struct hdr_cursor *nh,
-                                                             void *data_end,
-                                                             int *ok);
-
 static __always_inline struct packet_info parse_packet_x(struct hdr_cursor *nh,
                                                          void *data_end,
                                                          int *ok, bool l2) {
@@ -100,7 +96,8 @@ static __always_inline struct packet_info parse_packet_x(struct hdr_cursor *nh,
 
     /* L2 (XDP) frames start at the Ethernet header; the cgroup/skb egress
      * hook hands the program an skb whose data points at the L3 (IP)
-     * header, so the Ethernet step is skipped there. */
+     * header — reached here only after the caller dispatched on the IP
+     * version, so this function is the IPv4 path by construction. */
     int eth_type = bpf_htons(ETH_P_IP);
     if (l2) {
         struct ethhdr *eth;
@@ -114,13 +111,6 @@ static __always_inline struct packet_info parse_packet_x(struct hdr_cursor *nh,
         if (eth_type != bpf_htons(ETH_P_IP)) {
             return info;
         }
-    } else if ((void *)nh->pos + 1 <= data_end &&
-               ((*(__u8 *)nh->pos) >> 4) == 6) {
-        /* L3 context, IPv6: the egress domain stage covers v6 TCP. */
-        return parse_packet_l3_v6(nh, data_end, ok);
-    } else if ((void *)nh->pos + 1 > data_end ||
-               ((*(__u8 *)nh->pos) >> 4) != 4) {
-        return info;
     }
 
     struct iphdr *ip;
@@ -165,42 +155,35 @@ static __always_inline struct packet_info parse_packet_x(struct hdr_cursor *nh,
     return info;
 }
 
-/* Walk an IPv6 header chain (L3 context): returns 1 with the payload offset
- * (from the start of the IPv6 header) and the final protocol when the chain
- * ends in TCP or UDP; 0 for fragments, AH, no-next, unknown next-headers and
- * truncated chains — none of which are policy-relevant (default policy).
- * Bounded to 8 extension headers. The headers themselves are always in the
- * linear area, so direct reads are safe; the STREAM is read separately via
- * helper loads (see domain_tcp_payload). */
-static __always_inline int l3_v6_walk(void *data, void *data_end,
-                                      __u32 *off_out, __u8 *proto_out) {
+/* Locate the L4 payload offset in an IPv6 header chain (L3 context, skb
+ * offsets): returns 1 with the offset of the first L4 byte and the final
+ * protocol when the chain ends in TCP or UDP; 0 for fragments, AH,
+ * no-next, unknown next-headers and anything unreadable — none of which
+ * are policy-relevant. Bounded to 8 extension headers. Every read is a
+ * helper load: runtime-checked, non-linear-safe, and free of the direct
+ * pointer arithmetic this datapath must avoid (see domain_tcp_payload). */
+static __always_inline int v6_l4_offset(struct __sk_buff *skb,
+                                        __u32 *l4_off_out, __u8 *proto_out) {
+    __u8 nhdr = 0;
     __u32 off = sizeof(struct ipv6hdr);
-    __u8 nhdr;
 
-    if (data + sizeof(struct ipv6hdr) > data_end)
+    if (bpf_skb_load_bytes(skb, 6, &nhdr, 1)) /* next-header of the fixed header */
         return 0;
-    nhdr = ((__u8 *)data)[6]; /* next-header byte of the fixed header */
 
     for (int i = 0; i < 8; i++) {
+        __u8 h[2];
         if (nhdr == IPPROTO_TCP || nhdr == IPPROTO_UDP) {
-            *off_out = off;
+            *l4_off_out = off;
             *proto_out = nhdr;
             return 1;
         }
         /* hop-by-hop(0), routing(43), destination options(60) */
         if (nhdr != 0 && nhdr != 43 && nhdr != 60)
             return 0;
-        if (data + off + 8 > data_end)
+        if (bpf_skb_load_bytes(skb, off, h, 2))
             return 0;
-        {
-            __u8 nxt = ((__u8 *)data)[off];
-            __u8 elen = ((__u8 *)data)[off + 1];
-            __u32 size = 8 + (__u32)elen * 8;
-            if (data + off + size > data_end)
-                return 0;
-            nhdr = nxt;
-            off += size;
-        }
+        nhdr = h[0];
+        off += 8 + (__u32)h[1] * 8; /* ext len is in 8-octet units past 8 */
     }
     return 0;
 }
@@ -208,29 +191,25 @@ static __always_inline int l3_v6_walk(void *data, void *data_end,
 /* IPv6 L3 parse for the cgroup/skb egress hook. Policy scope for v6 is the
  * domain stage only: the IP/CIDR and port tables (and conntrack) have
  * IPv4-shaped keys, so v6 packets carry no addresses into the policy
- * stages — the domain stage and the default policy decide. Ports and TCP
- * flags are read from the (always linear) L4 header after the bounded
- * extension-header walk. */
-static __always_inline struct packet_info parse_packet_l3_v6(struct hdr_cursor *nh,
-                                                             void *data_end,
+ * stages. Ports and TCP flags are read via helper loads after the bounded
+ * extension-header walk; a truncated L4 header is not policy-relevant. */
+static __always_inline struct packet_info parse_packet_l3_v6(struct __sk_buff *skb,
                                                              int *ok) {
     struct packet_info info = {};
-    __u32 off = 0;
+    __u32 l4_off = 0;
     __u8 proto = 0;
-    __u8 *l4;
+    __u8 l4[20] = {};
 
     *ok = 0;
-    if (!l3_v6_walk(nh->pos, data_end, &off, &proto)) {
+    if (!v6_l4_offset(skb, &l4_off, &proto)) {
         return info;
     }
     info.family = 6;
     info.protocol = proto;
 
-    l4 = (__u8 *)nh->pos + off;
     if (proto == IPPROTO_TCP) {
-        if ((void *)l4 + 20 > data_end) {
-            return info;
-        }
+        if (bpf_skb_load_bytes(skb, l4_off, l4, sizeof(l4)))
+            return info; /* truncated TCP header: not policy-relevant */
         info.dport = ((__u16)l4[2] << 8) | (__u16)l4[3];
         info.sport = ((__u16)l4[0] << 8) | (__u16)l4[1];
         info.tcp_flags = ((l4[13] & 0x01) ? TCP_FIN : 0) |
@@ -238,9 +217,8 @@ static __always_inline struct packet_info parse_packet_l3_v6(struct hdr_cursor *
                          ((l4[13] & 0x04) ? TCP_RST : 0) |
                          ((l4[13] & 0x10) ? TCP_ACK : 0);
     } else if (proto == IPPROTO_UDP) {
-        if ((void *)l4 + 8 > data_end) {
+        if (bpf_skb_load_bytes(skb, l4_off, l4, 8))
             return info;
-        }
         info.dport = ((__u16)l4[2] << 8) | (__u16)l4[3];
         info.sport = ((__u16)l4[0] << 8) | (__u16)l4[1];
     }
@@ -248,11 +226,29 @@ static __always_inline struct packet_info parse_packet_l3_v6(struct hdr_cursor *
     return info;
 }
 
-/* L3-context variant for the cgroup/skb egress hook (skb->data = IP header). */
-static __always_inline struct packet_info parse_packet_l3(struct hdr_cursor *nh,
-                                                          void *data_end,
+/* L3-context dispatch for the cgroup/skb egress hook: the version nibble
+ * selects the family parse. The version byte is a helper load like every
+ * other read on this path — direct packet dereferences in this datapath
+ * repeatedly trip the verifier (see the bcur/domain comments). The v4
+ * path keeps direct header reads, which the verifier has accepted since
+ * the first smoke run. */
+static __always_inline struct packet_info parse_packet_l3(struct __sk_buff *skb,
+                                                          void *data, void *data_end,
                                                           int *ok) {
-    return parse_packet_x(nh, data_end, ok, false);
+    __u8 first = 0;
+
+    *ok = 0;
+    if (bpf_skb_load_bytes(skb, 0, &first, 1)) {
+        return (struct packet_info){};
+    }
+    if ((first >> 4) == 6) {
+        return parse_packet_l3_v6(skb, ok);
+    }
+    if ((first >> 4) != 4) {
+        return (struct packet_info){};
+    }
+    struct hdr_cursor nh = { data };
+    return parse_packet_x(&nh, data_end, ok, false);
 }
 
 /* Policy lookup for the IP blocklist. Returns the rule_value stored for the
@@ -1211,31 +1207,35 @@ static __always_inline int domain_tcp_payload(struct __sk_buff *skb, bool l2,
     struct tcphdr *tcp;
     __u32 hlen;
 
-    /* IPv6 (L3 context only — the domain stage is egress-only): walk the
-     * header chain numerically, then address the stream by skb offset
-     * exactly like the v4 path. The v6/TCP headers are always linear; the
-     * stream is read via helper loads by the extractors. */
-    if (!l2 && data + 1 <= data_end && ((*(__u8 *)data) >> 4) == 6) {
-        __u32 off6 = 0;
-        __u8 proto6 = 0;
-        __u8 doff_byte = 0;
-        volatile __u32 off_v, plen_v;
+    /* IPv6 (L3 context only — the domain stage is egress-only): locate the
+     * L4 offset through the header chain via helper loads, then address the
+     * stream by skb offset exactly like the v4 path. The v6/TCP headers are
+     * always linear; the stream is read via helper loads by the extractors. */
+    if (!l2) {
+        __u8 first6 = 0;
+        if (bpf_skb_load_bytes(skb, 0, &first6, 1))
+            return 0;
+        if ((first6 >> 4) == 6) {
+            __u32 off6 = 0;
+            __u8 proto6 = 0;
+            __u8 doff_byte = 0;
+            volatile __u32 off_v, plen_v;
 
-        if (!l3_v6_walk(data, data_end, &off6, &proto6) || proto6 != IPPROTO_TCP)
-            return 0;
-        if (data + off6 + 20 > data_end)
-            return 0;                                        /* truncated TCP header */
-        doff_byte = ((__u8 *)data)[off6 + 12];
-        hlen = (__u32)(doff_byte >> 4) * 4;
-        if (hlen < 20 || hlen > 60)
-            return 0;
-        off_v = off6 + hlen;
-        plen_v = skb->len - off_v;
-        if (plen_v == 0)
-            return 0;
-        *off_out = off_v;
-        *plen_out = plen_v;
-        return 1;
+            if (!v6_l4_offset(skb, &off6, &proto6) || proto6 != IPPROTO_TCP)
+                return 0;
+            if (bpf_skb_load_bytes(skb, off6 + 12, &doff_byte, 1))
+                return 0;                                    /* truncated TCP header */
+            hlen = (__u32)(doff_byte >> 4) * 4;
+            if (hlen < 20 || hlen > 60)
+                return 0;
+            off_v = off6 + hlen;
+            plen_v = skb->len - off_v;
+            if (plen_v == 0)
+                return 0;
+            *off_out = off_v;
+            *plen_out = plen_v;
+            return 1;
+        }
     }
 
     if (l2 && parse_ethhdr(&c, data_end, &eth) != bpf_htons(ETH_P_IP))
@@ -1276,9 +1276,8 @@ static __always_inline int is_quic_443(struct __sk_buff *skb, void *data,
     __u8 first = 0, proto = 0, port_b[2] = { 0, 0 };
     __u32 l4_off;
 
-    if (data + 1 > data_end)
+    if (bpf_skb_load_bytes(skb, 0, &first, 1))
         return 0;
-    first = *(__u8 *)data;
     switch (first >> 4) {
     case 4:
         if (bpf_skb_load_bytes(skb, 9, &proto, 1))
@@ -1309,7 +1308,6 @@ int firewall_cgroup_egress(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
     __u64 pkt_len = (__u64)(data_end - data);
-    struct hdr_cursor nh;
     int ok;
     int verdict;
 
@@ -1354,9 +1352,9 @@ int firewall_cgroup_egress(struct __sk_buff *skb) {
         }
     }
 
-    /* 1. parse (L3: the cgroup/skb context starts at the IP header). */
-    nh.pos = data;
-    struct packet_info info = parse_packet_l3(&nh, data_end, &ok);
+    /* 1. parse (L3: the cgroup/skb context starts at the IP header; the
+     * version dispatch and all v6 reads are helper loads). */
+    struct packet_info info = parse_packet_l3(skb, data, data_end, &ok);
 
     /* Unparseable or non-IPv4: apply the egress default policy only, exactly
      * like firewall_prog does for ingress. Without this early return a zeroed
