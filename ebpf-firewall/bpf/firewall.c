@@ -211,10 +211,13 @@ static __always_inline struct packet_info parse_packet_l3_v6(struct __sk_buff *s
         __u8 flags;
         if (bpf_skb_load_bytes(skb, l4_off, b, 2))
             return info; /* truncated TCP header: not policy-relevant */
-        info.sport = ((__u16)b[0] << 8) | (__u16)b[1];
+        /* Wire bytes assembled to the value the v4 parse stores: the raw
+         * __be16 field (network-order numeric), so the domain stage's
+         * bpf_htons(80/443) comparisons treat both families alike. */
+        info.sport = bpf_htons(((__u16)b[0] << 8) | (__u16)b[1]);
         if (bpf_skb_load_bytes(skb, l4_off + 2, b, 2))
             return info;
-        info.dport = ((__u16)b[0] << 8) | (__u16)b[1];
+        info.dport = bpf_htons(((__u16)b[0] << 8) | (__u16)b[1]);
         if (bpf_skb_load_bytes(skb, l4_off + 13, &flags, 1))
             return info;
         info.tcp_flags = ((flags & 0x01) ? TCP_FIN : 0) |
@@ -224,10 +227,10 @@ static __always_inline struct packet_info parse_packet_l3_v6(struct __sk_buff *s
     } else if (proto == IPPROTO_UDP) {
         if (bpf_skb_load_bytes(skb, l4_off + 2, b, 2))
             return info;
-        info.dport = ((__u16)b[0] << 8) | (__u16)b[1];
+        info.dport = bpf_htons(((__u16)b[0] << 8) | (__u16)b[1]);
         if (bpf_skb_load_bytes(skb, l4_off, b, 2))
             return info;
-        info.sport = ((__u16)b[0] << 8) | (__u16)b[1];
+        info.sport = bpf_htons(((__u16)b[0] << 8) | (__u16)b[1]);
     }
     *ok = 1;
     return info;
@@ -1322,7 +1325,11 @@ static __always_inline int is_quic_443(struct __sk_buff *skb, void *data,
     }
     if (bpf_skb_load_bytes(skb, l4_off + 2, port_b, 2))
         return 0;
-    return (((__u16)port_b[0] << 8) | (__u16)port_b[1]) == bpf_htons(443);
+    /* port_b holds the raw wire bytes, so the assembled value is the port
+     * in host order — compare against the literal, NOT bpf_htons(443)
+     * (network order): that comparison can never be true, which silenced
+     * the whole fence. */
+    return (((__u16)port_b[0] << 8) | (__u16)port_b[1]) == 443;
 }
 
 SEC("cgroup_skb/egress")
