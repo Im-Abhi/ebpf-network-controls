@@ -374,17 +374,24 @@ if ! "$REPO/bin/firewallctl" -sock "$SOCK" stats >/dev/null 2>&1; then
     exit 1
 fi
 qout=$(python3 - "$NS_IP" <<'PYEOF'
-import socket, sys
+import errno, socket, sys
 sent = []
 for name, fam, addr in (("v6", socket.AF_INET6, "fd00:99::2"),
                         ("v4", socket.AF_INET, sys.argv[1])):
     try:
         s = socket.socket(fam, socket.SOCK_DGRAM)
         s.sendto(b"\xc0" * 64, (addr, 443))  # QUIC-shaped initial datagram
-        sent.append(name)
         s.close()
+        sent.append(name)
     except OSError as exc:
-        sys.stderr.write("probe %s skipped: %s\n" % (name, exc))
+        if exc.errno == errno.EPERM:
+            # The cgroup/skb egress hook dropped the datagram inside the
+            # sendto syscall — the QUIC fence's signature. The datagram
+            # reached the hook and was counted; the counter assertion
+            # below is the authoritative check either way.
+            sent.append(name)
+        else:
+            sys.stderr.write("probe %s skipped: %s\n" % (name, exc))
 print(",".join(sent))
 PYEOF
 )
