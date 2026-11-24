@@ -198,7 +198,7 @@ static __always_inline struct packet_info parse_packet_l3_v6(struct __sk_buff *s
     struct packet_info info = {};
     __u32 l4_off = 0;
     __u8 proto = 0;
-    __u8 l4[20] = {};
+    __u8 b[2];
 
     *ok = 0;
     if (!v6_l4_offset(skb, &l4_off, &proto)) {
@@ -208,19 +208,26 @@ static __always_inline struct packet_info parse_packet_l3_v6(struct __sk_buff *s
     info.protocol = proto;
 
     if (proto == IPPROTO_TCP) {
-        if (bpf_skb_load_bytes(skb, l4_off, l4, sizeof(l4)))
+        __u8 flags;
+        if (bpf_skb_load_bytes(skb, l4_off, b, 2))
             return info; /* truncated TCP header: not policy-relevant */
-        info.dport = ((__u16)l4[2] << 8) | (__u16)l4[3];
-        info.sport = ((__u16)l4[0] << 8) | (__u16)l4[1];
-        info.tcp_flags = ((l4[13] & 0x01) ? TCP_FIN : 0) |
-                         ((l4[13] & 0x02) ? TCP_SYN : 0) |
-                         ((l4[13] & 0x04) ? TCP_RST : 0) |
-                         ((l4[13] & 0x10) ? TCP_ACK : 0);
-    } else if (proto == IPPROTO_UDP) {
-        if (bpf_skb_load_bytes(skb, l4_off, l4, 8))
+        info.sport = ((__u16)b[0] << 8) | (__u16)b[1];
+        if (bpf_skb_load_bytes(skb, l4_off + 2, b, 2))
             return info;
-        info.dport = ((__u16)l4[2] << 8) | (__u16)l4[3];
-        info.sport = ((__u16)l4[0] << 8) | (__u16)l4[1];
+        info.dport = ((__u16)b[0] << 8) | (__u16)b[1];
+        if (bpf_skb_load_bytes(skb, l4_off + 13, &flags, 1))
+            return info;
+        info.tcp_flags = ((flags & 0x01) ? TCP_FIN : 0) |
+                         ((flags & 0x02) ? TCP_SYN : 0) |
+                         ((flags & 0x04) ? TCP_RST : 0) |
+                         ((flags & 0x10) ? TCP_ACK : 0);
+    } else if (proto == IPPROTO_UDP) {
+        if (bpf_skb_load_bytes(skb, l4_off + 2, b, 2))
+            return info;
+        info.dport = ((__u16)b[0] << 8) | (__u16)b[1];
+        if (bpf_skb_load_bytes(skb, l4_off, b, 2))
+            return info;
+        info.sport = ((__u16)b[0] << 8) | (__u16)b[1];
     }
     *ok = 1;
     return info;
@@ -1198,6 +1205,30 @@ static __always_inline int http_host_extract(struct __sk_buff *skb, __u32 pbase,
  * "math between pkt pointer and register with unbounded min value").
  * Volatile makes the results opaque to those rewrites; the callers read
  * the stream by skb offset (bpf_skb_load_bytes) instead. */
+/* TCP payload offset for an IPv6 TCP stream (L3 context, skb offsets):
+ * walks the header chain, then reads the TCP header's data-offset. The
+ * doff byte is a helper load on purpose — the same discipline as every
+ * read on this path (see domain_tcp_payload). Returns 1 with *off_out =
+ * first payload byte, 0 when the chain is not TCP or headers are
+ * truncated. */
+static __always_inline int v6_tcp_payload_offset(struct __sk_buff *skb,
+                                                 __u32 *off_out) {
+    __u32 l4_off = 0;
+    __u8 proto = 0;
+    __u8 doff_byte;
+    __u32 hlen;
+
+    if (!v6_l4_offset(skb, &l4_off, &proto) || proto != IPPROTO_TCP)
+        return 0;
+    if (bpf_skb_load_bytes(skb, l4_off + 12, &doff_byte, 1))
+        return 0;                                        /* truncated TCP header */
+    hlen = (__u32)(doff_byte >> 4) * 4;
+    if (hlen < 20 || hlen > 60)
+        return 0;
+    *off_out = l4_off + hlen;
+    return 1;
+}
+
 static __always_inline int domain_tcp_payload(struct __sk_buff *skb, bool l2,
                                               void *data, void *data_end,
                                               __u32 *off_out, __u32 *plen_out) {
@@ -1212,23 +1243,14 @@ static __always_inline int domain_tcp_payload(struct __sk_buff *skb, bool l2,
      * stream by skb offset exactly like the v4 path. The v6/TCP headers are
      * always linear; the stream is read via helper loads by the extractors. */
     if (!l2) {
-        __u8 first6 = 0;
+        __u8 first6;
+        __u32 off_v, plen_v;
+
         if (bpf_skb_load_bytes(skb, 0, &first6, 1))
             return 0;
         if ((first6 >> 4) == 6) {
-            __u32 off6 = 0;
-            __u8 proto6 = 0;
-            __u8 doff_byte = 0;
-            volatile __u32 off_v, plen_v;
-
-            if (!v6_l4_offset(skb, &off6, &proto6) || proto6 != IPPROTO_TCP)
+            if (!v6_tcp_payload_offset(skb, &off_v))
                 return 0;
-            if (bpf_skb_load_bytes(skb, off6 + 12, &doff_byte, 1))
-                return 0;                                    /* truncated TCP header */
-            hlen = (__u32)(doff_byte >> 4) * 4;
-            if (hlen < 20 || hlen > 60)
-                return 0;
-            off_v = off6 + hlen;
             plen_v = skb->len - off_v;
             if (plen_v == 0)
                 return 0;
@@ -1273,7 +1295,7 @@ static __always_inline int domain_tcp_payload(struct __sk_buff *skb, bool l2,
  * treated as QUIC. */
 static __always_inline int is_quic_443(struct __sk_buff *skb, void *data,
                                        void *data_end) {
-    __u8 first = 0, proto = 0, port_b[2] = { 0, 0 };
+    __u8 first, proto, port_b[2];
     __u32 l4_off;
 
     if (bpf_skb_load_bytes(skb, 0, &first, 1))
