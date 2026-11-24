@@ -64,7 +64,7 @@ cleanup() {
     else
         echo "--- artifacts kept in $DIR (daemon log: $LOG) ---"
         echo "--- daemon log tail: ---"
-        tail -8 "$LOG" 2>/dev/null
+        tail -25 "$LOG" 2>/dev/null
     fi
 }
 trap cleanup EXIT
@@ -246,8 +246,25 @@ else F "'$BAD' still fenced after clear-domains (code=$code)"; fi
 # ---- IPv6 + QUIC fence -------------------------------------------------------
 # Re-arm the blocklist first: the runtime-command checks above ended with
 # clear-domains, and both the domain stage and the QUIC fence gate on the
-# domain presence bit.
-ctl block-domain "$BAD" >/dev/null 2>&1
+# domain presence bit. The re-arm is verified loudly: a silent failure here
+# (dead daemon, broken socket) used to leave the whole v6 section testing an
+# empty blocklist — every drop check then fails for the wrong reason, and a
+# run can even look half-green.
+if ! ctl block-domain "$BAD" >/dev/null 2>&1; then
+    F "block-domain failed at v6 section start — daemon reachable?"
+    if kill -0 "$FW_PID" 2>/dev/null; then
+        echo "   daemon process alive; list-domains says:"
+        ctl list-domains 2>&1 | head -3
+    else
+        echo "   daemon process DEAD — log tail:"
+        tail -12 "$LOG" 2>/dev/null
+    fi
+    exit 1
+fi
+if ! ctl list-domains 2>/dev/null | grep -q "$BAD"; then
+    F "block-domain accepted but '$BAD' is not listed afterwards"
+    exit 1
+fi
 
 # The sandbox setup disabled IPv6 on the veths (v4-counter determinism);
 # re-enable it and hand out sandbox addresses for the v6 checks. Every
@@ -349,6 +366,13 @@ fi
 # used to read as a one-family fence failure. Skips are reported on stderr.
 q1=$(edrop_cnt); q1=${q1:-0}
 case "$q1" in ''|*[!0-9]*) q1=0;; esac
+# A stats RPC that cannot be read is a daemon problem, not a fence result:
+# report it as such instead of as a delta of 0.
+if ! "$REPO/bin/firewallctl" -sock "$SOCK" stats >/dev/null 2>&1; then
+    F "egress stats unreachable at QUIC check — daemon alive?"
+    kill -0 "$FW_PID" 2>/dev/null || { echo "   daemon process DEAD — log tail:"; tail -12 "$LOG" 2>/dev/null; }
+    exit 1
+fi
 qout=$(python3 - "$NS_IP" <<'PYEOF'
 import socket, sys
 sent = []
