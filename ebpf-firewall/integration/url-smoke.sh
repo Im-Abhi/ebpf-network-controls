@@ -401,6 +401,11 @@ else
     fi
 fi
 
-SUCCEEDED=1
+# SUCCEEDED gates artifact retention in cleanup: only a fully green run may
+# delete its sandbox. A run that reached the summary with failures keeps its
+# artifacts — the daemon log is usually the only evidence of what happened.
+if [ "$fail" = 0 ]; then
+    SUCCEEDED=1
+fi
 echo "--- $pass passed, $fail failed ---"
 exit 0
