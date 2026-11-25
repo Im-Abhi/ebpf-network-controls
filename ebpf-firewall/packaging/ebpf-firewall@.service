@@ -1,0 +1,43 @@
+# ebpf-firewall systemd template unit — one service instance per interface.
+#
+#   sudo systemctl enable --now ebpf-firewall@eth0
+#
+# The instance name (%i) is the network interface the XDP ingress hook (and,
+# with a drop-in, the cgroup/skb egress hook) attaches to.
+#
+# Overriding daemon flags is done with a drop-in, e.g.:
+#
+#   sudo systemctl edit ebpf-firewall@eth0
+#     [Service]
+#     ExecStart=
+#     ExecStart=/usr/local/bin/firewall -i %i -dir both
+#
+# Rule maps are anonymous kernel objects tied to the running daemon: they are
+# reset whenever the service restarts (no persistence across restarts yet).
+
+[Unit]
+Description=eBPF XDP/TC firewall on %i
+Documentation=https://github.com/Im-Abhi/ebpf-network-controls
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/firewall -i %i
+Restart=on-failure
+RestartSec=5s
+
+# Loading BPF programs and updating their maps needs CAP_BPF (kernel >= 5.8;
+# on older kernels run the daemon as root and drop the capability lines).
+# Attaching XDP/TC and managing the interface needs CAP_NET_ADMIN, and
+# CAP_PERFMON covers tracing helpers some kernels require for program load.
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+NoNewPrivileges=yes
+
+# Kernels < 5.11 charge BPF program/map memory against RLIMIT_MEMLOCK;
+# infinity is harmless on newer kernels that no longer do.
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

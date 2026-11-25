@@ -22,8 +22,6 @@ HOST_IP=10.99.0.1
 NS_IP=10.99.0.2
 PORT=5000
 SPY=$(dirname "$0")/smoke.py
-DIR=$(mktemp -d -t fw-smoke.XXXXXX)
-LOG=$DIR/fw-smoke.log
 
 CTL="$REPO/bin/firewallctl -sock $SOCK"
 NS="ip netns exec $NS_NAME"
@@ -50,6 +48,8 @@ ct_state_for() { # $1=srcport -> established/new/closed/none
 
 FW_PID=
 SRV_PID=
+DIR=    # artifacts dir; created by mktemp only after the startup pollution scrub
+LOG=    # (unset until then so the scrub below cannot delete this run's own dir)
 
 cleanup() {
     set +e
@@ -67,7 +67,7 @@ cleanup() {
     # run into an afternoon of guesswork. Remove the sandbox dir only on
     # success, or when this run never got as far as starting the daemon.
     if [ "${SUCCEEDED:-0}" = 1 ] || [ ! -f "$LOG" ]; then
-        rm -rf "$DIR"
+        [ -n "$DIR" ] && rm -rf "$DIR"
     else
         echo "--- artifacts kept in $DIR (daemon log: $LOG) ---"
     fi
@@ -76,7 +76,14 @@ cleanup() {
 trap cleanup EXIT
 
 # ---- bring up the sandbox --------------------------------------------------
+# The startup scrub runs BEFORE mktemp creates this run's artifacts dir:
+# cleanup's "daemon never started" branch deletes $DIR when $LOG is absent,
+# which at startup is always true — creating the dir any earlier made the
+# scrub delete its own workspace (the line-139/144 redirects then failed and
+# the daemon socket never appeared).
 cleanup
+DIR=$(mktemp -d -t fw-smoke.XXXXXX)
+LOG=$DIR/fw-smoke.log
 
 # ---- preflight: fail fast on a polluted environment -------------------------
 # Orphan daemons/servers, a stale socket or an occupied port from an earlier
